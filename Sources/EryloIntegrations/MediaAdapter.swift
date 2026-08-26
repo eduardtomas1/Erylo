@@ -117,6 +117,32 @@ public struct MediaCoordinatorPolicy: Equatable, Sendable {
     }
 }
 
+private final class MediaCommandCancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isCancelledStorage = false
+    private var isReserved = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return isCancelledStorage
+    }
+
+    func reserveIfActive() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isCancelledStorage, !isReserved else { return false }
+        isReserved = true
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelledStorage = true
+        lock.unlock()
+    }
+}
+
 /// Owns enabled-state, stale-update rejection, snapshot dedupe, subscriptions, and command ordering.
 public actor MediaCoordinator {
     private struct QueuedCommand {
@@ -124,6 +150,7 @@ public actor MediaCoordinator {
         let source: MediaSource
         let generation: UInt64
         let command: MediaCommand
+        let cancellation: MediaCommandCancellationState
         let continuation: CheckedContinuation<Void, Error>
     }
 
@@ -236,6 +263,9 @@ public actor MediaCoordinator {
     }
 
     public func perform(_ command: MediaCommand, on source: MediaSource) async throws {
+        guard !Task.isCancelled else {
+            throw MediaError.cancelled(source: source)
+        }
         guard let generation = activeGenerations[source], adapters[source] != nil else {
             throw MediaError.disabled(source: source)
         }
@@ -243,6 +273,9 @@ public actor MediaCoordinator {
             throw MediaError.sourceUnavailable(source: source)
         }
         let normalized = try command.normalized(for: snapshot)
+        guard !Task.isCancelled else {
+            throw MediaError.cancelled(source: source)
+        }
         let pendingCount = commandQueue.count + (activeCommand == nil ? 0 : 1)
         guard pendingCount < policy.maximumPendingCommands else {
             throw MediaError.commandQueueFull(
@@ -252,20 +285,30 @@ public actor MediaCoordinator {
         }
 
         let identifier = MediaOperationID()
+        let cancellation = MediaCommandCancellationState()
         try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) in
+                guard cancellation.reserveIfActive() else {
+                    continuation.resume(
+                        throwing: MediaError.cancelled(source: source)
+                    )
+                    return
+                }
                 commandQueue.append(
                     QueuedCommand(
                         identifier: identifier,
                         source: source,
                         generation: generation,
                         command: normalized,
+                        cancellation: cancellation,
                         continuation: continuation
                     )
                 )
                 startCommandWorkerIfNeeded()
             }
         } onCancel: {
+            cancellation.cancel()
             Task { [weak self] in
                 await self?.cancelCommand(identifier, source: source)
             }
@@ -313,6 +356,7 @@ public actor MediaCoordinator {
         let queued = commandQueue
         commandQueue.removeAll(keepingCapacity: false)
         for command in queued {
+            command.cancellation.cancel()
             cancelledCommandIdentifiers.remove(command.identifier)
             command.continuation.resume(throwing: MediaError.cancelled(source: command.source))
         }
@@ -488,7 +532,8 @@ public actor MediaCoordinator {
             activeCommand = queued
 
             let result: Result<Void, Error>
-            if cancelledCommandIdentifiers.contains(queued.identifier) {
+            if queued.cancellation.isCancelled
+                || cancelledCommandIdentifiers.contains(queued.identifier) {
                 result = .failure(MediaError.cancelled(source: queued.source))
             } else if activeGenerations[queued.source] != queued.generation {
                 result = .failure(MediaError.cancelled(source: queued.source))
@@ -501,6 +546,7 @@ public actor MediaCoordinator {
                         operationID: queued.identifier
                     )
                     if activeGenerations[queued.source] != queued.generation
+                        || queued.cancellation.isCancelled
                         || cancelledCommandIdentifiers.contains(queued.identifier) {
                         result = .failure(MediaError.cancelled(source: queued.source))
                     } else {
@@ -537,6 +583,7 @@ public actor MediaCoordinator {
     private func cancelCommand(_ identifier: MediaOperationID, source: MediaSource) async {
         if let index = commandQueue.firstIndex(where: { $0.identifier == identifier }) {
             let queued = commandQueue.remove(at: index)
+            queued.cancellation.cancel()
             cancelledCommandIdentifiers.remove(identifier)
             queued.continuation.resume(throwing: MediaError.cancelled(source: source))
             return
@@ -547,6 +594,7 @@ public actor MediaCoordinator {
             cancelledCommandIdentifiers.remove(identifier)
             return
         }
+        activeCommand?.cancellation.cancel()
         cancelledCommandIdentifiers.insert(identifier)
         await adapters[source]?.cancel(identifier)
     }
@@ -555,6 +603,7 @@ public actor MediaCoordinator {
         let cancelled = commandQueue.filter { $0.source == source }
         commandQueue.removeAll { $0.source == source }
         for queued in cancelled {
+            queued.cancellation.cancel()
             cancelledCommandIdentifiers.remove(queued.identifier)
             queued.continuation.resume(throwing: error)
         }

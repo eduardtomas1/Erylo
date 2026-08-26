@@ -87,8 +87,14 @@ public actor ProcessMediaScriptExecutor: MediaScriptExecuting {
     private let processRunner: any MediaScriptProcessRunning
     private let limits: MediaScriptProcessLimits
 
+    public init(limits: MediaScriptProcessLimits = MediaScriptProcessLimits()) {
+        processRunner = FoundationMediaScriptProcessRunner()
+        self.limits = limits
+    }
+
+    @_spi(Testing)
     public init(
-        processRunner: any MediaScriptProcessRunning = FoundationMediaScriptProcessRunner(),
+        processRunner: any MediaScriptProcessRunning,
         limits: MediaScriptProcessLimits = MediaScriptProcessLimits()
     ) {
         self.processRunner = processRunner
@@ -190,13 +196,15 @@ public actor AppleMusicDesktopAdapter: MediaAdapter {
     public init(
         applicationStatus: any MediaApplicationStatusChecking = SystemMediaApplicationStatus(),
         scriptExecutor: any MediaScriptExecuting = ProcessMediaScriptExecutor(),
-        maximumPendingOperations: Int = 16
+        maximumPendingOperations: Int = 16,
+        cancellationDrainTimeoutNanoseconds: UInt64 = 2_000_000_000
     ) {
         implementation = ScriptedDesktopMediaAdapter(
             source: .appleMusic,
             applicationStatus: applicationStatus,
             scriptExecutor: scriptExecutor,
             maximumPendingOperations: maximumPendingOperations,
+            cancellationDrainTimeoutNanoseconds: cancellationDrainTimeoutNanoseconds,
             admissionObserver: nil
         )
     }
@@ -206,13 +214,15 @@ public actor AppleMusicDesktopAdapter: MediaAdapter {
         applicationStatus: any MediaApplicationStatusChecking,
         scriptExecutor: any MediaScriptExecuting,
         maximumPendingOperations: Int,
-        admissionObserver: any MediaAdapterAdmissionObserving
+        admissionObserver: any MediaAdapterAdmissionObserving,
+        cancellationDrainTimeoutNanoseconds: UInt64 = 2_000_000_000
     ) {
         implementation = ScriptedDesktopMediaAdapter(
             source: .appleMusic,
             applicationStatus: applicationStatus,
             scriptExecutor: scriptExecutor,
             maximumPendingOperations: maximumPendingOperations,
+            cancellationDrainTimeoutNanoseconds: cancellationDrainTimeoutNanoseconds,
             admissionObserver: admissionObserver
         )
     }
@@ -230,6 +240,12 @@ public actor AppleMusicDesktopAdapter: MediaAdapter {
         await implementation.cancel(operationID)
     }
     public func cancelAllPendingWork() async { await implementation.cancelAllPendingWork() }
+    @_spi(Testing) public var latestSnapshotForTesting: NowPlayingSnapshot? {
+        get async { await implementation.currentSnapshot }
+    }
+    @_spi(Testing) public var outstandingWorkCountForTesting: Int {
+        get async { await implementation.outstandingWorkCount }
+    }
 }
 
 public actor SpotifyDesktopAdapter: MediaAdapter {
@@ -239,13 +255,15 @@ public actor SpotifyDesktopAdapter: MediaAdapter {
     public init(
         applicationStatus: any MediaApplicationStatusChecking = SystemMediaApplicationStatus(),
         scriptExecutor: any MediaScriptExecuting = ProcessMediaScriptExecutor(),
-        maximumPendingOperations: Int = 16
+        maximumPendingOperations: Int = 16,
+        cancellationDrainTimeoutNanoseconds: UInt64 = 2_000_000_000
     ) {
         implementation = ScriptedDesktopMediaAdapter(
             source: .spotify,
             applicationStatus: applicationStatus,
             scriptExecutor: scriptExecutor,
             maximumPendingOperations: maximumPendingOperations,
+            cancellationDrainTimeoutNanoseconds: cancellationDrainTimeoutNanoseconds,
             admissionObserver: nil
         )
     }
@@ -263,6 +281,130 @@ public actor SpotifyDesktopAdapter: MediaAdapter {
         await implementation.cancel(operationID)
     }
     public func cancelAllPendingWork() async { await implementation.cancelAllPendingWork() }
+    @_spi(Testing) public var latestSnapshotForTesting: NowPlayingSnapshot? {
+        get async { await implementation.currentSnapshot }
+    }
+    @_spi(Testing) public var outstandingWorkCountForTesting: Int {
+        get async { await implementation.outstandingWorkCount }
+    }
+}
+
+private final class MediaWorkCompletion<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Value, Error>?
+
+    init(_ continuation: CheckedContinuation<Value, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(returning value: Value) {
+        take()?.resume(returning: value)
+    }
+
+    func resume(throwing error: Error) {
+        take()?.resume(throwing: error)
+    }
+
+    private func take() -> CheckedContinuation<Value, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let current = continuation
+        continuation = nil
+        return current
+    }
+}
+
+private extension MediaWorkCompletion where Value == Void {
+    func resume() {
+        resume(returning: ())
+    }
+}
+
+private final class MediaWorkSettlement: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isSettled = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if isSettled {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                continuations.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    func resolve() {
+        lock.lock()
+        guard !isSettled else {
+            lock.unlock()
+            return
+        }
+        isSettled = true
+        let current = continuations
+        continuations.removeAll(keepingCapacity: false)
+        lock.unlock()
+        for continuation in current {
+            continuation.resume()
+        }
+    }
+}
+
+private enum MediaBoundedWait {
+    static func wait(
+        for task: Task<Void, Never>,
+        timeoutNanoseconds: UInt64
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let resolution = MediaBooleanResolution(continuation)
+            let completionTask = Task {
+                await task.value
+                resolution.resolve(true)
+            }
+            let timeoutTask = Task {
+                try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                guard !Task.isCancelled else { return }
+                resolution.resolve(false)
+            }
+            resolution.register([completionTask, timeoutTask])
+        }
+    }
+}
+
+private final class MediaBooleanResolution: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var tasks: [Task<Void, Never>] = []
+
+    init(_ continuation: CheckedContinuation<Bool, Never>) {
+        self.continuation = continuation
+    }
+
+    func resolve(_ value: Bool) {
+        lock.lock()
+        let current = continuation
+        continuation = nil
+        let currentTasks = tasks
+        tasks.removeAll(keepingCapacity: false)
+        lock.unlock()
+        for task in currentTasks { task.cancel() }
+        current?.resume(returning: value)
+    }
+
+    func register(_ tasks: [Task<Void, Never>]) {
+        lock.lock()
+        guard continuation != nil else {
+            lock.unlock()
+            for task in tasks { task.cancel() }
+            return
+        }
+        self.tasks = tasks
+        lock.unlock()
+    }
 }
 
 private actor ScriptedDesktopMediaAdapter {
@@ -274,26 +416,38 @@ private actor ScriptedDesktopMediaAdapter {
     private enum WorkItem {
         case refresh(
             operationID: MediaOperationID,
+            executionID: MediaOperationID,
             generation: UInt64,
-            continuation: CheckedContinuation<MediaAdapterUpdate, Error>
+            completion: MediaWorkCompletion<MediaAdapterUpdate>
         )
         case command(
             operationID: MediaOperationID,
+            executionID: MediaOperationID,
             generation: UInt64,
             command: MediaCommand,
-            continuation: CheckedContinuation<Void, Error>
+            completion: MediaWorkCompletion<Void>
         )
 
         var operationID: MediaOperationID {
             switch self {
-            case let .refresh(operationID, _, _), let .command(operationID, _, _, _):
+            case let .refresh(operationID, _, _, _),
+                 let .command(operationID, _, _, _, _):
                 operationID
+            }
+        }
+
+        var executionID: MediaOperationID {
+            switch self {
+            case let .refresh(_, executionID, _, _),
+                 let .command(_, executionID, _, _, _):
+                executionID
             }
         }
 
         var generation: UInt64 {
             switch self {
-            case let .refresh(_, generation, _), let .command(_, generation, _, _):
+            case let .refresh(_, _, generation, _),
+                 let .command(_, _, generation, _, _):
                 generation
             }
         }
@@ -303,6 +457,8 @@ private actor ScriptedDesktopMediaAdapter {
     private let applicationStatus: any MediaApplicationStatusChecking
     private let scriptExecutor: any MediaScriptExecuting
     private let maximumPendingOperations: Int
+    private let cancellationDrainTimeoutNanoseconds: UInt64
+    private let requiresExactCancellationDrain: Bool
     private let admissionObserver: (any MediaAdapterAdmissionObserving)?
     private var isActive = false
     private var activationGeneration: UInt64 = 0
@@ -310,21 +466,35 @@ private actor ScriptedDesktopMediaAdapter {
     private var latestSnapshot: NowPlayingSnapshot?
     private var workQueue: [WorkItem] = []
     private var workTask: Task<Void, Never>?
+    private var workerEpoch: UInt64 = 0
     private var activeWorkTask: Task<ActiveWorkResult, Error>?
+    private var activeWork: WorkItem?
+    private var activeSettlement: MediaWorkSettlement?
     private var activeOperationID: MediaOperationID?
-    private var cancelledOperationIDs: Set<MediaOperationID> = []
+    private var activeExecutionID: MediaOperationID?
+    private var cancelledExecutionIDs: Set<MediaOperationID> = []
+    private var unsettledExecutionIDs: Set<MediaOperationID> = []
+    private var workSettledWhileCancelling: Set<MediaOperationID> = []
+    private var pendingCancellationExecutionIDs: Set<MediaOperationID> = []
+    private var cancellationDrainTasks: [MediaOperationID: Task<Void, Never>] = [:]
 
     init(
         source: MediaSource,
         applicationStatus: any MediaApplicationStatusChecking,
         scriptExecutor: any MediaScriptExecuting,
         maximumPendingOperations: Int,
+        cancellationDrainTimeoutNanoseconds: UInt64,
         admissionObserver: (any MediaAdapterAdmissionObserving)?
     ) {
         self.source = source
         self.applicationStatus = applicationStatus
         self.scriptExecutor = scriptExecutor
         self.maximumPendingOperations = min(max(1, maximumPendingOperations), 64)
+        self.cancellationDrainTimeoutNanoseconds = min(
+            max(10_000_000, cancellationDrainTimeoutNanoseconds),
+            5_000_000_000
+        )
+        requiresExactCancellationDrain = scriptExecutor is ProcessMediaScriptExecutor
         self.admissionObserver = admissionObserver
     }
 
@@ -371,11 +541,13 @@ private actor ScriptedDesktopMediaAdapter {
             )
         }
         return try await withCheckedThrowingContinuation { continuation in
+            let completion = MediaWorkCompletion(continuation)
             workQueue.append(
                 .refresh(
                     operationID: operationID,
+                    executionID: MediaOperationID(),
                     generation: generation,
-                    continuation: continuation
+                    completion: completion
                 )
             )
             startWorkerIfNeeded()
@@ -405,13 +577,16 @@ private actor ScriptedDesktopMediaAdapter {
                 limit: maximumPendingOperations
             )
         }
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, Error>) in
+            let completion = MediaWorkCompletion(continuation)
             workQueue.append(
                 .command(
                     operationID: operationID,
+                    executionID: MediaOperationID(),
                     generation: generation,
                     command: command,
-                    continuation: continuation
+                    completion: completion
                 )
             )
             startWorkerIfNeeded()
@@ -429,9 +604,7 @@ private actor ScriptedDesktopMediaAdapter {
             // A late cancellation is a no-op and leaves no tombstone.
             return
         }
-        cancelledOperationIDs.insert(operationID)
-        activeWorkTask?.cancel()
-        await scriptExecutor.cancel(operationID)
+        await cancelActiveOperation(operationID)
     }
 
     func cancelAllPendingWork() async {
@@ -440,42 +613,47 @@ private actor ScriptedDesktopMediaAdapter {
         for work in queued {
             resume(work, throwing: MediaError.cancelled(source: source))
         }
-        let operationToCancel = activeOperationID
-        if let operationToCancel {
-            cancelledOperationIDs.insert(operationToCancel)
-        }
-        activeWorkTask?.cancel()
-        if let operationToCancel {
-            await scriptExecutor.cancel(operationToCancel)
+        if let activeOperationID {
+            await cancelActiveOperation(activeOperationID)
         }
     }
 
     private func startWorkerIfNeeded() {
         guard workTask == nil else { return }
+        workerEpoch &+= 1
+        let epoch = workerEpoch
         workTask = Task { [weak self] in
-            await self?.drainWorkQueue()
+            await self?.drainWorkQueue(epoch: epoch)
         }
     }
 
-    private func drainWorkQueue() async {
-        while !Task.isCancelled, !workQueue.isEmpty {
+    private func drainWorkQueue(epoch: UInt64) async {
+        while !Task.isCancelled, workerEpoch == epoch, !workQueue.isEmpty {
             let work = workQueue.removeFirst()
             let operationID = work.operationID
+            let executionID = work.executionID
+            let settlement = MediaWorkSettlement()
             activeOperationID = operationID
+            activeExecutionID = executionID
+            unsettledExecutionIDs.insert(executionID)
+            activeWork = work
+            activeSettlement = settlement
 
             let task = Task<ActiveWorkResult, Error> { [weak self] in
                 guard let self else { throw CancellationError() }
                 switch work {
-                case let .refresh(_, generation, _):
+                case let .refresh(_, _, generation, _):
                     let update = try await self.loadSnapshot(
                         operationID: operationID,
+                        executionID: executionID,
                         generation: generation
                     )
                     return .refresh(update)
-                case let .command(_, generation, command, _):
+                case let .command(_, _, generation, command, _):
                     try await self.runCommand(
                         command,
                         operationID: operationID,
+                        executionID: executionID,
                         generation: generation
                     )
                     return .command
@@ -483,48 +661,137 @@ private actor ScriptedDesktopMediaAdapter {
             }
             activeWorkTask = task
             let result = await task.result
+
+            guard workerEpoch == epoch,
+                  activeOperationID == operationID,
+                  activeExecutionID == executionID else {
+                markWorkSettled(executionID)
+                resume(work, throwing: MediaError.cancelled(source: source))
+                settlement.resolve()
+                return
+            }
             activeWorkTask = nil
+            activeWork = nil
+            activeSettlement = nil
+            activeOperationID = nil
+            activeExecutionID = nil
+            markWorkSettled(executionID)
 
             switch (work, result) {
-            case let (.refresh(_, generation, continuation), .success(.refresh(update))):
-                if consumeCancellation(for: operationID, generation: generation) {
+            case let (.refresh(_, _, generation, continuation), .success(.refresh(update))):
+                if consumeCancellation(for: executionID, generation: generation) {
                     continuation.resume(throwing: MediaError.cancelled(source: source))
                 } else {
                     continuation.resume(returning: update)
                 }
-            case let (.command(_, generation, _, continuation), .success(.command)):
-                if consumeCancellation(for: operationID, generation: generation) {
+            case let (.command(_, _, generation, _, continuation), .success(.command)):
+                if consumeCancellation(for: executionID, generation: generation) {
                     continuation.resume(throwing: MediaError.cancelled(source: source))
                 } else {
                     continuation.resume()
                 }
-            case let (.refresh(_, _, continuation), .failure(error)):
-                cancelledOperationIDs.remove(operationID)
+            case let (.refresh(_, _, _, continuation), .failure(error)):
+                cancelledExecutionIDs.remove(executionID)
                 continuation.resume(throwing: map(error))
-            case let (.command(_, _, _, continuation), .failure(error)):
-                cancelledOperationIDs.remove(operationID)
+            case let (.command(_, _, _, _, continuation), .failure(error)):
+                cancelledExecutionIDs.remove(executionID)
                 continuation.resume(throwing: map(error))
             default:
                 resume(work, throwing: MediaError.automationFailed(source: source, exitCode: nil))
             }
-            activeOperationID = nil
+            settlement.resolve()
         }
 
+        guard workerEpoch == epoch else { return }
         workTask = nil
         if !workQueue.isEmpty {
             startWorkerIfNeeded()
         }
     }
 
+    private func cancelActiveOperation(_ operationID: MediaOperationID) async {
+        guard activeOperationID == operationID,
+              let executionID = activeExecutionID,
+              let settlement = activeSettlement else { return }
+        cancelledExecutionIDs.insert(executionID)
+        activeWorkTask?.cancel()
+
+        let drain: Task<Void, Never>
+        if let existing = cancellationDrainTasks[executionID] {
+            drain = existing
+        } else {
+            pendingCancellationExecutionIDs.insert(executionID)
+            let executor = scriptExecutor
+            drain = Task.detached { [weak self] in
+                await executor.cancel(executionID)
+                await self?.cancellationCallSettled(executionID)
+                await settlement.wait()
+                await self?.cancellationDrainSettled(executionID)
+            }
+            cancellationDrainTasks[executionID] = drain
+        }
+        if requiresExactCancellationDrain {
+            await drain.value
+            return
+        }
+        if await MediaBoundedWait.wait(
+            for: drain,
+            timeoutNanoseconds: cancellationDrainTimeoutNanoseconds
+        ) {
+            return
+        }
+
+        retireActiveOperation(
+            operationID,
+            executionID: executionID,
+            settlement: settlement
+        )
+    }
+
+    private func retireActiveOperation(
+        _ operationID: MediaOperationID,
+        executionID: MediaOperationID,
+        settlement: MediaWorkSettlement
+    ) {
+        guard activeOperationID == operationID,
+              activeExecutionID == executionID,
+              activeSettlement === settlement else { return }
+        workerEpoch &+= 1
+        workTask?.cancel()
+        activeWorkTask?.cancel()
+        if let activeWork {
+            resume(activeWork, throwing: MediaError.cancelled(source: source))
+        }
+        activeWork = nil
+        activeWorkTask = nil
+        activeSettlement = nil
+        activeOperationID = nil
+        activeExecutionID = nil
+        workTask = nil
+        cancelledExecutionIDs.remove(executionID)
+        if isActive, !workQueue.isEmpty {
+            startWorkerIfNeeded()
+        }
+    }
+
     private func loadSnapshot(
         operationID: MediaOperationID,
+        executionID: MediaOperationID,
         generation: UInt64
     ) async throws -> MediaAdapterUpdate {
-        try ensureCurrent(operationID: operationID, generation: generation)
+        try ensureCurrent(
+            operationID: operationID,
+            executionID: executionID,
+            generation: generation
+        )
         let applicationIsRunning = await applicationStatus.isRunning(
             bundleIdentifier: source.bundleIdentifier
         )
-        try ensureCurrent(operationID: operationID, generation: generation)
+        try ensureCurrent(
+            operationID: operationID,
+            executionID: executionID,
+            generation: generation
+        )
         guard applicationIsRunning else {
             latestSnapshot = nil
             return .sourceDisappeared(source: source, stamp: nextStamp())
@@ -533,9 +800,13 @@ private actor ScriptedDesktopMediaAdapter {
         do {
             let output = try await scriptExecutor.execute(
                 snapshotRequest,
-                operationID: operationID
+                operationID: executionID
             )
-            try ensureCurrent(operationID: operationID, generation: generation)
+            try ensureCurrent(
+                operationID: operationID,
+                executionID: executionID,
+                generation: generation
+            )
             let snapshot = try MediaSnapshotParser.parse(
                 output,
                 source: source,
@@ -544,7 +815,11 @@ private actor ScriptedDesktopMediaAdapter {
             latestSnapshot = snapshot
             return .snapshot(snapshot)
         } catch MediaScriptExecutionError.applicationUnavailable {
-            try ensureCurrent(operationID: operationID, generation: generation)
+            try ensureCurrent(
+                operationID: operationID,
+                executionID: executionID,
+                generation: generation
+            )
             latestSnapshot = nil
             return .sourceDisappeared(source: source, stamp: nextStamp())
         } catch {
@@ -555,12 +830,18 @@ private actor ScriptedDesktopMediaAdapter {
     private func runCommand(
         _ command: MediaCommand,
         operationID: MediaOperationID,
+        executionID: MediaOperationID,
         generation: UInt64
     ) async throws {
-        try ensureCurrent(operationID: operationID, generation: generation)
+        try ensureCurrent(
+            operationID: operationID,
+            executionID: executionID,
+            generation: generation
+        )
         if latestSnapshot == nil {
             let update = try await loadSnapshot(
                 operationID: operationID,
+                executionID: executionID,
                 generation: generation
             )
             guard case .snapshot = update else {
@@ -571,7 +852,11 @@ private actor ScriptedDesktopMediaAdapter {
         let applicationIsRunning = await applicationStatus.isRunning(
             bundleIdentifier: source.bundleIdentifier
         )
-        try ensureCurrent(operationID: operationID, generation: generation)
+        try ensureCurrent(
+            operationID: operationID,
+            executionID: executionID,
+            generation: generation
+        )
         guard applicationIsRunning else {
             latestSnapshot = nil
             throw MediaError.sourceUnavailable(source: source)
@@ -582,32 +867,42 @@ private actor ScriptedDesktopMediaAdapter {
             throw MediaError.sourceUnavailable(source: source)
         }
         let revalidated = try command.normalized(for: latestSnapshot)
-        try ensureCurrent(operationID: operationID, generation: generation)
+        try ensureCurrent(
+            operationID: operationID,
+            executionID: executionID,
+            generation: generation
+        )
         _ = try await scriptExecutor.execute(
             commandRequest(for: revalidated),
-            operationID: operationID
+            operationID: executionID
         )
-        try ensureCurrent(operationID: operationID, generation: generation)
+        try ensureCurrent(
+            operationID: operationID,
+            executionID: executionID,
+            generation: generation
+        )
     }
 
     private func ensureCurrent(
         operationID: MediaOperationID,
+        executionID: MediaOperationID,
         generation: UInt64
     ) throws {
         guard !Task.isCancelled,
               isActive,
               activationGeneration == generation,
               activeOperationID == operationID,
-              !cancelledOperationIDs.contains(operationID) else {
+              activeExecutionID == executionID,
+              !cancelledExecutionIDs.contains(executionID) else {
             throw MediaError.cancelled(source: source)
         }
     }
 
     private func consumeCancellation(
-        for operationID: MediaOperationID,
+        for executionID: MediaOperationID,
         generation: UInt64
     ) -> Bool {
-        let wasCancelled = cancelledOperationIDs.remove(operationID) != nil
+        let wasCancelled = cancelledExecutionIDs.remove(executionID) != nil
         return wasCancelled || !isActive || activationGeneration != generation
     }
 
@@ -617,15 +912,37 @@ private actor ScriptedDesktopMediaAdapter {
     }
 
     private var admittedOperationCount: Int {
-        workQueue.count + (activeOperationID == nil ? 0 : 1)
+        workQueue.count + unsettledExecutionIDs.count
     }
 
+    private func markWorkSettled(_ executionID: MediaOperationID) {
+        if pendingCancellationExecutionIDs.contains(executionID) {
+            workSettledWhileCancelling.insert(executionID)
+        } else {
+            unsettledExecutionIDs.remove(executionID)
+        }
+    }
+
+    private func cancellationCallSettled(_ executionID: MediaOperationID) {
+        pendingCancellationExecutionIDs.remove(executionID)
+        if workSettledWhileCancelling.remove(executionID) != nil {
+            unsettledExecutionIDs.remove(executionID)
+        }
+    }
+
+    private func cancellationDrainSettled(_ executionID: MediaOperationID) {
+        cancellationDrainTasks.removeValue(forKey: executionID)
+    }
+
+    var currentSnapshot: NowPlayingSnapshot? { latestSnapshot }
+    var outstandingWorkCount: Int { unsettledExecutionIDs.count }
+
     private func resume(_ work: WorkItem, throwing error: Error) {
-        cancelledOperationIDs.remove(work.operationID)
+        cancelledExecutionIDs.remove(work.executionID)
         switch work {
-        case let .refresh(_, _, continuation):
+        case let .refresh(_, _, _, continuation):
             continuation.resume(throwing: error)
-        case let .command(_, _, _, continuation):
+        case let .command(_, _, _, _, continuation):
             continuation.resume(throwing: error)
         }
     }

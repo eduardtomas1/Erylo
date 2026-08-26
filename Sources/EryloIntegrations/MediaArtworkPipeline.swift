@@ -94,6 +94,7 @@ where Loader: MediaArtworkDataLoading, Decoder: MediaArtworkDecoding {
     private var entries: [MediaArtworkCacheKey: Entry] = [:]
     private var leastRecentKeys: [MediaArtworkCacheKey] = []
     private var inFlight: [MediaArtworkCacheKey: InFlight] = [:]
+    private var outstanding: [UUID: InFlight] = [:]
     private var totalDecodedBytes = 0
     private var purgeGeneration: UInt64 = 0
 
@@ -136,7 +137,7 @@ where Loader: MediaArtworkDataLoading, Decoder: MediaArtworkDecoding {
             }
             return decoded.artwork
         }
-        guard inFlight.count < maximumInFlightLoads else {
+        guard outstanding.count < maximumInFlightLoads else {
             throw MediaArtworkPipelineError.tooManyInFlightLoads(
                 limit: maximumInFlightLoads
             )
@@ -172,6 +173,7 @@ where Loader: MediaArtworkDataLoading, Decoder: MediaArtworkDecoding {
             state: requestState,
             task: task
         )
+        outstanding[identifier] = inFlight[key]
 
         do {
             let decoded = try await task.value
@@ -181,19 +183,21 @@ where Loader: MediaArtworkDataLoading, Decoder: MediaArtworkDecoding {
                 throw MediaArtworkPipelineError.cancelled
             }
             inFlight.removeValue(forKey: key)
+            outstanding.removeValue(forKey: identifier)
             insert(decoded, for: key)
             return decoded.artwork
         } catch {
             if inFlight[key]?.identifier == identifier {
                 inFlight.removeValue(forKey: key)
             }
+            outstanding.removeValue(forKey: identifier)
             throw error
         }
     }
 
     public func removeAll() {
         purgeGeneration &+= 1
-        for operation in inFlight.values {
+        for operation in outstanding.values {
             operation.state.invalidate()
             operation.task.cancel()
         }
@@ -212,7 +216,7 @@ where Loader: MediaArtworkDataLoading, Decoder: MediaArtworkDecoding {
     }
 
     public var inFlightLoadCount: Int {
-        inFlight.count
+        outstanding.count
     }
 
     private nonisolated static func validate(

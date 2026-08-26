@@ -17,3 +17,4 @@ swift build
 swift run EryloActivityTests
 swift run EryloFoundationTests
 swift run EryloGlanceTests
+swift run EryloTrustTests

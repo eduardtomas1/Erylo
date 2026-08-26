@@ -13,11 +13,14 @@ let package = Package(
         .library(name: "EryloCore", targets: ["EryloCore"]),
         .library(name: "EryloGlance", targets: ["EryloGlance"]),
         .library(name: "EryloIntegrations", targets: ["EryloIntegrations"]),
+        .library(name: "EryloSettingsUI", targets: ["EryloSettingsUI"]),
         .library(name: "EryloSurface", targets: ["EryloSurface"]),
+        .library(name: "EryloTrust", targets: ["EryloTrust"]),
         .library(name: "EryloWindowing", targets: ["EryloWindowing"]),
         .executable(name: "EryloActivityTests", targets: ["EryloActivityTests"]),
         .executable(name: "EryloFoundationTests", targets: ["EryloFoundationTests"]),
         .executable(name: "EryloGlanceTests", targets: ["EryloGlanceTests"]),
+        .executable(name: "EryloTrustTests", targets: ["EryloTrustTests"]),
     ],
     targets: [
         .target(name: "EryloActivity"),
@@ -36,6 +39,17 @@ let package = Package(
         .target(
             name: "EryloSurface",
             dependencies: ["EryloCore"]
+        ),
+        .target(
+            name: "EryloTrust",
+            dependencies: ["EryloCore"]
+        ),
+        .target(
+            name: "EryloSettingsUI",
+            dependencies: [
+                "EryloCore",
+                "EryloTrust",
+            ]
         ),
         .target(
             name: "EryloWindowing",
@@ -71,6 +85,15 @@ let package = Package(
                 "EryloGlance",
             ],
             path: "Tests/GlanceHarness"
+        ),
+        .executableTarget(
+            name: "EryloTrustTests",
+            dependencies: [
+                "EryloCore",
+                "EryloSettingsUI",
+                "EryloTrust",
+            ],
+            path: "Tests/TrustHarness"
         ),
     ],
     swiftLanguageModes: [.v6]

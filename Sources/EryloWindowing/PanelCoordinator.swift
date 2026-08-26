@@ -82,6 +82,28 @@ public final class PanelCoordinator {
         )
     }
 
+    package convenience init(
+        activityModel: SurfaceActivityModel,
+        previewInitialState: PanelPresentationState,
+        displayProvider: any EnabledDisplayProviding = SystemDisplayProvider(),
+        policy: DisplayPolicy = .safeDefault,
+        lifecycleEventSource: any PanelLifecycleEventSourcing = SystemPanelLifecycleEventSource()
+    ) {
+        self.init(
+            displayProvider: displayProvider,
+            policy: policy,
+            lifecycleEventSource: lifecycleEventSource,
+            activityModel: activityModel,
+            panelFactory: {
+                PanelController(
+                    snapshot: $0,
+                    activityModel: $1,
+                    initialState: previewInitialState
+                )
+            }
+        )
+    }
+
     /// Preserves the original injectable one-argument panel factory.
     public convenience init(
         displayProvider: any EnabledDisplayProviding,

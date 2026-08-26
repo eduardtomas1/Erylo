@@ -1,0 +1,8 @@
+# expected	name	public_key
+ready	canonical-32-bytes	eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg=
+invalid	extra-padding	eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg==
+invalid	missing-padding	eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg
+invalid	whitespace	eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e Hg=
+invalid	short-31-bytes	eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eA==
+invalid	long-33-bytes	eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4
+invalid	placeholder	replace_me

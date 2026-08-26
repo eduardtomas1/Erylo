@@ -2,12 +2,12 @@
 
 ## Current state
 
-This repository does not yet contain the parallel Wave 1 code foundation. No build command is valid on this revision. Continuous verification therefore runs repository controls and emits an explicit warning that build/tests were not run.
+This repository contains a Swift 6, macOS 14+ SwiftPM foundation. `Scripts/ci.sh` is the canonical entry point: it builds with warnings as errors, runs the activity, foundation, File Hold, Glance, Media, Trust, Local Integrations, surface, updater, and release harnesses, and uses `shellcheck` when that optional local tool is installed.
 
-When the foundation lands, align CI using the following discovery order:
+Continuous verification uses the following discovery order:
 
 1. Add an executable `Scripts/ci.sh` for an Xcode workspace/project. It must select a shared scheme and an explicit macOS destination and must run the project's real build and test commands.
-2. If the repository remains SwiftPM-only, the existing workflow uses `swift test --parallel` and requires Swift 6 or newer.
+2. If `Scripts/ci.sh` is absent and the repository remains SwiftPM-only, the workflow falls back to `swift test --parallel` and requires Swift 6 or newer.
 3. Record the chosen Xcode/toolchain version in a tracked project file and update the runner only when that requirement differs from the public `macos-14` runner image.
 
 An Xcode project without `Scripts/ci.sh` fails CI deliberately. This avoids a green check based on a guessed scheme, destination, or incomplete test set.
@@ -18,11 +18,22 @@ Run:
 
 ```sh
 .github/scripts/check-repository.sh
+Scripts/ci.sh
 ```
 
 The script fails for tracked files hidden by `.gitignore`, common private signing/credential filenames, private-key markers, high-confidence GitHub/AWS token patterns, invalid tracked shell syntax, or invalid GitHub YAML syntax. A false positive should receive a narrow reviewed exception; do not weaken the repository-wide rule or add a broad ignore pattern.
 
 Use `git check-ignore -v <path>` when changing `.gitignore`, and confirm that collaboration inputs such as `Package.resolved`, project/workspace metadata, entitlements, documentation assets, and sanitized test fixtures remain visible to Git.
+
+The unsigned development bundle path is:
+
+```sh
+Scripts/release/build-app.sh
+Scripts/release/assemble-app.sh
+Scripts/release/validate-app.sh .release/stage/Erylo.app
+```
+
+It works with Command Line Tools and never claims distribution readiness. Developer ID signing and notarization deliberately require full Xcode and external Keychain state; see `docs/RELEASE_RUNBOOK.md`.
 
 ## Verification expectations
 

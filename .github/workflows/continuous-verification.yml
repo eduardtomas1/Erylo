@@ -33,7 +33,7 @@ jobs:
     # macos-14 defaults to Swift 5.10; the package is intentionally Swift 6.
     # The deployment target remains macOS 14 in Package.swift.
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

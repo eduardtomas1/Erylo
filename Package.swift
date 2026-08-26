@@ -19,6 +19,7 @@ let package = Package(
         .library(name: "EryloLocalIntegrations", targets: ["EryloLocalIntegrations"]),
         .library(name: "EryloSurface", targets: ["EryloSurface"]),
         .library(name: "EryloTrust", targets: ["EryloTrust"]),
+        .library(name: "EryloUpdates", targets: ["EryloUpdates"]),
         .library(name: "EryloWindowing", targets: ["EryloWindowing"]),
         .executable(name: "EryloActivityTests", targets: ["EryloActivityTests"]),
         .executable(name: "EryloFileHoldTests", targets: ["EryloFileHoldTests"]),
@@ -28,6 +29,13 @@ let package = Package(
         .executable(name: "EryloTrustTests", targets: ["EryloTrustTests"]),
         .executable(name: "EryloIntegrationTests", targets: ["EryloIntegrationTests"]),
         .executable(name: "EryloSurfaceTests", targets: ["EryloSurfaceTests"]),
+        .executable(name: "EryloUpdateTests", targets: ["EryloUpdateTests"]),
+    ],
+    dependencies: [
+        .package(
+            url: "https://github.com/sparkle-project/Sparkle",
+            exact: "2.9.6"
+        ),
     ],
     targets: [
         .target(name: "EryloActivity"),
@@ -78,11 +86,18 @@ let package = Package(
                 "EryloSurface",
             ]
         ),
+        .target(
+            name: "EryloUpdates",
+            dependencies: [
+                .product(name: "Sparkle", package: "Sparkle"),
+            ]
+        ),
         .executableTarget(
             name: "EryloApp",
             dependencies: [
                 "EryloActivity",
                 "EryloSurface",
+                "EryloUpdates",
                 "EryloWindowing",
             ]
         ),
@@ -149,6 +164,11 @@ let package = Package(
                 "EryloWindowing",
             ],
             path: "Tests/SurfaceHarness"
+        ),
+        .executableTarget(
+            name: "EryloUpdateTests",
+            dependencies: ["EryloUpdates"],
+            path: "Tests/UpdateHarness"
         ),
     ],
     swiftLanguageModes: [.v6]

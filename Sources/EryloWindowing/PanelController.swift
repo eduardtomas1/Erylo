@@ -4,12 +4,17 @@ import EryloSurface
 import SwiftUI
 
 @MainActor
-final class PanelController {
+final class PanelController: PanelPresenting {
     let directDisplayID: CGDirectDisplayID
+
+    var displayIdentity: DisplayIdentity {
+        DisplayIdentity(rawValue: directDisplayID)
+    }
 
     private let panel: NonActivatingPanel
     private let rootView: PanelHitTestView
     private let model: PanelSurfaceModel
+    private var isVisible = false
 
     init(snapshot: DisplaySnapshot) {
         directDisplayID = CGDirectDisplayID(snapshot.identity.rawValue)
@@ -33,11 +38,23 @@ final class PanelController {
     }
 
     func show() {
+        isVisible = true
         panel.orderFrontRegardless()
+        updatePointer(screenPoint: NSEvent.mouseLocation)
     }
 
     func close() {
+        isVisible = false
+        model.cancelPendingInteractions()
+        panel.ignoresMouseEvents = true
         panel.close()
+    }
+
+    func hide() {
+        isVisible = false
+        model.cancelPendingInteractions()
+        panel.ignoresMouseEvents = true
+        panel.orderOut(nil)
     }
 
     func update(snapshot: DisplaySnapshot) {
@@ -45,13 +62,22 @@ final class PanelController {
     }
 
     func updatePointer(screenPoint: CGPoint) {
-        let localPoint = panel.convertPoint(fromScreen: screenPoint)
-        let isInteractive = model.layout.hitRegion.contains(localPoint)
-        panel.ignoresMouseEvents = !isInteractive
-
-        if !isInteractive, model.state == .peek {
-            model.send(.hoverEnded)
+        guard isVisible else {
+            panel.ignoresMouseEvents = true
+            return
         }
+        let localPoint = panel.convertPoint(fromScreen: screenPoint)
+        let pointerDisposition = model.pointerDisposition(at: localPoint)
+        panel.ignoresMouseEvents = !pointerDisposition.acceptsMouseEvents
+        model.setPointerInside(pointerDisposition.isInsideTargetSurface)
+    }
+
+    func performPrimaryAction() {
+        model.send(.primaryAction)
+    }
+
+    func cancelPendingInteractions() {
+        model.cancelPendingInteractions()
     }
 
     private func configurePanel() {
@@ -86,7 +112,9 @@ final class PanelController {
         let layout = model.layout
         panel.setFrame(layout.fixedFrame, display: true, animate: false)
         rootView.frame = CGRect(origin: .zero, size: layout.fixedFrame.size)
-        rootView.hitRegion = layout.hitRegion
-        updatePointer(screenPoint: NSEvent.mouseLocation)
+        rootView.hitRegion = model.interactionHitRegion
+        if isVisible {
+            updatePointer(screenPoint: NSEvent.mouseLocation)
+        }
     }
 }

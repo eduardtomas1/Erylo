@@ -40,9 +40,18 @@ public struct DisplayGeometry: Equatable, Sendable {
 public struct DisplaySnapshot: Equatable, Sendable {
     public let identity: DisplayIdentity
     public let geometry: DisplayGeometry
+    public let isMain: Bool
+    public let isMirrored: Bool
 
-    public init(identity: DisplayIdentity, geometry: DisplayGeometry) {
+    public init(
+        identity: DisplayIdentity,
+        geometry: DisplayGeometry,
+        isMain: Bool = false,
+        isMirrored: Bool = false
+    ) {
         self.identity = identity
         self.geometry = geometry
+        self.isMain = isMain
+        self.isMirrored = isMirrored
     }
 }

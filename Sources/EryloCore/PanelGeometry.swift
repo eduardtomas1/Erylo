@@ -8,6 +8,7 @@ public struct PanelMetrics: Equatable, Sendable {
     public let expandedSize: CGSize
     public let dropTargetSize: CGSize
     public let notchHorizontalPadding: CGFloat
+    public let notchlessTopInset: CGFloat
 
     public init(
         maximumSize: CGSize,
@@ -15,7 +16,8 @@ public struct PanelMetrics: Equatable, Sendable {
         peekSize: CGSize,
         expandedSize: CGSize,
         dropTargetSize: CGSize,
-        notchHorizontalPadding: CGFloat
+        notchHorizontalPadding: CGFloat,
+        notchlessTopInset: CGFloat = 0
     ) {
         self.maximumSize = maximumSize
         self.compactSize = compactSize
@@ -23,6 +25,7 @@ public struct PanelMetrics: Equatable, Sendable {
         self.expandedSize = expandedSize
         self.dropTargetSize = dropTargetSize
         self.notchHorizontalPadding = notchHorizontalPadding
+        self.notchlessTopInset = notchlessTopInset
     }
 
     public static let feasibility = PanelMetrics(
@@ -31,13 +34,37 @@ public struct PanelMetrics: Equatable, Sendable {
         peekSize: CGSize(width: 260, height: 64),
         expandedSize: CGSize(width: 440, height: 190),
         dropTargetSize: CGSize(width: 480, height: 210),
-        notchHorizontalPadding: 24
+        notchHorizontalPadding: 24,
+        notchlessTopInset: 6
     )
+}
+
+public struct RoundedHitRegion: Equatable, Sendable {
+    public let rect: CGRect
+    public let cornerRadius: CGFloat
+
+    public init(rect: CGRect, cornerRadius: CGFloat) {
+        self.rect = rect
+        self.cornerRadius = cornerRadius
+    }
 }
 
 public enum HitRegion: Equatable, Sendable {
     case empty
     case roundedRectangle(CGRect, cornerRadius: CGFloat)
+    /// A flattened, deduplicated conjunction. It cannot form a recursive chain.
+    case intersection([RoundedHitRegion])
+
+    public var componentCount: Int {
+        switch self {
+        case .empty:
+            0
+        case .roundedRectangle:
+            1
+        case let .intersection(components):
+            components.count
+        }
+    }
 
     public func contains(_ point: CGPoint) -> Bool {
         switch self {
@@ -49,6 +76,48 @@ public enum HitRegion: Equatable, Sendable {
                 rect: rect,
                 cornerRadius: cornerRadius
             )
+        case let .intersection(components):
+            return !components.isEmpty && components.allSatisfy { component in
+                Self.roundedRectangleContains(
+                    point,
+                    rect: component.rect,
+                    cornerRadius: component.cornerRadius
+                )
+            }
+        }
+    }
+
+    public func intersecting(_ other: HitRegion) -> HitRegion {
+        switch (self, other) {
+        case (.empty, _), (_, .empty):
+            return .empty
+        case _ where self == other:
+            return self
+        default:
+            let components = (roundedComponents + other.roundedComponents).reduce(
+                into: [RoundedHitRegion]()
+            ) { result, component in
+                if !result.contains(component) {
+                    result.append(component)
+                }
+            }
+            return components.count == 1
+                ? .roundedRectangle(
+                    components[0].rect,
+                    cornerRadius: components[0].cornerRadius
+                )
+                : .intersection(components)
+        }
+    }
+
+    private var roundedComponents: [RoundedHitRegion] {
+        switch self {
+        case .empty:
+            []
+        case let .roundedRectangle(rect, cornerRadius):
+            [RoundedHitRegion(rect: rect, cornerRadius: cornerRadius)]
+        case let .intersection(components):
+            components
         }
     }
 
@@ -81,6 +150,11 @@ public enum HitRegion: Equatable, Sendable {
     }
 }
 
+public enum PanelAttachment: Equatable, Sendable {
+    case notchIntegrated
+    case notchlessPill
+}
+
 public struct PanelLayout: Equatable, Sendable {
     /// The window frame in global display coordinates. It is invariant across states.
     public let fixedFrame: CGRect
@@ -88,6 +162,8 @@ public struct PanelLayout: Equatable, Sendable {
     public let surfaceFrame: CGRect
     public let cornerRadius: CGFloat
     public let hitRegion: HitRegion
+    public let attachment: PanelAttachment
+    public let surfaceTopInset: CGFloat
 
     public init(
         display: DisplayGeometry,
@@ -102,18 +178,22 @@ public struct PanelLayout: Equatable, Sendable {
             height: maximumSize.height
         )
 
+        attachment = display.topEdgeOcclusion == nil ? .notchlessPill : .notchIntegrated
+        surfaceTopInset = attachment == .notchlessPill ? metrics.notchlessTopInset : 0
+
         let requestedSize = Self.requestedSurfaceSize(
             state: state,
             display: display,
             metrics: metrics
         )
+        let availableHeight = max(maximumSize.height - surfaceTopInset, 0)
         let size = CGSize(
             width: min(max(requestedSize.width, 0), maximumSize.width),
-            height: min(max(requestedSize.height, 0), maximumSize.height)
+            height: min(max(requestedSize.height, 0), availableHeight)
         )
         surfaceFrame = CGRect(
             x: (maximumSize.width - size.width) / 2,
-            y: maximumSize.height - size.height,
+            y: maximumSize.height - surfaceTopInset - size.height,
             width: size.width,
             height: size.height
         )

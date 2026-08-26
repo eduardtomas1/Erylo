@@ -53,6 +53,8 @@ let package = Package(
             dependencies: [
                 "EryloCore",
                 "EryloIntegrations",
+                "EryloSurface",
+                "EryloWindowing",
             ],
             path: "Tests/FoundationHarness"
         ),

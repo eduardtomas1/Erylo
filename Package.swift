@@ -11,15 +11,21 @@ let package = Package(
         .executable(name: "Erylo", targets: ["EryloApp"]),
         .library(name: "EryloActivity", targets: ["EryloActivity"]),
         .library(name: "EryloCore", targets: ["EryloCore"]),
+        .library(name: "EryloGlance", targets: ["EryloGlance"]),
         .library(name: "EryloIntegrations", targets: ["EryloIntegrations"]),
         .library(name: "EryloSurface", targets: ["EryloSurface"]),
         .library(name: "EryloWindowing", targets: ["EryloWindowing"]),
         .executable(name: "EryloActivityTests", targets: ["EryloActivityTests"]),
         .executable(name: "EryloFoundationTests", targets: ["EryloFoundationTests"]),
+        .executable(name: "EryloGlanceTests", targets: ["EryloGlanceTests"]),
     ],
     targets: [
         .target(name: "EryloActivity"),
         .target(name: "EryloCore"),
+        .target(
+            name: "EryloGlance",
+            dependencies: ["EryloActivity"]
+        ),
         .target(
             name: "EryloIntegrations",
             dependencies: [
@@ -57,6 +63,14 @@ let package = Package(
                 "EryloWindowing",
             ],
             path: "Tests/FoundationHarness"
+        ),
+        .executableTarget(
+            name: "EryloGlanceTests",
+            dependencies: [
+                "EryloActivity",
+                "EryloGlance",
+            ],
+            path: "Tests/GlanceHarness"
         ),
     ],
     swiftLanguageModes: [.v6]

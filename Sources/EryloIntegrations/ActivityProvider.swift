@@ -1,10 +1,10 @@
-import EryloCore
+import EryloActivity
 import Foundation
 
 /// Public integration events are intentionally declarative: providers cannot submit code to execute.
 public enum ActivityEvent: Equatable, Sendable {
-    case appeared(identifier: String, summary: String)
-    case disappeared(identifier: String)
+    case submit(ActivityRequest)
+    case cancel(ActivityIdentity)
 }
 
 public protocol ActivityProvider: Sendable {

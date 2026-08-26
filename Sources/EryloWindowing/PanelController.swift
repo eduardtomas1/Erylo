@@ -16,10 +16,15 @@ final class PanelController: PanelPresenting {
     private let model: PanelSurfaceModel
     private var isVisible = false
 
-    init(snapshot: DisplaySnapshot, activityModel: SurfaceActivityModel) {
+    init(
+        snapshot: DisplaySnapshot,
+        activityModel: SurfaceActivityModel,
+        initialState: PanelPresentationState = .hidden
+    ) {
         directDisplayID = CGDirectDisplayID(snapshot.identity.rawValue)
         model = PanelSurfaceModel(
             displayGeometry: snapshot.geometry,
+            initialState: initialState,
             activityModel: activityModel
         )
         let layout = model.layout

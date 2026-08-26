@@ -83,7 +83,7 @@ private struct FoundationHarness {
 
         let compact = PanelLayout(display: display, state: .compact)
         check(compact.attachment == .notchlessPill, "notchless display uses pill attachment")
-        check(compact.surfaceTopInset == 6, "notchless pill is inset from the display edge")
+        check(compact.surfaceTopInset == 8, "notchless pill is inset from the display edge")
         check(
             compact.surfaceFrame.maxY == compact.fixedFrame.height - compact.surfaceTopInset,
             "notchless pill inset is represented in AppKit-local geometry"
@@ -114,7 +114,7 @@ private struct FoundationHarness {
         check(notched.attachment == .notchIntegrated, "top-edge occlusion selects notch integration")
         check(notched.surfaceTopInset == 0, "notch-integrated surface remains top-edge anchored")
         check(notched.fixedFrame == compact.fixedFrame, "notch does not change the maximum frame")
-        check(notched.surfaceFrame.width == 268, "notch width and padding expand compact surface")
+        check(notched.surfaceFrame.width == 280, "notch width and padding expand compact surface")
         check(notched.surfaceFrame.height == 74, "notch height expands compact surface")
 
         let constrainedMetrics = PanelMetrics(
@@ -203,17 +203,13 @@ private struct FoundationHarness {
         model.setPointerInside(true)
         model.setPointerInside(false)
         scheduler.runAll()
-        check(model.state == .compact, "cancelled hover entry never reaches peek")
+        check(model.state == .compact, "pointer transit keeps compact geometry stable")
 
         model.setPointerInside(true)
-        scheduler.runNext()
-        check(model.state == .peek, "hover entry reaches peek after the one-shot delay")
-        scheduler.runAll()
-
-        model.setPointerInside(false)
+        check(model.state == .compact, "hover highlights without changing panel geometry")
         model.send(.primaryAction)
         scheduler.runAll()
-        check(model.state == .expanded, "click interrupts a pending hover exit")
+        check(model.state == .expanded, "click deliberately expands the stable compact surface")
 
         let motionScheduler = ManualOneShotScheduler()
         let motionModel = PanelSurfaceModel(
@@ -290,6 +286,107 @@ private struct FoundationHarness {
         check(
             reduceMotionScheduler.lastScheduledDelay == .milliseconds(120),
             "Reduce Motion uses the crossfade/scale completion duration"
+        )
+
+        let notchedDisplay = DisplayGeometry(
+            frame: CGRect(x: 0, y: 0, width: 1_512, height: 982),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1_512, height: 950),
+            backingScaleFactor: 2,
+            topEdgeOcclusion: TopEdgeOcclusion(
+                frame: CGRect(x: 663, y: 950, width: 185, height: 32)
+            )
+        )
+        let topAnchorPoint = CGPoint(x: 280, y: 232)
+        let notchedCompactLayout = PanelLayout(
+            display: notchedDisplay,
+            state: .compact
+        )
+        let notchedPeekLayout = PanelLayout(
+            display: notchedDisplay,
+            state: .peek
+        )
+        check(
+            notchedCompactLayout.hitRegion.contains(topAnchorPoint),
+            "compact notch anchor accepts the real top-edge pointer"
+        )
+        check(
+            !notchedPeekLayout.hitRegion.contains(topAnchorPoint),
+            "peek click shelf does not steal the hardware row"
+        )
+        check(
+            notchedPeekLayout.hoverAnchorRegion.contains(topAnchorPoint),
+            "peek retains the stable compact hover anchor"
+        )
+
+        let stableScheduler = ManualOneShotScheduler()
+        let stableModel = PanelSurfaceModel(
+            displayGeometry: notchedDisplay,
+            initialState: .compact,
+            scheduler: stableScheduler,
+            activityModel: makeActiveActivityModel()
+        )
+        stableModel.setPointerInside(
+            stableModel.pointerDisposition(at: topAnchorPoint).isInsideTargetSurface
+        )
+        check(stableModel.state == .compact, "notch hover preserves compact geometry")
+        for _ in 0..<500 {
+            stableModel.setPointerInside(
+                stableModel.pointerDisposition(at: topAnchorPoint).isInsideTargetSurface
+            )
+        }
+        stableScheduler.runAll()
+        check(
+            stableModel.state == .compact,
+            "stationary notch hover cannot oscillate surface geometry"
+        )
+        check(
+            stableScheduler.activeOperationCount == 0,
+            "stationary notch hover settles without repeating work"
+        )
+
+        let closeScheduler = ManualOneShotScheduler()
+        let closeModel = PanelSurfaceModel(
+            displayGeometry: notchedDisplay,
+            initialState: .expanded,
+            scheduler: closeScheduler,
+            activityModel: makeActiveActivityModel()
+        )
+        closeModel.setPointerInside(
+            closeModel.pointerDisposition(at: topAnchorPoint).isInsideTargetSurface
+        )
+        closeModel.send(.primaryAction)
+        for _ in 0..<500 {
+            closeModel.setPointerInside(
+                closeModel.pointerDisposition(at: topAnchorPoint).isInsideTargetSurface
+            )
+        }
+        closeScheduler.runAll()
+        check(
+            closeModel.state == .compact,
+            "explicit close stays compact under a stationary notch pointer"
+        )
+        check(
+            closeScheduler.activeOperationCount == 0,
+            "explicit close leaves no hover or motion work"
+        )
+
+        closeModel.setPointerInside(false)
+        closeModel.send(.hoverBegan)
+        closeScheduler.runAll()
+        check(
+            closeModel.state == .peek,
+            "a genuine exit rearms the explicit compatibility hover event"
+        )
+
+        let hiddenModel = PanelSurfaceModel(
+            displayGeometry: notchedDisplay,
+            initialState: .hidden,
+            scheduler: ManualOneShotScheduler(),
+            activityModel: SurfaceActivityModel(inert: ())
+        )
+        check(
+            !hiddenModel.pointerDisposition(at: topAnchorPoint).acceptsMouseEvents,
+            "hidden notch anchor remains click-through"
         )
     }
 
@@ -457,6 +554,10 @@ private final class ManualOneShotScheduler: OneShotScheduling {
 
     var lastScheduledDelay: Duration? {
         entries.last?.delay
+    }
+
+    var activeOperationCount: Int {
+        entries.lazy.filter { !$0.token.isCancelled }.count
     }
 
     func schedule(

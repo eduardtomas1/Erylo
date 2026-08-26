@@ -60,8 +60,10 @@ public final class PanelSurfaceModel {
         set { ownedResources.pendingMotionOperation = newValue }
     }
 
+    package private(set) var isPointerInside = false
+
     @ObservationIgnored
-    private var isPointerInside = false
+    private var hoverRequiresExit = false
 
     @ObservationIgnored
     private var reduceMotion = false
@@ -125,8 +127,12 @@ public final class PanelSurfaceModel {
         self.timing = timing
         self.activityModel = activityModel
         ownedResources = PanelSurfaceOwnedResources(activityModel: activityModel)
-        var initialStateMachine = PanelStateMachine(initialState: initialState)
-        if initialState == .hidden, activityModel.current != nil {
+        let resolvedInitialState: PanelPresentationState =
+            initialState == .expanded && activityModel.current == nil
+                ? .compact
+                : initialState
+        var initialStateMachine = PanelStateMachine(initialState: resolvedInitialState)
+        if resolvedInitialState == .hidden, activityModel.current != nil {
             initialStateMachine.updateActivityAvailability(true)
         }
         stateMachine = initialStateMachine
@@ -151,17 +157,29 @@ public final class PanelSurfaceModel {
         if event != .hoverBegan, event != .hoverEnded {
             cancelPendingHover()
         }
-        let stateBeforeEvent = state
-        transition(event)
-        if event == .primaryAction,
-           stateBeforeEvent == .expanded,
-           state == .compact,
-           activityModel.current == nil {
-            updateActivityAvailability(false)
+        if event == .hoverBegan, hoverRequiresExit {
+            return
         }
+        let oldState = state
+        if event == .primaryAction,
+           activityModel.current == nil,
+           state != .dropTarget {
+            stateMachine.send(state == .hidden ? .show : .hide)
+        } else {
+            stateMachine.send(event)
+        }
+        guard state != oldState else { return }
+        if isExplicitContraction(event, from: oldState, to: state) {
+            hoverRequiresExit = true
+        }
+        beginHitRegionTransition(to: layout.hitRegion)
+        didChange?()
     }
 
     public func setPointerInside(_ isInside: Bool) {
+        if !isInside {
+            hoverRequiresExit = false
+        }
         guard isPointerInside != isInside else { return }
         isPointerInside = isInside
         cancelPendingHover()
@@ -169,9 +187,6 @@ public final class PanelSurfaceModel {
         let event: PanelEvent
         let delay: Duration
         switch (state, isInside) {
-        case (.compact, true):
-            event = .hoverBegan
-            delay = timing.hoverEntryDelay
         case (.peek, false):
             event = .hoverEnded
             delay = timing.hoverExitDelay
@@ -192,9 +207,12 @@ public final class PanelSurfaceModel {
     }
 
     public func pointerDisposition(at localPoint: CGPoint) -> PanelPointerDisposition {
-        PanelPointerDisposition(
+        let currentLayout = layout
+        let isInsideHoverTarget = currentLayout.hoverAnchorRegion.contains(localPoint)
+            || currentLayout.hitRegion.contains(localPoint)
+        return PanelPointerDisposition(
             acceptsMouseEvents: interactionHitRegion.contains(localPoint),
-            isInsideTargetSurface: layout.hitRegion.contains(localPoint)
+            isInsideTargetSurface: isInsideHoverTarget
         )
     }
 
@@ -215,6 +233,23 @@ public final class PanelSurfaceModel {
         if state != oldState {
             beginHitRegionTransition(to: layout.hitRegion)
             didChange?()
+        }
+    }
+
+    private func isExplicitContraction(
+        _ event: PanelEvent,
+        from oldState: PanelPresentationState,
+        to newState: PanelPresentationState
+    ) -> Bool {
+        switch (event, oldState, newState) {
+        case (.primaryAction, .expanded, .compact),
+             (.primaryAction, _, .hidden),
+             (.hide, _, .hidden),
+             (.dismiss, _, .compact),
+             (.dismiss, _, .hidden):
+            true
+        default:
+            false
         }
     }
 
@@ -243,8 +278,15 @@ public final class PanelSurfaceModel {
     private func updateActivityAvailability(_ hasActivity: Bool) {
         cancelPendingHover()
         let oldState = state
-        stateMachine.updateActivityAvailability(hasActivity)
+        if !hasActivity, state == .expanded {
+            stateMachine.send(.hide)
+        } else {
+            stateMachine.updateActivityAvailability(hasActivity)
+        }
         if state != oldState {
+            if !hasActivity {
+                hoverRequiresExit = true
+            }
             beginHitRegionTransition(to: layout.hitRegion)
             didChange?()
         }

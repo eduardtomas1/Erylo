@@ -1,5 +1,6 @@
 import AppKit
 import EryloActivity
+import EryloCore
 import EryloSurface
 import EryloUpdates
 import EryloWindowing
@@ -24,19 +25,39 @@ enum EryloApplication {
 private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     private let activityBroker: ActivityBroker
     private let activityModel: SurfaceActivityModel
+    private let previewInitialState: PanelPresentationState?
     private var panelCoordinator: PanelCoordinator?
     private var isStopping = false
 
     override init() {
         let activityBroker = ActivityBroker()
         self.activityBroker = activityBroker
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["ERYLO_PREVIEW_SCENARIO"] == "timer",
+           let snapshot = try? ActivitySurfacePreviewCatalog.timer.snapshot() {
+            activityModel = SurfaceActivityModel(previewSnapshot: snapshot)
+            previewInitialState = ActivitySurfacePreviewCatalog.timer.state
+        } else {
+            activityModel = SurfaceActivityModel(broker: activityBroker)
+            previewInitialState = nil
+        }
+        #else
         activityModel = SurfaceActivityModel(broker: activityBroker)
+        previewInitialState = nil
+        #endif
         super.init()
     }
     private var updateRuntime: UpdateRuntime?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        let panelCoordinator = PanelCoordinator(activityModel: activityModel)
+        let panelCoordinator = if let previewInitialState {
+            PanelCoordinator(
+                activityModel: activityModel,
+                previewInitialState: previewInitialState
+            )
+        } else {
+            PanelCoordinator(activityModel: activityModel)
+        }
         self.panelCoordinator = panelCoordinator
         let updateRuntime = UpdateRuntime(configuration: .mainBundle)
         self.updateRuntime = updateRuntime

@@ -8,11 +8,11 @@ public enum SurfaceStrings {
     )
     public static let quietTitle = String(
         localized: "surface.empty.title",
-        defaultValue: "Quiet for now"
+        defaultValue: "Nothing active"
     )
     public static let quietDetail = String(
         localized: "surface.empty.detail",
-        defaultValue: "New activities will appear here."
+        defaultValue: "Erylo is ready when you are."
     )
     public static let compactQuietTitle = String(
         localized: "surface.empty.compact",
@@ -22,6 +22,15 @@ public enum SurfaceStrings {
         localized: "surface.empty.compact.value",
         defaultValue: "No current activity"
     )
+    public static let compactReady = String(
+        localized: "surface.empty.compact.ready",
+        defaultValue: "Ready"
+    )
+    public static let compactPaused = String(
+        localized: "surface.degraded.compact",
+        defaultValue: "Paused"
+    )
+    public static let primaryShortcutKey = "⌃⌥⌘E"
     public static let degradedTitle = String(
         localized: "surface.degraded.title",
         defaultValue: "Activity feed paused"
@@ -61,6 +70,10 @@ public enum SurfaceStrings {
     public static let collapseHint = String(
         localized: "surface.accessibility.collapse-hint",
         defaultValue: "Use Control-Option-Command-E to return to compact view."
+    )
+    public static let hideHint = String(
+        localized: "surface.accessibility.hide-hint",
+        defaultValue: "Use Control-Option-Command-E to hide Erylo."
     )
     public static let dropTargetHint = String(
         localized: "surface.accessibility.drop-target-hint",

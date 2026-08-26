@@ -30,7 +30,9 @@ jobs:
 
   build-and-test:
     name: Build and test (when configured)
-    runs-on: macos-14
+    # macos-14 defaults to Swift 5.10; the package is intentionally Swift 6.
+    # The deployment target remains macOS 14 in Package.swift.
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Check out repository

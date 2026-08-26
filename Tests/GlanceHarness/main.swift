@@ -8,15 +8,33 @@ enum GlanceHarnessMain {
     static func main() async {
         var harness = GlanceHarness()
         await harness.verifyConversionAndValidation()
+        await harness.verifyConditionalBrokerConformance()
+        await harness.verifyLegacyBrokerRuntimeCompatibility()
         await harness.verifyDisabledStateAndLifecycleIdempotence()
         await harness.verifyConcurrentLifecycleRaces()
+        await harness.verifyQuietPresentationPolicies()
         await harness.verifyPowerDedupeAndStaleGenerations()
         await harness.verifyVolumeDeviceChangesAndFloodDisable()
         await harness.verifyCalendarChangesAndBoundaries()
+        await harness.verifyCalendarSystemConvergence()
+        await harness.verifyCalendarBrokerMutationOrdering()
+        await harness.verifyCalendarNoPresentationSupersedesSubmit()
+        await harness.verifyCalendarEventCoalescing()
         await harness.verifyCalendarPermissionSeams()
+        await harness.verifyCalendarUnavailableTakeover()
         await harness.verifyCountdownCancellationReplacementAndExpiry()
+        await harness.verifyVisibleCountdownDemand()
+        await harness.verifyCountdownDemandMutationOrdering()
         await harness.verifyBoundaryAndMutationDraining()
         await harness.verifyNonCooperativeTimerGenerationBackstop()
+        await harness.verifyCancellationInsensitiveShutdown()
+        await harness.verifyReleaseCleanupFallbacks()
+        await harness.verifyReplacementOwnershipLeases()
+        await harness.verifyCrossInstanceClaimAdmission()
+        await harness.verifyCrossInstanceSubmitAdmission()
+        await harness.verifyUnleasedReplacementFencing()
+        await harness.verifyDisableDeinitOverlap()
+        await harness.verifyLifecycleStress()
         await harness.verifyNormalizedFailureHealth()
         harness.finish()
     }
@@ -79,6 +97,36 @@ private struct GlanceHarness {
             check(capped.seconds == CalendarLookAhead.maximumSeconds, "calendar look-ahead is capped to a reasonable horizon")
         } catch {
             recordUnexpected(error, context: "calendar look-ahead cap")
+        }
+        do {
+            _ = try CalendarPresentationWindow(leadTime: -1)
+            check(false, "negative calendar lead time is rejected")
+        } catch {
+            check(error == .invalidLeadTime, "calendar lead time returns a dedicated typed error")
+        }
+        do {
+            _ = try BatteryPresentationPolicy(
+                lowBatteryThreshold: .nan,
+                transientMilliseconds: 1_800
+            )
+            check(false, "non-finite battery policy threshold is rejected")
+        } catch {
+            check(
+                error == .invalidLowBatteryThreshold,
+                "battery threshold returns a dedicated typed error"
+            )
+        }
+        do {
+            _ = try BatteryPresentationPolicy(
+                lowBatteryThreshold: 0.2,
+                transientMilliseconds: 0
+            )
+            check(false, "non-positive battery transient duration is rejected")
+        } catch {
+            check(
+                error == .invalidTransientDuration,
+                "battery transient duration returns a dedicated typed error"
+            )
         }
 
         do {
@@ -143,6 +191,258 @@ private struct GlanceHarness {
         }
     }
 
+    mutating func verifyConditionalBrokerConformance() async {
+        let scheduler = ManualBrokerScheduler()
+        let concreteBroker = ActivityBroker(expirationScheduler: scheduler)
+        let broker: any GlanceRevisionActivityBroker = concreteBroker
+        let ownershipBroker: any GlanceOwnershipActivityBroker = concreteBroker
+        do {
+            let identity = ActivityIdentity(
+                source: .calendar,
+                identifier: try ActivityIdentifier(validating: "conditional-witness")
+            )
+            let oldSnapshot = try await broker.submit(
+                ActivityRequest(
+                    identifier: identity.identifier.rawValue,
+                    source: identity.source.rawValue,
+                    kind: ActivityKind.meeting.rawValue,
+                    priority: 60,
+                    title: "Old witness activity",
+                    ttlMilliseconds: 1_000
+                )
+            )
+            guard let oldRevision = oldSnapshot.current?.revision else {
+                check(false, "conditional broker witness returns the old revision")
+                return
+            }
+            check(
+                await waitUntil { await scheduler.totalSleepCount == 1 },
+                "conditional broker witness schedules the old expiry"
+            )
+            let replacementSnapshot = try await broker.submit(
+                ActivityRequest(
+                    identifier: identity.identifier.rawValue,
+                    source: identity.source.rawValue,
+                    kind: ActivityKind.meeting.rawValue,
+                    priority: 60,
+                    title: "Replacement witness activity",
+                    ttlMilliseconds: 2_000
+                )
+            )
+            guard let replacementRevision = replacementSnapshot.current?.revision else {
+                check(false, "conditional broker witness returns the replacement revision")
+                return
+            }
+            check(
+                await waitUntil {
+                    let sleepCount = await scheduler.totalSleepCount
+                    let pendingCount = await scheduler.pendingCount
+                    return sleepCount == 2 && pendingCount == 1
+                },
+                "conditional broker witness replaces the expiry one-shot"
+            )
+
+            check(
+                !(await broker.cancel(identity, ifRevision: oldRevision)),
+                "existential conditional cancel rejects a superseded revision"
+            )
+            check(
+                await concreteBroker.snapshot().current?.activity.presentation.title
+                    == "Replacement witness activity",
+                "existential conditional cancel preserves the replacement"
+            )
+            check(
+                await concreteBroker.snapshot().version == replacementSnapshot.version,
+                "rejected conditional cancel publishes no mutation"
+            )
+            check(
+                await concreteBroker.workState().scheduledExpiryCount == 1,
+                "rejected conditional cancel preserves replacement expiry work"
+            )
+            check(
+                await broker.cancel(identity, ifRevision: replacementRevision),
+                "existential conditional cancel removes the exact owned revision"
+            )
+            check(
+                await concreteBroker.snapshot().ordered.isEmpty,
+                "existential conditional cancel publishes the exact removal"
+            )
+            check(
+                await concreteBroker.snapshot().version == replacementSnapshot.version + 1,
+                "exact conditional removal publishes one mutation"
+            )
+            check(
+                await waitUntil {
+                    let workState = await concreteBroker.workState()
+                    let pendingCount = await scheduler.pendingCount
+                    return workState.scheduledExpiryCount == 0 && pendingCount == 0
+                },
+                "exact conditional removal cancels and releases expiry work"
+            )
+
+            let ownedIdentity = ActivityIdentity(
+                source: .calendar,
+                identifier: try ActivityIdentifier(validating: "ownership-witness")
+            )
+            let ownedRequest = ActivityRequest(
+                identifier: ownedIdentity.identifier.rawValue,
+                source: ownedIdentity.source.rawValue,
+                kind: ActivityKind.meeting.rawValue,
+                priority: 60,
+                title: "Old owned witness"
+            )
+            guard let oldIntent = ownershipBroker.ownershipCoordinator.prepareClaim(
+                for: ownedIdentity
+            ), let oldLease = await ownershipBroker.claimOwnership(
+                of: ownedIdentity,
+                admitting: oldIntent
+            ) else {
+                check(false, "existential broker claims the first ownership generation")
+                return
+            }
+            check(
+                try await ownershipBroker.submit(ownedRequest, ifOwnedBy: oldLease) != nil,
+                "existential owned submit admits its current generation"
+            )
+            guard let successorIntent = ownershipBroker.ownershipCoordinator.prepareClaim(
+                for: ownedIdentity
+            ), let successorLease = await ownershipBroker.claimOwnership(
+                of: ownedIdentity,
+                admitting: successorIntent
+            ) else {
+                check(false, "existential broker claims the successor ownership generation")
+                return
+            }
+            check(
+                await concreteBroker.snapshot().ordered.isEmpty,
+                "successor claim atomically retires the predecessor presentation"
+            )
+            check(
+                try await ownershipBroker.submit(ownedRequest, ifOwnedBy: oldLease) == nil,
+                "existential owned submit rejects a superseded generation"
+            )
+            let successorRequest = ActivityRequest(
+                identifier: ownedIdentity.identifier.rawValue,
+                source: ownedIdentity.source.rawValue,
+                kind: ActivityKind.meeting.rawValue,
+                priority: 60,
+                title: "Successor owned witness"
+            )
+            check(
+                try await ownershipBroker.submit(
+                    successorRequest,
+                    ifOwnedBy: successorLease
+                ) != nil,
+                "existential owned submit admits the successor generation"
+            )
+            oldLease.beginRetirement()
+            check(
+                !(await ownershipBroker.cancel(ownedIdentity, ifOwnedBy: oldLease)),
+                "existential old cleanup fails closed after successor publication"
+            )
+            check(
+                !(await ownershipBroker.releaseOwnership(oldLease)),
+                "existential stale release cannot prune successor admission"
+            )
+            check(
+                await concreteBroker.snapshot().current?.activity.presentation.title
+                    == "Successor owned witness",
+                "existential old cleanup and release preserve the successor"
+            )
+            successorLease.beginRetirement()
+            check(
+                try await ownershipBroker.submit(
+                    successorRequest,
+                    ifOwnedBy: successorLease
+                ) == nil,
+                "synchronous retirement closes future existential submit admission"
+            )
+            check(
+                await ownershipBroker.cancel(ownedIdentity, ifOwnedBy: successorLease),
+                "retiring successor may remove its exact current generation"
+            )
+            check(
+                await ownershipBroker.releaseOwnership(successorLease),
+                "exact successor release prunes ownership admission"
+            )
+            check(
+                await concreteBroker.workState().activeOwnershipCount == 0,
+                "existential ownership lifecycle returns retained state to zero"
+            )
+
+        } catch {
+            recordUnexpected(error, context: "conditional broker conformance witness")
+        }
+    }
+
+    mutating func verifyLegacyBrokerRuntimeCompatibility() async {
+        let now = Date(timeIntervalSinceReferenceDate: 19_500)
+
+        do {
+            let broker = LegacyGlanceBroker()
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let clock = ManualGlanceClock(now: now)
+            let meeting = try CalendarMeeting(
+                eventIdentifier: "legacy-calendar",
+                title: "Legacy calendar conformer",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await source.setMeeting(meeting)
+            let provider = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            await provider.enable()
+            check(
+                await provider.status().health == .healthy,
+                "pre-change calendar broker conformance enables without degradation"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Legacy calendar conformer",
+                "pre-change calendar broker conformance submits at runtime"
+            )
+            check(await broker.submitCallCount == 1, "legacy calendar submits exactly once")
+            await provider.disable()
+            check(await broker.cancelCallCount == 1, "legacy calendar disable cancels at runtime")
+            check(await broker.snapshot().ordered.isEmpty, "legacy calendar disable clears activity")
+            check(await provider.workState().isIdle, "legacy calendar disable drains provider work")
+        } catch {
+            recordUnexpected(error, context: "legacy calendar broker runtime compatibility")
+        }
+
+        do {
+            let broker = LegacyGlanceBroker()
+            let clock = ManualGlanceClock(now: now)
+            let timer = try CountdownTimer(
+                title: "Legacy countdown conformer",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            let provider = CountdownGlanceProvider(broker: broker, clock: clock)
+            await provider.setCountdown(timer)
+            await provider.enable()
+            check(
+                await provider.status().health == .healthy,
+                "pre-change countdown broker conformance enables without degradation"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Legacy countdown conformer",
+                "pre-change countdown broker conformance submits at runtime"
+            )
+            check(await broker.submitCallCount == 1, "legacy countdown submits exactly once")
+            await provider.disable()
+            check(await broker.cancelCallCount == 1, "legacy countdown disable cancels at runtime")
+            check(await broker.snapshot().ordered.isEmpty, "legacy countdown disable clears activity")
+            check(await provider.workState().isIdle, "legacy countdown disable drains provider work")
+        } catch {
+            recordUnexpected(error, context: "legacy countdown broker runtime compatibility")
+        }
+    }
+
     mutating func verifyDisabledStateAndLifecycleIdempotence() async {
         let broker = makeBroker()
         let powerSource = ManualPowerSource()
@@ -200,7 +500,7 @@ private struct GlanceHarness {
         check(await glance.volume.workState().isIdle, "aggregate shutdown drains volume work")
         check(await glance.calendar.workState().isIdle, "aggregate shutdown drains calendar work")
         check(await glance.countdown.workState().isIdle, "aggregate shutdown drains countdown work")
-        check(await calendarSource.permissionRequestCount == 1, "aggregate lifecycle requests calendar access only after enable")
+        check(await calendarSource.permissionRequestCount == 0, "aggregate restore-style enable never requests calendar access")
         check(await broker.snapshot().ordered.isEmpty, "aggregate shutdown cancels all broker activities")
     }
 
@@ -299,6 +599,118 @@ private struct GlanceHarness {
         check(await calendarBroker.snapshot().ordered.isEmpty, "calendar stale callback after stop is inert")
     }
 
+    mutating func verifyQuietPresentationPolicies() async {
+        let scheduler = ManualBrokerScheduler()
+        let batteryBroker = ActivityBroker(expirationScheduler: scheduler)
+        let batterySource = ManualPowerSource()
+        let battery = PowerGlanceProvider(broker: batteryBroker, source: batterySource)
+        do {
+            let resting = try PowerSnapshot(
+                chargeLevel: 0.72,
+                isCharging: false,
+                isConnectedToPower: false
+            )
+            let changed = try PowerSnapshot(
+                chargeLevel: 0.71,
+                isCharging: false,
+                isConnectedToPower: false
+            )
+            let low = try PowerSnapshot(
+                chargeLevel: 0.18,
+                isCharging: false,
+                isConnectedToPower: false
+            )
+
+            await battery.enable()
+            await batterySource.emit(.snapshot(resting))
+            check(
+                await waitUntil {
+                    await battery.latestProcessedSnapshot() == resting
+                },
+                "ordinary initial battery snapshot is consumed as the quiet baseline"
+            )
+            check(await batteryBroker.snapshot().ordered.isEmpty, "ordinary initial battery snapshot stays hidden at rest")
+            check(await scheduler.totalSleepCount == 0, "resting battery starts no broker expiry work")
+
+            await batterySource.emit(.snapshot(changed))
+            check(
+                await waitUntil { !(await batteryBroker.snapshot().ordered.isEmpty) },
+                "battery changes receive a transient presentation"
+            )
+            if case .expires = await batteryBroker.snapshot().current?.activity.lifecycle {
+                check(true, "ordinary battery change is explicitly transient")
+            } else {
+                check(false, "ordinary battery change is explicitly transient")
+            }
+
+            await batterySource.emit(.snapshot(low))
+            check(
+                await waitUntil {
+                    await batteryBroker.snapshot().current?.activity.presentation.detail == "18%"
+                },
+                "actionable low battery replaces the transient presentation"
+            )
+            if case .untilCancelled = await batteryBroker.snapshot().current?.activity.lifecycle {
+                check(true, "actionable low battery is explicitly ambient")
+            } else {
+                check(false, "actionable low battery is explicitly ambient")
+            }
+            check(await batteryBroker.workState().scheduledExpiryCount == 0, "ambient low battery owns no repeating or expiry task")
+            await battery.disable()
+        } catch {
+            recordUnexpected(error, context: "quiet battery presentation policy")
+        }
+
+        let now = Date(timeIntervalSinceReferenceDate: 25_000)
+        let calendarClock = ManualGlanceClock(now: now)
+        let calendarSource = ManualCalendarSource(authorization: .fullAccess)
+        let calendarBroker = makeBroker()
+        let calendar = CalendarGlanceProvider(
+            broker: calendarBroker,
+            source: calendarSource,
+            clock: calendarClock
+        )
+        do {
+            let distant = try CalendarMeeting(
+                eventIdentifier: "distant",
+                title: "Later review",
+                startDate: now.addingTimeInterval(3_600),
+                endDate: now.addingTimeInterval(4_200)
+            )
+            await calendarSource.setMeeting(distant)
+            await calendar.enable()
+            check(await calendarBroker.snapshot().ordered.isEmpty, "distant meeting creates no broker activity")
+            check(
+                await waitUntil {
+                    await calendarClock.pendingDeadlines == [distant.startDate.addingTimeInterval(-600)]
+                },
+                "distant meeting schedules the documented ten-minute lead boundary"
+            )
+            let queryCount = await calendarSource.queryCount
+            await yieldSeveralTimes()
+            check(await calendarSource.queryCount == queryCount, "calendar performs no idle polling")
+
+            let leadStart = distant.startDate.addingTimeInterval(-600)
+            await calendarClock.advance(to: leadStart.addingTimeInterval(-0.001))
+            await yieldSeveralTimes()
+            check(await calendarBroker.snapshot().ordered.isEmpty, "meeting stays hidden immediately before lead time")
+            await calendarClock.advance(to: leadStart)
+            check(
+                await waitUntil {
+                    await calendarBroker.snapshot().current?.activity.presentation.title == "Later review"
+                },
+                "meeting becomes visible exactly at the lead-time boundary"
+            )
+            check(
+                await waitUntil { await calendarClock.pendingDeadlines == [distant.startDate] },
+                "lead-time presentation schedules only the meeting-start boundary"
+            )
+            await calendar.disable()
+        } catch {
+            recordUnexpected(error, context: "quiet calendar presentation policy")
+        }
+    }
+
     mutating func verifyPowerDedupeAndStaleGenerations() async {
         let broker = makeBroker()
         let source = ManualPowerSource()
@@ -306,9 +718,11 @@ private struct GlanceHarness {
         do {
             let first = try PowerSnapshot(chargeLevel: 0.4, isCharging: false, isConnectedToPower: false)
             let changed = try PowerSnapshot(chargeLevel: 0.5, isCharging: false, isConnectedToPower: false)
+            let actionable = try PowerSnapshot(chargeLevel: 0.1, isCharging: false, isConnectedToPower: false)
             await provider.enable()
             await source.emit(.snapshot(first))
-            check(await waitUntil { await broker.snapshot().version == 1 }, "power event reaches broker")
+            await yieldSeveralTimes()
+            check(await broker.snapshot().ordered.isEmpty, "initial ordinary power event establishes a quiet baseline")
             let firstSnapshot = await broker.snapshot()
 
             await source.emit(.snapshot(first))
@@ -327,7 +741,7 @@ private struct GlanceHarness {
             await yieldSeveralTimes()
             check(await broker.snapshot().ordered.isEmpty, "stale power callback cannot submit after re-enable")
 
-            await source.emit(.snapshot(changed), handlerIndex: 1)
+            await source.emit(.snapshot(actionable), handlerIndex: 1)
             check(await waitUntil { !(await broker.snapshot().ordered.isEmpty) }, "current power callback can submit")
             await provider.disable()
         } catch {
@@ -390,7 +804,10 @@ private struct GlanceHarness {
             await source.setMeeting(first)
             await provider.enable()
             check(await broker.snapshot().current?.activity.presentation.title == "Design review", "calendar enable submits the next meeting")
-            check(await clock.pendingCount == 1, "calendar schedules one start boundary")
+            check(
+                await waitUntil { await clock.pendingCount == 1 },
+                "calendar schedules one start boundary"
+            )
             let initialVersion = await broker.snapshot().version
 
             await source.emitChange()
@@ -427,13 +844,593 @@ private struct GlanceHarness {
 
             await clock.advance(to: changed.endDate)
             check(await waitUntil { await broker.snapshot().ordered.isEmpty }, "meeting end boundary cancels expired calendar activity")
-            check(await provider.workState().scheduledBoundaryCount == 0, "calendar expiry leaves no timer work")
+            check(
+                await waitUntil { await provider.workState().scheduledBoundaryCount == 0 },
+                "calendar expiry leaves no timer work"
+            )
 
             await provider.disable()
             check(await source.stopCount == 1, "calendar disable removes its observer")
             check(await provider.workState().isIdle, "calendar disable releases all work")
         } catch {
             recordUnexpected(error, context: "calendar changes")
+        }
+    }
+
+    mutating func verifyCalendarSystemConvergence() async {
+        let now = Date(timeIntervalSinceReferenceDate: 35_000)
+        let clock = ManualGlanceClock(now: now)
+        let source = ManualCalendarSource(authorization: .fullAccess)
+        let broker = makeBroker()
+        let provider = CalendarGlanceProvider(broker: broker, source: source, clock: clock)
+        do {
+            let meeting = try CalendarMeeting(
+                eventIdentifier: "system-events",
+                title: "Clock convergence",
+                startDate: now.addingTimeInterval(3_600),
+                endDate: now.addingTimeInterval(4_200)
+            )
+            await source.setMeeting(meeting)
+            await provider.enable()
+            check(await broker.snapshot().ordered.isEmpty, "system-event fixture begins outside the meeting lead window")
+
+            await clock.setNow(meeting.startDate.addingTimeInterval(-300))
+            await source.emit(.wallClockChanged)
+            check(
+                await waitUntil {
+                    await broker.snapshot().current?.activity.presentation.title == "Clock convergence"
+                },
+                "wall-clock change converges a meeting that moved into lead time"
+            )
+            check(
+                await waitUntil { await clock.pendingDeadlines == [meeting.startDate] },
+                "wall-clock convergence replaces the stale lead boundary"
+            )
+
+            let wallClockVersion = await broker.snapshot().version
+            await source.emit(.timeZoneChanged)
+            check(
+                await waitUntil { await broker.snapshot().version == wallClockVersion + 1 },
+                "time-zone change refreshes visible time-derived presentation"
+            )
+            check(
+                await waitUntil { await clock.pendingCount == 1 },
+                "time-zone convergence retains one boundary"
+            )
+
+            await clock.setNow(meeting.endDate.addingTimeInterval(1))
+            await source.emit(.didWake)
+            check(await waitUntil { await broker.snapshot().ordered.isEmpty }, "wake after meeting end removes stale activity")
+            check(
+                await waitUntil { await clock.pendingCount == 0 },
+                "wake after meeting end leaves no stale boundary"
+            )
+
+            await clock.setNow(now)
+            await source.emit(.wallClockChanged)
+            check(
+                await waitUntil {
+                    await clock.pendingDeadlines == [meeting.startDate.addingTimeInterval(-600)]
+                },
+                "backward wall-clock change restores the correct future lead boundary"
+            )
+            check(await broker.snapshot().ordered.isEmpty, "backward clock convergence keeps distant meeting hidden")
+            await provider.disable()
+        } catch {
+            recordUnexpected(error, context: "calendar system convergence")
+        }
+    }
+
+    mutating func verifyCalendarBrokerMutationOrdering() async {
+        let now = Date(timeIntervalSinceReferenceDate: 37_000)
+        let healthy = GlanceProviderStatus(
+            isEnabled: true,
+            capability: .available,
+            health: .healthy
+        )
+        let activeWork = GlanceProviderWorkState(
+            activeObserverCount: 1,
+            activeConsumerTaskCount: 1,
+            scheduledBoundaryCount: 1,
+            activeBrokerMutationCount: 0
+        )
+
+        do {
+            let clock = ManualGlanceClock(now: now)
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let broker = GatedGlanceBroker()
+            let provider = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            let oldMeeting = try CalendarMeeting(
+                eventIdentifier: "old-submit",
+                title: "Old submit",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            let newMeeting = try CalendarMeeting(
+                eventIdentifier: "new-submit",
+                title: "New submit",
+                startDate: now.addingTimeInterval(120),
+                endDate: now.addingTimeInterval(240)
+            )
+            await source.setMeeting(oldMeeting)
+            await broker.gateNextSubmit()
+            let enable = Task { await provider.enable() }
+            check(
+                await waitUntil { await broker.submitPending },
+                "old calendar activation reaches its gated submit"
+            )
+
+            await source.setMeeting(newMeeting)
+            await source.emitChange()
+            check(
+                await waitUntil { await source.queryCount == 2 },
+                "new calendar store refresh overlaps the old submit"
+            )
+            check(
+                await broker.submitCallCount == 1,
+                "new calendar submit remains serialized behind the old submit"
+            )
+            await broker.releaseSubmit()
+            await enable.value
+            check(
+                await waitUntil {
+                    await broker.snapshot().current?.activity.presentation.title == "New submit"
+                },
+                "new calendar submit is the final broker mutation"
+            )
+            check(await broker.submitCallCount == 2, "both ordered calendar submits execute exactly once")
+            check(await broker.snapshot().ordered.count == 1, "ordered calendar submits retain one identity")
+            check(await provider.status() == healthy, "latest submit refresh owns exact healthy status")
+            check(
+                await waitUntil { await clock.pendingDeadlines == [newMeeting.startDate] },
+                "latest submit refresh owns the exact boundary"
+            )
+            check(await provider.workState() == activeWork, "latest submit refresh drains its broker mutation tail")
+
+            let reusableMeeting = try CalendarMeeting(
+                eventIdentifier: "reusable-submit",
+                title: "Reusable submit",
+                startDate: now.addingTimeInterval(150),
+                endDate: now.addingTimeInterval(270)
+            )
+            await broker.gateNextSubmit()
+            await source.setMeeting(reusableMeeting)
+            await source.emitChange()
+            check(
+                await waitUntil { await broker.submitPending },
+                "serialized submit capacity is reusable after the race"
+            )
+            await broker.releaseSubmit()
+            check(
+                await waitUntil {
+                    await broker.snapshot().current?.activity.presentation.title == "Reusable submit"
+                },
+                "reused serialized submit capacity converges"
+            )
+            check(
+                await waitUntil { await clock.pendingDeadlines == [reusableMeeting.startDate] },
+                "reused submit capacity replaces the boundary exactly"
+            )
+            check(await provider.workState() == activeWork, "reused submit capacity fully drains")
+            await provider.disable()
+            check(await broker.snapshot().ordered.isEmpty, "submit race disable removes calendar activity")
+            check(await provider.workState().isIdle, "submit race disable drains all work")
+        } catch {
+            recordUnexpected(error, context: "calendar old-submit/new-submit ordering")
+        }
+
+        do {
+            let clock = ManualGlanceClock(now: now)
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let broker = GatedGlanceBroker()
+            let provider = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            let endingMeeting = try CalendarMeeting(
+                eventIdentifier: "old-cancel",
+                title: "Old cancel",
+                startDate: now.addingTimeInterval(-60),
+                endDate: now.addingTimeInterval(60)
+            )
+            let newMeeting = try CalendarMeeting(
+                eventIdentifier: "after-cancel",
+                title: "After cancel",
+                startDate: now.addingTimeInterval(120),
+                endDate: now.addingTimeInterval(240)
+            )
+            await source.setMeeting(endingMeeting)
+            await provider.enable()
+            check(await broker.submitCallCount == 1, "cancel race fixture submits its active meeting once")
+            await broker.gateNextCancel()
+            await clock.advance(to: endingMeeting.endDate)
+            check(
+                await waitUntil { await broker.cancelPending },
+                "old boundary refresh reaches its gated cancellation"
+            )
+
+            await source.setMeeting(newMeeting)
+            await source.emitChange()
+            check(
+                await waitUntil { await source.queryCount == 3 },
+                "new store refresh overlaps the old cancellation"
+            )
+            check(
+                await broker.submitCallCount == 1,
+                "new submit remains serialized behind the old cancellation"
+            )
+            await broker.releaseCancel()
+            check(
+                await waitUntil {
+                    await broker.snapshot().current?.activity.presentation.title == "After cancel"
+                },
+                "new submit survives stale old-cancel completion"
+            )
+            check(await broker.cancelCallCount == 1, "old calendar cancellation executes exactly once")
+            check(await broker.submitCallCount == 2, "post-cancel calendar submit executes exactly once")
+            check(await broker.snapshot().ordered.count == 1, "cancel-submit race retains one exact broker record")
+            check(await provider.status() == healthy, "post-cancel refresh owns exact healthy status")
+            check(
+                await waitUntil { await clock.pendingDeadlines == [newMeeting.startDate] },
+                "post-cancel refresh owns the exact boundary"
+            )
+            check(await provider.workState() == activeWork, "cancel-submit race drains its mutation tail")
+
+            let reusableMeeting = try CalendarMeeting(
+                eventIdentifier: "reusable-after-cancel",
+                title: "Reusable after cancel",
+                startDate: now.addingTimeInterval(150),
+                endDate: now.addingTimeInterval(270)
+            )
+            await broker.gateNextSubmit()
+            await source.setMeeting(reusableMeeting)
+            await source.emitChange()
+            check(
+                await waitUntil { await broker.submitPending },
+                "cancel-submit serializer retains reusable capacity"
+            )
+            await broker.releaseSubmit()
+            check(
+                await waitUntil {
+                    await broker.snapshot().current?.activity.presentation.title == "Reusable after cancel"
+                },
+                "reused cancel-submit serializer converges"
+            )
+            check(
+                await waitUntil { await clock.pendingDeadlines == [reusableMeeting.startDate] },
+                "reused cancel-submit serializer owns one exact boundary"
+            )
+            check(await provider.workState() == activeWork, "reused cancel-submit serializer fully drains")
+            await provider.disable()
+            check(await broker.snapshot().ordered.isEmpty, "cancel-submit race disable removes activity")
+            check(await provider.workState().isIdle, "cancel-submit race disable drains all work")
+        } catch {
+            recordUnexpected(error, context: "calendar old-cancel/new-submit ordering")
+        }
+    }
+
+    mutating func verifyCalendarNoPresentationSupersedesSubmit() async {
+        let now = Date(timeIntervalSinceReferenceDate: 38_000)
+        let healthy = GlanceProviderStatus(
+            isEnabled: true,
+            capability: .available,
+            health: .healthy
+        )
+
+        for scenario in CalendarClearScenario.allCases {
+            let clock = ManualGlanceClock(now: now)
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let broker = GatedGlanceBroker()
+            let provider = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+
+            do {
+                let staleMeeting = try CalendarMeeting(
+                    eventIdentifier: "stale-\(scenario.label)",
+                    title: "STALE SHOULD NOT SURVIVE",
+                    startDate: now.addingTimeInterval(60),
+                    endDate: now.addingTimeInterval(180)
+                )
+                let distantMeeting = try CalendarMeeting(
+                    eventIdentifier: "distant-\(scenario.label)",
+                    title: "Distant replacement",
+                    startDate: now.addingTimeInterval(3_600),
+                    endDate: now.addingTimeInterval(3_900)
+                )
+                await source.setMeeting(staleMeeting)
+                await broker.gateNextSubmit()
+                let enable = Task { await provider.enable() }
+                check(
+                    await waitUntil { await broker.submitPending },
+                    "\(scenario.label) fixture gates the stale activation submit"
+                )
+
+                switch scenario {
+                case .noMeeting:
+                    await source.setMeeting(nil)
+                case .distantMeeting:
+                    await source.setMeeting(distantMeeting)
+                case .queryFailure:
+                    await source.setFailQueries(true)
+                }
+                await source.emitChange()
+                check(
+                    await waitUntil { await source.queryCount == 2 },
+                    "\(scenario.label) newer refresh resolves before stale submit completion"
+                )
+                check(
+                    await broker.cancelCallCount == 0,
+                    "\(scenario.label) clear remains serialized behind stale submit"
+                )
+
+                await broker.releaseSubmit()
+                await enable.value
+                check(
+                    await waitUntil { await broker.snapshot().ordered.isEmpty },
+                    "\(scenario.label) newer no-presentation intent clears stale broker activity"
+                )
+                check(
+                    await broker.cancelCallCount == 1,
+                    "\(scenario.label) newer result executes one explicit broker clear"
+                )
+                check(
+                    await broker.snapshot().current?.activity.presentation.title
+                        != "STALE SHOULD NOT SURVIVE",
+                    "\(scenario.label) stale activation title cannot survive"
+                )
+
+                let expectedStatus = scenario == .queryFailure
+                    ? GlanceProviderStatus(
+                        isEnabled: true,
+                        capability: .available,
+                        health: .degraded(.sourceQueryFailed)
+                    )
+                    : healthy
+                check(
+                    await waitUntil { await provider.status() == expectedStatus },
+                    "\(scenario.label) latest refresh owns exact provider status"
+                )
+                let expectedWork = GlanceProviderWorkState(
+                    activeObserverCount: 1,
+                    activeConsumerTaskCount: 1,
+                    scheduledBoundaryCount: scenario == .distantMeeting ? 1 : 0,
+                    activeBrokerMutationCount: 0
+                )
+                check(
+                    await waitUntil { await provider.workState() == expectedWork },
+                    "\(scenario.label) leaves no hidden mutation or unexpected boundary work"
+                )
+                if scenario == .distantMeeting {
+                    check(
+                        await waitUntil {
+                            await clock.pendingDeadlines
+                                == [distantMeeting.startDate.addingTimeInterval(-600)]
+                        },
+                        "distant replacement retains only its lead-time boundary"
+                    )
+                } else {
+                    check(
+                        await clock.pendingDeadlines.isEmpty,
+                        "\(scenario.label) leaves no clock work"
+                    )
+                }
+
+                let reusableMeeting = try CalendarMeeting(
+                    eventIdentifier: "reuse-\(scenario.label)",
+                    title: "Reusable after \(scenario.label)",
+                    startDate: now.addingTimeInterval(120),
+                    endDate: now.addingTimeInterval(240)
+                )
+                await source.setFailQueries(false)
+                await source.setMeeting(reusableMeeting)
+                await source.emitChange()
+                check(
+                    await waitUntil {
+                        await broker.snapshot().current?.activity.presentation.title
+                            == "Reusable after \(scenario.label)"
+                    },
+                    "\(scenario.label) serializer remains reusable after stale clear"
+                )
+                check(
+                    await waitUntil { await clock.pendingDeadlines == [reusableMeeting.startDate] },
+                    "\(scenario.label) reuse installs one exact boundary"
+                )
+                check(await provider.status() == healthy, "\(scenario.label) reuse restores healthy status")
+                check(
+                    await provider.workState() == GlanceProviderWorkState(
+                        activeObserverCount: 1,
+                        activeConsumerTaskCount: 1,
+                        scheduledBoundaryCount: 1,
+                        activeBrokerMutationCount: 0
+                    ),
+                    "\(scenario.label) reuse drains its mutation tail"
+                )
+                await provider.disable()
+                check(await broker.snapshot().ordered.isEmpty, "\(scenario.label) disable removes reused activity")
+                check(await provider.workState().isIdle, "\(scenario.label) disable drains all work")
+                check(await clock.pendingDeadlines.isEmpty, "\(scenario.label) disable drains reused boundary")
+            } catch {
+                recordUnexpected(error, context: "calendar \(scenario.label) stale-submit clear")
+            }
+        }
+
+        do {
+            let clock = ManualGlanceClock(now: now)
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let broker = GatedGlanceBroker()
+            let provider = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            let meeting = try CalendarMeeting(
+                eventIdentifier: "disable-stale-submit",
+                title: "Disable stale submit",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await source.setMeeting(meeting)
+            await broker.gateNextSubmit()
+            let enable = Task { await provider.enable() }
+            check(
+                await waitUntil { await broker.submitPending },
+                "deactivation fixture gates activation submit"
+            )
+            let disableFlag = CompletionFlag()
+            let disable = Task {
+                await provider.disable()
+                await disableFlag.markComplete()
+            }
+            await yieldSeveralTimes()
+            check(!(await disableFlag.isComplete), "deactivation drains gated prior submit")
+            await broker.releaseSubmit()
+            await enable.value
+            await disable.value
+            check(await broker.snapshot().ordered.isEmpty, "deactivation clear wins after stale submit")
+            check(await broker.cancelCallCount == 1, "deactivation performs one terminal broker clear")
+            check(await provider.status() == .disabled, "deactivation overlap reaches exact disabled status")
+            check(await provider.workState().isIdle, "deactivation overlap leaves no hidden work")
+            check(await clock.pendingDeadlines.isEmpty, "deactivation overlap leaves no boundary")
+
+            await provider.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Disable stale submit",
+                "deactivation overlap retains reusable broker capacity"
+            )
+            check(await provider.status() == healthy, "deactivation overlap reuse becomes healthy")
+            await provider.disable()
+            check(await broker.snapshot().ordered.isEmpty, "reused deactivation fixture disables cleanly")
+            check(await provider.workState().isIdle, "reused deactivation fixture drains all work")
+        } catch {
+            recordUnexpected(error, context: "calendar deactivation stale-submit clear")
+        }
+    }
+
+    mutating func verifyCalendarEventCoalescing() async {
+        let now = Date(timeIntervalSinceReferenceDate: 39_000)
+        let movedNow = now.addingTimeInterval(30)
+        let clock = NonCooperativeGlanceClock(now: now)
+        let source = ManualCalendarSource(authorization: .fullAccess)
+        let broker = GatedGlanceBroker()
+        let provider = CalendarGlanceProvider(
+            broker: broker,
+            source: source,
+            clock: clock
+        )
+
+        do {
+            let initialMeeting = try CalendarMeeting(
+                eventIdentifier: "coalesced-initial",
+                title: "Initial relay meeting",
+                startDate: now.addingTimeInterval(120),
+                endDate: now.addingTimeInterval(300)
+            )
+            let updatedMeeting = try CalendarMeeting(
+                eventIdentifier: "coalesced-updated",
+                title: "Updated relay meeting",
+                startDate: now.addingTimeInterval(180),
+                endDate: now.addingTimeInterval(360)
+            )
+            await source.setMeeting(initialMeeting)
+            await provider.enable()
+            check(await waitUntil { await clock.waiterCount == 1 }, "coalescing fixture owns one initial boundary")
+            check(await broker.submitCallCount == 1, "coalescing fixture submits its initial meeting once")
+
+            await broker.gateNextSubmit()
+            await source.setMeeting(updatedMeeting)
+            await source.emit(.eventStoreChanged)
+            check(
+                await waitUntil { await broker.submitPending },
+                "calendar consumer is deterministically gated in a store submission"
+            )
+            await clock.setNow(movedNow)
+            await source.emit(.wallClockChanged)
+            await source.emit(.eventStoreChanged)
+            await broker.releaseSubmit()
+            check(
+                await waitUntil { await clock.cancellationAttemptCount >= 1 },
+                "store refresh begins replacing the noncooperative old boundary"
+            )
+            await clock.fire(index: 0, at: movedNow)
+            check(
+                await waitUntil {
+                    let submitCallCount = await broker.submitCallCount
+                    let cancellationAttemptCount = await clock.cancellationAttemptCount
+                    return submitCallCount == 3 && cancellationAttemptCount >= 2
+                },
+                "system-dominant coalescing forces resubmission and boundary replacement"
+            )
+            await clock.fire(index: 0, at: movedNow)
+            check(
+                await waitUntil {
+                    let totalSleepCount = await clock.totalSleepCount
+                    let pendingDeadlines = await clock.pendingDeadlines
+                    return totalSleepCount == 3
+                        && pendingDeadlines == [updatedMeeting.startDate]
+                },
+                "coalesced system refresh installs one fresh exact deadline"
+            )
+            check(await source.queryCount == 3, "equivalent store trigger coalesces behind the stronger system trigger")
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Updated relay meeting",
+                "coalesced refresh retains the latest broker presentation"
+            )
+            check(await broker.snapshot().ordered.count == 1, "coalesced refresh retains one broker identity")
+            check(
+                await provider.status() == GlanceProviderStatus(
+                    isEnabled: true,
+                    capability: .available,
+                    health: .healthy
+                ),
+                "coalesced refresh retains exact healthy status"
+            )
+            check(
+                await provider.workState() == GlanceProviderWorkState(
+                    activeObserverCount: 1,
+                    activeConsumerTaskCount: 1,
+                    scheduledBoundaryCount: 1,
+                    activeBrokerMutationCount: 0
+                ),
+                "coalesced refresh leaves one observer, consumer, and one-shot boundary"
+            )
+
+            let disableFlag = CompletionFlag()
+            let disable = Task {
+                await provider.disable()
+                await disableFlag.markComplete()
+            }
+            check(
+                await waitUntil { await clock.cancellationAttemptCount >= 3 },
+                "disable cancels the final noncooperative boundary"
+            )
+            await yieldSeveralTimes()
+            check(!(await disableFlag.isComplete), "disable drains the final noncooperative boundary")
+            await clock.fire(index: 0, at: movedNow)
+            await disable.value
+            check(await clock.waiterCount == 0, "disable leaves no stale clock waiter")
+            check(await broker.snapshot().ordered.isEmpty, "disable removes the coalesced calendar activity")
+            check(await provider.status() == .disabled, "coalesced calendar disable reaches exact disabled status")
+            check(await provider.workState().isIdle, "coalesced calendar disable drains all work")
+
+            let callsAfterDisable = await broker.physicalCallCount
+            await source.emitStale(.didWake)
+            await source.emitStale(.eventStoreChanged)
+            await yieldSeveralTimes()
+            check(
+                await broker.physicalCallCount == callsAfterDisable,
+                "coalesced stale events perform zero physical broker work after disable"
+            )
+            check(await source.queryCount == 3, "coalesced stale events perform zero queries after disable")
+        } catch {
+            recordUnexpected(error, context: "calendar strongest-trigger coalescing")
         }
     }
 
@@ -462,9 +1459,22 @@ private struct GlanceHarness {
         check(await granted.permissionRequestCount == 0, "not-determined permission remains untouched before enable")
         await grantedProvider.enable()
         await grantedProvider.enable()
-        check(await granted.permissionRequestCount == 1, "explicit enable requests calendar permission exactly once")
-        check(await granted.startCount == 1, "granted contextual request starts one observer")
-        check(await grantedProvider.status().capability == .available, "granted calendar access becomes available")
+        check(await granted.permissionRequestCount == 0, "persisted restore and repeated enable perform zero permission calls")
+        check(await granted.startCount == 0, "permission-required restore installs no observer")
+        check(await grantedProvider.status().capability == .permissionRequired, "prompt-free restore reports permission required")
+        check(await grantedProvider.status().health == .healthy, "prompt-free restore reports healthy idle machinery")
+        check(await grantedProvider.workState().isIdle, "prompt-free restore remains physically idle")
+        do {
+            let authorization = try await grantedProvider.requestFullAccess()
+            check(authorization == .fullAccess, "explicit contextual permission seam reports granted access")
+        } catch {
+            recordUnexpected(error, context: "explicit granted calendar permission")
+        }
+        check(await granted.permissionRequestCount == 1, "explicit contextual permission seam requests exactly once")
+        check(await granted.startCount == 0, "permission acquisition remains separate from provider start")
+        await grantedProvider.enable()
+        check(await granted.startCount == 1, "post-permission enable starts one observer")
+        check(await grantedProvider.status().capability == .available, "post-permission enable becomes available")
         await grantedProvider.disable()
 
         let declined = ManualCalendarSource(
@@ -474,9 +1484,208 @@ private struct GlanceHarness {
         )
         let declinedProvider = CalendarGlanceProvider(broker: makeBroker(), source: declined, clock: ManualGlanceClock())
         await declinedProvider.enable()
-        check(await declined.permissionRequestCount == 1, "not-determined denial attempts one contextual request")
+        check(await declined.permissionRequestCount == 0, "not-determined enable never implicitly prompts")
+        do {
+            let authorization = try await declinedProvider.requestFullAccess()
+            check(authorization == .denied, "explicit contextual denial returns current authorization")
+        } catch {
+            recordUnexpected(error, context: "explicit declined calendar permission")
+        }
+        check(await declined.permissionRequestCount == 1, "explicit contextual denial attempts one permission request")
         check(await declined.startCount == 0, "declined request installs no observer")
         check(await declinedProvider.status().capability == .permissionDenied, "declined request reports denial")
+
+        let deferred = DeferredPermissionCalendarSource()
+        let deferredProvider = CalendarGlanceProvider(
+            broker: makeBroker(),
+            source: deferred,
+            clock: ManualGlanceClock()
+        )
+        let firstRequest = Task { try? await deferredProvider.requestFullAccess() }
+        check(await waitUntil { await deferred.requestPending }, "explicit deferred permission request begins")
+        let secondRequest = Task { try? await deferredProvider.requestFullAccess() }
+        await yieldSeveralTimes()
+        check(await deferred.permissionRequestCount == 1, "overlapping contextual permission calls share one request")
+        let disableFlag = CompletionFlag()
+        let disable = Task {
+            await deferredProvider.disable()
+            await disableFlag.markComplete()
+        }
+        await yieldSeveralTimes()
+        check(!(await disableFlag.isComplete), "disable drains an in-flight permission request even while provider is disabled")
+        await deferred.finishPermission(granted: true)
+        check(await firstRequest.value == .fullAccess, "first shared permission caller receives grant")
+        check(await secondRequest.value == .fullAccess, "second shared permission caller receives grant")
+        await disable.value
+        check(await disableFlag.isComplete, "disable completes after contextual permission work drains")
+    }
+
+    mutating func verifyCalendarUnavailableTakeover() async {
+        let now = Date(timeIntervalSinceReferenceDate: 46_500)
+        let authorizationScenarios: [(
+            authorization: CalendarAuthorization,
+            capability: GlanceProviderCapability,
+            label: String
+        )] = [
+            (.denied, .permissionDenied, "denied"),
+            (.notDetermined, .permissionRequired, "not-determined"),
+            (.restricted, .restricted, "restricted"),
+        ]
+
+        for scenario in authorizationScenarios {
+            do {
+                let broker = makeBroker()
+                let oldSource = ManualCalendarSource(authorization: .fullAccess)
+                let oldClock = ManualGlanceClock(now: now)
+                let oldMeeting = try CalendarMeeting(
+                    eventIdentifier: "takeover-\(scenario.label)",
+                    title: "Old visible \(scenario.label) meeting",
+                    startDate: now.addingTimeInterval(60),
+                    endDate: now.addingTimeInterval(180)
+                )
+                await oldSource.setMeeting(oldMeeting)
+                let oldProvider = CalendarGlanceProvider(
+                    broker: broker,
+                    source: oldSource,
+                    clock: oldClock
+                )
+                await oldProvider.enable()
+                check(
+                    await broker.snapshot().current?.activity.presentation.title
+                        == "Old visible \(scenario.label) meeting",
+                    "\(scenario.label) takeover fixture starts with an old visible meeting"
+                )
+
+                let replacementSource = ManualCalendarSource(
+                    authorization: scenario.authorization
+                )
+                let replacement = CalendarGlanceProvider(
+                    broker: broker,
+                    source: replacementSource,
+                    clock: ManualGlanceClock(now: now)
+                )
+                await replacement.enable()
+                check(
+                    await broker.snapshot().ordered.isEmpty,
+                    "\(scenario.label) successor claim atomically clears the old meeting"
+                )
+                check(
+                    await replacement.status().capability == scenario.capability,
+                    "\(scenario.label) successor reports its exact unavailable capability"
+                )
+                check(
+                    await replacementSource.permissionRequestCount == 0,
+                    "\(scenario.label) successor takeover performs zero permission prompts"
+                )
+                check(
+                    await replacementSource.startCount == 0,
+                    "\(scenario.label) successor takeover starts no event source"
+                )
+                check(
+                    await replacement.workState().isIdle,
+                    "\(scenario.label) successor takeover is quiet at rest"
+                )
+
+                await oldSource.emitChange()
+                check(
+                    await waitUntil { await oldSource.queryCount == 2 },
+                    "\(scenario.label) stale predecessor refresh reaches broker admission"
+                )
+                check(
+                    await broker.snapshot().ordered.isEmpty,
+                    "\(scenario.label) stale predecessor cannot republish after takeover"
+                )
+
+                await oldProvider.disable()
+                await replacement.disable()
+                check(
+                    await broker.workState().activeOwnershipCount == 0,
+                    "\(scenario.label) takeover releases both ownership generations"
+                )
+                let oldWork = await oldProvider.workState()
+                let replacementWork = await replacement.workState()
+                check(
+                    oldWork.isIdle && replacementWork.isIdle,
+                    "\(scenario.label) takeover drains predecessor and successor work"
+                )
+            } catch {
+                recordUnexpected(error, context: "\(scenario.label) calendar takeover")
+            }
+        }
+
+        do {
+            let broker = makeBroker()
+            let oldSource = ManualCalendarSource(authorization: .fullAccess)
+            let oldClock = ManualGlanceClock(now: now)
+            let oldMeeting = try CalendarMeeting(
+                eventIdentifier: "takeover-start-failure",
+                title: "Old visible source-start meeting",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await oldSource.setMeeting(oldMeeting)
+            let oldProvider = CalendarGlanceProvider(
+                broker: broker,
+                source: oldSource,
+                clock: oldClock
+            )
+            await oldProvider.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Old visible source-start meeting",
+                "source-start takeover fixture begins with an old visible meeting"
+            )
+
+            let failedSource = ManualCalendarSource(
+                authorization: .fullAccess,
+                failStart: true
+            )
+            let replacement = CalendarGlanceProvider(
+                broker: broker,
+                source: failedSource,
+                clock: ManualGlanceClock(now: now)
+            )
+            await replacement.enable()
+            check(
+                await broker.snapshot().ordered.isEmpty,
+                "source-start failure successor claim atomically clears the old meeting"
+            )
+            check(
+                await replacement.status().health
+                    == .unavailable(.eventSourceUnavailable),
+                "source-start failure successor reports normalized unavailability"
+            )
+            check(await failedSource.startCount == 1, "source-start failure is attempted once")
+            check(
+                await replacement.workState().isIdle,
+                "source-start failure successor drains relay and observer work"
+            )
+
+            await oldSource.emitChange()
+            check(
+                await waitUntil { await oldSource.queryCount == 2 },
+                "source-start failure stale predecessor reaches broker admission"
+            )
+            check(
+                await broker.snapshot().ordered.isEmpty,
+                "source-start failure stale predecessor cannot republish"
+            )
+
+            await oldProvider.disable()
+            await replacement.disable()
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "source-start failure takeover releases both ownership generations"
+            )
+            let oldWork = await oldProvider.workState()
+            let replacementWork = await replacement.workState()
+            check(
+                oldWork.isIdle && replacementWork.isIdle,
+                "source-start failure takeover drains predecessor and successor work"
+            )
+        } catch {
+            recordUnexpected(error, context: "source-start failure calendar takeover")
+        }
     }
 
     mutating func verifyCountdownCancellationReplacementAndExpiry() async {
@@ -501,7 +1710,10 @@ private struct GlanceHarness {
 
             await provider.enable()
             check(await broker.snapshot().current?.activity.presentation.title == "First", "countdown enable submits stored timer")
-            check(await clock.pendingCount == 1, "countdown schedules one expiry boundary")
+            check(
+                await waitUntil { await clock.pendingCount == 1 },
+                "countdown schedules one expiry boundary"
+            )
             check(
                 await provider.presentation(at: now.addingTimeInterval(60))?.fractionCompleted == 0.5,
                 "provider exposes live timestamp-derived progress without broker ticks"
@@ -538,6 +1750,368 @@ private struct GlanceHarness {
             check(await provider.status() == .disabled, "countdown disable is idempotent")
         } catch {
             recordUnexpected(error, context: "countdown lifecycle")
+        }
+    }
+
+    mutating func verifyVisibleCountdownDemand() async {
+        let now = Date(timeIntervalSinceReferenceDate: 42_000.25)
+        let clock = ManualGlanceClock(now: now)
+        let broker = makeBroker()
+        let provider = CountdownGlanceProvider(broker: broker, clock: clock)
+        do {
+            let timer = try CountdownTimer(
+                title: "Visible timer",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(4.75)
+            )
+            await provider.setCountdown(timer)
+            await provider.enable()
+            check(await provider.presentationDemand() == .hidden, "timer live updates default to hidden demand")
+            check(
+                await waitUntil { await clock.pendingDeadlines == [timer.endsAt] },
+                "hidden timer retains only its expiry one-shot"
+            )
+
+            let staticVersion = await broker.snapshot().version
+            await provider.setPresentationDemand(.visible)
+            check(await provider.presentationDemand() == .visible, "surface can explicitly demand visible timer updates")
+            check(await broker.snapshot().version == staticVersion + 1, "visible demand immediately refreshes timer presentation")
+            let firstTick = Date(timeIntervalSinceReferenceDate: 42_001)
+            check(
+                await waitUntil { await clock.pendingDeadlines == [firstTick] },
+                "visible timer schedules one aligned second boundary"
+            )
+
+            await clock.advance(to: firstTick)
+            check(
+                await waitUntil {
+                    (await broker.snapshot().current?.activity.presentation.progress?.fractionCompleted ?? 0) > 0
+                },
+                "visible timer publishes timestamp-derived progress"
+            )
+            check(
+                await waitUntil { await clock.pendingDeadlines == [firstTick.addingTimeInterval(1)] },
+                "visible timer schedules one successor one-shot instead of a repeating loop"
+            )
+
+            let visibleVersion = await broker.snapshot().version
+            await provider.setPresentationDemand(.hidden)
+            check(
+                await waitUntil { await clock.pendingDeadlines == [timer.endsAt] },
+                "hiding timer immediately replaces live tick with expiry-only boundary"
+            )
+            await clock.advance(to: firstTick.addingTimeInterval(1))
+            await yieldSeveralTimes()
+            check(await broker.snapshot().version == visibleVersion, "hidden timer performs no progress submissions")
+
+            await provider.setPresentationDemand(.visible)
+            await clock.advance(to: timer.endsAt)
+            check(await waitUntil { await provider.countdown() == nil }, "visible timer expires deterministically at its end date")
+            check(await broker.snapshot().ordered.isEmpty, "visible timer expiry removes broker activity")
+            check(await provider.workState().isIdle, "visible timer expiry stops all one-shot work")
+
+            let cancellable = try CountdownTimer(
+                title: "Cancellable visible timer",
+                startedAt: timer.endsAt,
+                endsAt: timer.endsAt.addingTimeInterval(30)
+            )
+            await provider.setCountdown(cancellable)
+            await provider.setPresentationDemand(.visible)
+            check(
+                await waitUntil { await clock.pendingCount == 1 },
+                "new visible timer owns one boundary"
+            )
+            await provider.cancelCountdown()
+            check(await clock.pendingCount == 0, "timer cancellation immediately stops live scheduling")
+            check(await provider.workState().isIdle, "cancelled visible timer owns zero work")
+
+            await provider.disable()
+            check(await provider.presentationDemand() == .hidden, "disable clears stale visible demand")
+        } catch {
+            recordUnexpected(error, context: "visible countdown demand")
+        }
+    }
+
+    mutating func verifyCountdownDemandMutationOrdering() async {
+        let now = Date(timeIntervalSinceReferenceDate: 44_000.25)
+
+        do {
+            let clock = ManualGlanceClock(now: now)
+            let broker = GatedGlanceBroker()
+            let provider = CountdownGlanceProvider(broker: broker, clock: clock)
+            let initial = try CountdownTimer(
+                title: "Demand ordering initial",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(300)
+            )
+            let blocked = try CountdownTimer(
+                title: "DEMAND ORDERING BLOCKED A",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(240)
+            )
+            let replacement = try CountdownTimer(
+                title: "DEMAND ORDERING REPLACEMENT B",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+
+            await provider.setCountdown(initial)
+            await provider.enable()
+            await broker.gateNextSubmit()
+            let blockedMutation = Task { await provider.setCountdown(blocked) }
+            check(
+                await waitUntil { await broker.submitPending },
+                "countdown replacement-demand fixture gates mutation A in broker submit"
+            )
+            let blockedQueueRevision = await provider.mutationQueueRevision()
+
+            let replacementFlag = CompletionFlag()
+            let replacementMutation = Task {
+                await provider.setCountdown(replacement)
+                await replacementFlag.markComplete()
+            }
+            check(
+                await waitUntil {
+                    await provider.mutationQueueRevision() == blockedQueueRevision + 1
+                },
+                "countdown replacement B is admitted behind blocked mutation A"
+            )
+
+            let demandFlag = CompletionFlag()
+            let demandMutation = Task {
+                await provider.setPresentationDemand(.visible)
+                await demandFlag.markComplete()
+            }
+            check(
+                await waitUntil {
+                    await provider.mutationQueueRevision() == blockedQueueRevision + 2
+                },
+                "visible demand is admitted behind queued replacement B"
+            )
+            let replacementCompletedWhileBlocked = await replacementFlag.isComplete
+            let demandCompletedWhileBlocked = await demandFlag.isComplete
+            check(
+                !replacementCompletedWhileBlocked && !demandCompletedWhileBlocked,
+                "replacement and demand remain serialized behind blocked mutation A"
+            )
+
+            await broker.releaseSubmit()
+            await blockedMutation.value
+            await replacementMutation.value
+            await demandMutation.value
+
+            check(
+                await provider.countdown() == replacement,
+                "visible demand cannot suppress the queued countdown replacement"
+            )
+            check(
+                await provider.presentationDemand() == .visible,
+                "visible demand applies to the replacement logical state"
+            )
+            let replacementSnapshot = await broker.snapshot()
+            check(
+                replacementSnapshot.ordered.count == 1
+                    && replacementSnapshot.queued.isEmpty
+                    && replacementSnapshot.current?.activity.presentation.title
+                        == "DEMAND ORDERING REPLACEMENT B",
+                "replacement B owns the exact broker snapshot after visible demand"
+            )
+            check(
+                await broker.submitCallCount == 4,
+                "blocked A, replacement B, and visible demand each perform their ordered submit"
+            )
+            let firstTick = Date(timeIntervalSinceReferenceDate: 44_001)
+            check(
+                await waitUntil { await clock.pendingDeadlines == [firstTick] },
+                "visible replacement owns one aligned successor boundary"
+            )
+            check(
+                await provider.workState() == GlanceProviderWorkState(
+                    activeObserverCount: 0,
+                    activeConsumerTaskCount: 0,
+                    scheduledBoundaryCount: 1
+                ),
+                "replacement-demand ordering leaves only its visible one-shot"
+            )
+            let replacementBrokerWork = await broker.workState()
+            check(
+                replacementBrokerWork.scheduledExpiryCount == 0
+                    && replacementBrokerWork.subscriberCount == 0
+                    && replacementBrokerWork.activeOwnershipCount == 1
+                    && replacementBrokerWork.pendingOwnershipIntentCount == 0,
+                "replacement-demand ordering retains one bounded ownership lane"
+            )
+
+            await clock.advance(to: firstTick)
+            check(
+                await waitUntil { await broker.submitCallCount == 5 },
+                "visible replacement performs one bounded progress refresh"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "DEMAND ORDERING REPLACEMENT B",
+                "blocked mutation A cannot reappear on a later visible boundary"
+            )
+
+            await provider.cancelCountdown()
+            let reusable = try CountdownTimer(
+                title: "DEMAND ORDERING REUSABLE",
+                startedAt: firstTick,
+                endsAt: firstTick.addingTimeInterval(120)
+            )
+            await provider.setCountdown(reusable)
+            let reusableCountdown = await provider.countdown()
+            let reusableSnapshot = await broker.snapshot()
+            check(
+                reusableCountdown == reusable
+                    && reusableSnapshot.current?.activity.presentation.title
+                        == "DEMAND ORDERING REUSABLE",
+                "replacement-demand mutation capacity remains reusable"
+            )
+            await provider.disable()
+            let finalProviderWork = await provider.workState()
+            let finalSnapshot = await broker.snapshot()
+            let finalBrokerWork = await broker.workState()
+            check(
+                finalProviderWork.isIdle
+                    && finalSnapshot.ordered.isEmpty
+                    && finalBrokerWork.activeOwnershipCount == 0
+                    && finalBrokerWork.pendingOwnershipIntentCount == 0,
+                "replacement-demand reuse drains provider and ownership work exactly"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown replacement versus demand ordering")
+        }
+
+        do {
+            let clock = ManualGlanceClock(now: now)
+            let broker = GatedGlanceBroker()
+            let provider = CountdownGlanceProvider(broker: broker, clock: clock)
+            let initial = try CountdownTimer(
+                title: "Cancel-demand initial",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(300)
+            )
+            let blocked = try CountdownTimer(
+                title: "CANCEL DEMAND BLOCKED A",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(240)
+            )
+
+            await provider.setCountdown(initial)
+            await provider.enable()
+            await provider.setPresentationDemand(.visible)
+            await broker.gateNextSubmit()
+            let blockedMutation = Task { await provider.setCountdown(blocked) }
+            check(
+                await waitUntil { await broker.submitPending },
+                "countdown cancel-demand fixture gates mutation A in broker submit"
+            )
+            let blockedQueueRevision = await provider.mutationQueueRevision()
+
+            let cancelFlag = CompletionFlag()
+            let cancelMutation = Task {
+                await provider.cancelCountdown()
+                await cancelFlag.markComplete()
+            }
+            check(
+                await waitUntil {
+                    await provider.mutationQueueRevision() == blockedQueueRevision + 1
+                },
+                "countdown cancellation is admitted behind blocked mutation A"
+            )
+
+            let demandFlag = CompletionFlag()
+            let demandMutation = Task {
+                await provider.setPresentationDemand(.hidden)
+                await demandFlag.markComplete()
+            }
+            check(
+                await waitUntil {
+                    await provider.mutationQueueRevision() == blockedQueueRevision + 2
+                },
+                "hidden demand is admitted behind queued countdown cancellation"
+            )
+            let cancelCompletedWhileBlocked = await cancelFlag.isComplete
+            let demandCompletedWhileBlocked = await demandFlag.isComplete
+            check(
+                !cancelCompletedWhileBlocked && !demandCompletedWhileBlocked,
+                "cancellation and hidden demand remain serialized behind blocked mutation A"
+            )
+
+            await broker.releaseSubmit()
+            await blockedMutation.value
+            await cancelMutation.value
+            await demandMutation.value
+
+            check(
+                await provider.countdown() == nil,
+                "hidden demand cannot suppress the queued countdown cancellation"
+            )
+            check(
+                await provider.presentationDemand() == .hidden,
+                "hidden demand applies after cancellation"
+            )
+            let cancelledSnapshot = await broker.snapshot()
+            check(
+                cancelledSnapshot.current == nil
+                    && cancelledSnapshot.queued.isEmpty
+                    && cancelledSnapshot.ordered.isEmpty,
+                "cancel-demand ordering leaves the exact broker snapshot empty"
+            )
+            let submitCallCount = await broker.submitCallCount
+            let cancelCallCount = await broker.cancelCallCount
+            check(
+                submitCallCount == 3 && cancelCallCount == 1,
+                "cancel-demand ordering performs the expected bounded physical mutations"
+            )
+            let cancelledProviderWork = await provider.workState()
+            let cancelledBoundaryCount = await clock.pendingCount
+            check(
+                cancelledProviderWork.isIdle && cancelledBoundaryCount == 0,
+                "cancel-demand ordering leaves no stale boundary or mutation work"
+            )
+
+            await clock.advance(to: blocked.endsAt.addingTimeInterval(1))
+            await yieldSeveralTimes()
+            let countdownAfterAdvance = await provider.countdown()
+            let snapshotAfterAdvance = await broker.snapshot()
+            check(
+                countdownAfterAdvance == nil && snapshotAfterAdvance.ordered.isEmpty,
+                "blocked mutation A cannot reappear after queued cancellation"
+            )
+
+            let reusable = try CountdownTimer(
+                title: "CANCEL DEMAND REUSABLE",
+                startedAt: blocked.endsAt.addingTimeInterval(1),
+                endsAt: blocked.endsAt.addingTimeInterval(121)
+            )
+            await provider.setCountdown(reusable)
+            let reusableCountdown = await provider.countdown()
+            let reusableSnapshot = await broker.snapshot()
+            check(
+                reusableCountdown == reusable
+                    && reusableSnapshot.current?.activity.presentation.title
+                        == "CANCEL DEMAND REUSABLE",
+                "cancel-demand mutation capacity remains reusable"
+            )
+            check(
+                await waitUntil { await clock.pendingDeadlines == [reusable.endsAt] },
+                "reused hidden countdown owns only its expiry boundary"
+            )
+            await provider.disable()
+            let finalProviderWork = await provider.workState()
+            let finalSnapshot = await broker.snapshot()
+            let finalBrokerWork = await broker.workState()
+            check(
+                finalProviderWork.isIdle
+                    && finalSnapshot.ordered.isEmpty
+                    && finalBrokerWork.activeOwnershipCount == 0
+                    && finalBrokerWork.pendingOwnershipIntentCount == 0,
+                "cancel-demand reuse drains provider and ownership work exactly"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown cancellation versus demand ordering")
         }
     }
 
@@ -657,7 +2231,12 @@ private struct GlanceHarness {
                 await countdown.disable()
                 await expiryDisableFlag.markComplete()
             }
-            await yieldSeveralTimes()
+            check(
+                await waitUntil {
+                    await countdown.workState().scheduledBoundaryCount == 0
+                },
+                "countdown disable retires the gated expiry boundary before release"
+            )
             check(
                 !(await expiryDisableFlag.isComplete),
                 "countdown disable drains expiry already inside broker cancellation"
@@ -769,18 +2348,1495 @@ private struct GlanceHarness {
             }
             await yieldSeveralTimes()
             check(!(await replacementFlag.isComplete), "replacement drains a non-cooperative old boundary")
-            await clock.fire(index: 0)
+            await clock.fire(index: 0, at: now.addingTimeInterval(30))
             await replacementTask.value
             check(await provider.countdown() == replacement, "stale timer generation cannot expire replacement")
             check(await broker.snapshot().current?.activity.presentation.title == "New", "stale timer callback cannot cancel replacement activity")
             check(await waitUntil { await clock.waiterCount == 1 }, "replacement registers a new waiter after the old one drains")
 
-            await clock.fire(index: 0)
+            await clock.fire(index: 0, at: replacement.endsAt)
             check(await waitUntil { await provider.countdown() == nil }, "current timer generation can expire")
             check(await broker.snapshot().ordered.isEmpty, "current expiry reaches broker cancellation")
         } catch {
             recordUnexpected(error, context: "timer generation backstop")
         }
+    }
+
+    mutating func verifyCancellationInsensitiveShutdown() async {
+        let broker = CancellationRecordingBroker()
+        let powerSource = ManualPowerSource()
+        let volumeSource = ManualVolumeSource()
+        let calendarSource = ManualCalendarSource(authorization: .fullAccess)
+        let clock = ManualGlanceClock(now: Date(timeIntervalSinceReferenceDate: 55_000))
+        let power = PowerGlanceProvider(broker: broker, source: powerSource)
+        let volume = VolumeGlanceProvider(broker: broker, source: volumeSource)
+        let calendar = CalendarGlanceProvider(broker: broker, source: calendarSource, clock: clock)
+        let countdown = CountdownGlanceProvider(broker: broker, clock: clock)
+
+        do {
+            let low = try PowerSnapshot(chargeLevel: 0.1, isCharging: false, isConnectedToPower: false)
+            let volumeSnapshot = try VolumeSnapshot(deviceID: 1, scalar: 0.5, isMuted: false)
+            let timer = try CountdownTimer(
+                title: "Shutdown drain",
+                startedAt: await clock.now(),
+                endsAt: (await clock.now()).addingTimeInterval(60)
+            )
+            await countdown.setCountdown(timer)
+            await power.enable()
+            await volume.enable()
+            await calendar.enable()
+            await countdown.enable()
+            await powerSource.emit(.snapshot(low))
+            await volumeSource.emit(.snapshot(volumeSnapshot))
+            check(
+                await waitUntil { await broker.snapshot().ordered.count == 3 },
+                "shutdown fixture starts physical provider work"
+            )
+
+            let powerStop = Task {
+                while !Task.isCancelled { await Task.yield() }
+                await power.disable()
+            }
+            let volumeStop = Task {
+                while !Task.isCancelled { await Task.yield() }
+                await volume.disable()
+            }
+            let calendarStop = Task {
+                while !Task.isCancelled { await Task.yield() }
+                await calendar.disable()
+            }
+            let countdownStop = Task {
+                while !Task.isCancelled { await Task.yield() }
+                await countdown.disable()
+            }
+            powerStop.cancel()
+            volumeStop.cancel()
+            calendarStop.cancel()
+            countdownStop.cancel()
+            await powerStop.value
+            await volumeStop.value
+            await calendarStop.value
+            await countdownStop.value
+
+            check(!(await powerSource.stopObservedCancellation), "power shutdown source stop is cancellation-insensitive")
+            check(!(await volumeSource.stopObservedCancellation), "volume shutdown source stop is cancellation-insensitive")
+            check(!(await calendarSource.stopObservedCancellation), "calendar shutdown source stop is cancellation-insensitive")
+            check(!(await broker.cancelObservedCancellation), "all final broker cancellations run outside caller cancellation")
+            check(await power.workState().isIdle, "cancelled caller still drains power work")
+            check(await volume.workState().isIdle, "cancelled caller still drains volume work")
+            check(await calendar.workState().isIdle, "cancelled caller still drains calendar work")
+            check(await countdown.workState().isIdle, "cancelled caller still drains timer work")
+            check(await broker.snapshot().ordered.isEmpty, "cancelled shutdown callers still remove every activity")
+
+            let callsAfterDisable = await broker.physicalCallCount
+            await powerSource.emit(.snapshot(low), handlerIndex: 0)
+            await calendarSource.emitStale(.didWake)
+            await clock.advance(to: timer.endsAt.addingTimeInterval(10))
+            await yieldSeveralTimes()
+            check(
+                await broker.physicalCallCount == callsAfterDisable,
+                "stale callbacks and boundaries perform zero physical broker work after disable"
+            )
+        } catch {
+            recordUnexpected(error, context: "cancellation-insensitive shutdown")
+        }
+    }
+
+    mutating func verifyReleaseCleanupFallbacks() async {
+        let now = Date(timeIntervalSinceReferenceDate: 56_000)
+
+        do {
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let clock = ManualGlanceClock(now: now)
+            let broker = GatedGlanceBroker()
+            let distantMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-drop",
+                title: "Calendar drop",
+                startDate: now.addingTimeInterval(3_600),
+                endDate: now.addingTimeInterval(3_900)
+            )
+            await source.setMeeting(distantMeeting)
+            var provider: CalendarGlanceProvider? = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            await provider?.enable()
+            check(await source.isActive, "calendar drop fixture installs its observer")
+            check(
+                await waitUntil { await clock.pendingCount == 1 },
+                "calendar drop fixture owns one boundary"
+            )
+            let weakProvider = WeakProviderReference(provider!)
+            provider = nil
+            check(
+                await waitUntil { weakProvider.isReleased },
+                "dropping enabled calendar releases the provider"
+            )
+            check(
+                await waitUntil { !(await source.isActive) },
+                "calendar deinit fallback removes source observation"
+            )
+            check(await source.stopCount == 1, "calendar deinit fallback stops its source once")
+            check(
+                await waitUntil { await clock.pendingCount == 0 },
+                "calendar deinit fallback cancels its one-shot"
+            )
+            check(await clock.cancellationCount == 1, "calendar drop records one boundary cancellation")
+            check(
+                await waitUntil { await broker.snapshot().ordered.isEmpty },
+                "calendar deinit fallback clears broker activity"
+            )
+            check(
+                await waitUntil {
+                    let brokerWork = await broker.workState()
+                    return await broker.cancelCallCount == 2
+                        && brokerWork.activeOwnershipCount == 0
+                        && brokerWork.pendingOwnershipIntentCount == 0
+                },
+                "calendar drop performs quiet clear and terminal retirement"
+            )
+            let queriesAfterDrop = await source.queryCount
+            await source.emitStale(.didWake)
+            await yieldSeveralTimes()
+            check(await source.queryCount == queriesAfterDrop, "calendar dropped relay rejects stale source events")
+        } catch {
+            recordUnexpected(error, context: "calendar release cleanup fallback")
+        }
+
+        do {
+            let clock = ManualGlanceClock(now: now)
+            let broker = GatedGlanceBroker()
+            let timer = try CountdownTimer(
+                title: "Countdown drop",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            var provider: CountdownGlanceProvider? = CountdownGlanceProvider(
+                broker: broker,
+                clock: clock
+            )
+            await provider?.setCountdown(timer)
+            await provider?.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Countdown drop",
+                "countdown drop fixture publishes its timer"
+            )
+            check(
+                await waitUntil { await clock.pendingCount == 1 },
+                "countdown drop fixture owns one boundary"
+            )
+            let weakProvider = WeakProviderReference(provider!)
+            provider = nil
+            check(
+                await waitUntil { weakProvider.isReleased },
+                "dropping enabled countdown releases the provider"
+            )
+            check(
+                await waitUntil { await clock.pendingCount == 0 },
+                "countdown deinit fallback cancels its one-shot"
+            )
+            check(await clock.cancellationCount == 1, "countdown drop records one boundary cancellation")
+            check(
+                await waitUntil { await broker.snapshot().ordered.isEmpty },
+                "countdown deinit fallback clears broker activity"
+            )
+            check(await broker.cancelCallCount == 1, "countdown drop performs one terminal clear")
+        } catch {
+            recordUnexpected(error, context: "countdown release cleanup fallback")
+        }
+    }
+
+    mutating func verifyReplacementOwnershipLeases() async {
+        let now = Date(timeIntervalSinceReferenceDate: 56_500)
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldSource = ManualCalendarSource(authorization: .fullAccess)
+            let oldClock = ManualGlanceClock(now: now)
+            let oldMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-old-owner",
+                title: "Old calendar owner",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await oldSource.setMeeting(oldMeeting)
+            var oldProvider: CalendarGlanceProvider? = CalendarGlanceProvider(
+                broker: broker,
+                source: oldSource,
+                clock: oldClock
+            )
+            await oldProvider?.enable()
+            let weakOldProvider = WeakProviderReference(oldProvider!)
+
+            await broker.gateNextCancel()
+            oldProvider = nil
+            check(
+                await waitUntil { await broker.cancelPending },
+                "calendar replacement fixture gates old detached cleanup"
+            )
+            let oldRevision = await broker.gatedConditionalExpectedRevision
+            check(
+                await broker.gatedConditionalComparisonMatched,
+                "calendar cleanup gate observes the old revision before replacement"
+            )
+            check(
+                await broker.snapshot().current?.revision == oldRevision,
+                "calendar cleanup gate captures the exact old broker revision"
+            )
+            check(weakOldProvider.isReleased, "calendar old provider releases before detached cleanup settles")
+
+            let replacementSource = ManualCalendarSource(authorization: .fullAccess)
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-replacement-owner",
+                title: "Calendar replacement survives",
+                startDate: now.addingTimeInterval(90),
+                endDate: now.addingTimeInterval(210)
+            )
+            await replacementSource.setMeeting(replacementMeeting)
+            let replacement = CalendarGlanceProvider(
+                broker: broker,
+                source: replacementSource,
+                clock: replacementClock
+            )
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Calendar replacement survives",
+                "calendar replacement publishes while old cleanup is gated"
+            )
+            check(
+                await broker.snapshot().current?.revision != oldRevision,
+                "calendar replacement advances the broker revision before old removal"
+            )
+
+            await broker.releaseCancel()
+            check(
+                await waitUntil { await broker.conditionalCancelCompletionCount == 1 },
+                "calendar old conditional cleanup settles"
+            )
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "calendar atomic conditional removal fails closed after replacement"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Calendar replacement survives",
+                "calendar old cleanup cannot erase replacement revision"
+            )
+            check(!(await oldSource.isActive), "calendar old observation remains retired")
+            check(await oldSource.stopCount == 1, "calendar old source stops exactly once")
+            check(
+                await waitUntil { await oldClock.pendingCount == 0 },
+                "calendar old one-shot settles to zero"
+            )
+            check(
+                await replacement.workState() == GlanceProviderWorkState(
+                    activeObserverCount: 1,
+                    activeConsumerTaskCount: 1,
+                    scheduledBoundaryCount: 1,
+                    activeBrokerMutationCount: 0
+                ),
+                "calendar replacement owns only its expected work"
+            )
+
+            await replacement.disable()
+            check(await broker.snapshot().ordered.isEmpty, "calendar replacement later clears its own revision")
+            check(await broker.cancelCallCount == 2, "calendar ownership handoff performs two exact clears")
+            check(await replacement.workState().isIdle, "calendar replacement disable drains all work")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "calendar replacement handoff releases all broker admission state"
+            )
+        } catch {
+            recordUnexpected(error, context: "calendar deinit replacement ownership")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldClock = ManualGlanceClock(now: now)
+            let oldTimer = try CountdownTimer(
+                title: "Old countdown owner",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            var oldProvider: CountdownGlanceProvider? = CountdownGlanceProvider(
+                broker: broker,
+                clock: oldClock
+            )
+            await oldProvider?.setCountdown(oldTimer)
+            await oldProvider?.enable()
+            let weakOldProvider = WeakProviderReference(oldProvider!)
+
+            await broker.gateNextCancel()
+            oldProvider = nil
+            check(
+                await waitUntil { await broker.cancelPending },
+                "countdown replacement fixture gates old detached cleanup"
+            )
+            let oldRevision = await broker.gatedConditionalExpectedRevision
+            check(
+                await broker.gatedConditionalComparisonMatched,
+                "countdown cleanup gate observes the old revision before replacement"
+            )
+            check(
+                await broker.snapshot().current?.revision == oldRevision,
+                "countdown cleanup gate captures the exact old broker revision"
+            )
+            check(weakOldProvider.isReleased, "countdown old provider releases before detached cleanup settles")
+
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementTimer = try CountdownTimer(
+                title: "Countdown replacement survives",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            let replacement = CountdownGlanceProvider(
+                broker: broker,
+                clock: replacementClock
+            )
+            await replacement.setCountdown(replacementTimer)
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Countdown replacement survives",
+                "countdown replacement publishes while old cleanup is gated"
+            )
+            check(
+                await broker.snapshot().current?.revision != oldRevision,
+                "countdown replacement advances the broker revision before old removal"
+            )
+
+            await broker.releaseCancel()
+            check(
+                await waitUntil { await broker.conditionalCancelCompletionCount == 1 },
+                "countdown old conditional cleanup settles"
+            )
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "countdown atomic conditional removal fails closed after replacement"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Countdown replacement survives",
+                "countdown old cleanup cannot erase replacement revision"
+            )
+            check(
+                await waitUntil { await oldClock.pendingCount == 0 },
+                "countdown old one-shot settles to zero"
+            )
+            check(
+                await replacement.workState() == GlanceProviderWorkState(
+                    activeObserverCount: 0,
+                    activeConsumerTaskCount: 0,
+                    scheduledBoundaryCount: 1
+                ),
+                "countdown replacement owns only its expected work"
+            )
+
+            await replacement.disable()
+            check(await broker.snapshot().ordered.isEmpty, "countdown replacement later clears its own revision")
+            check(await broker.cancelCallCount == 2, "countdown ownership handoff performs two exact clears")
+            check(await replacement.workState().isIdle, "countdown replacement disable drains all work")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "countdown replacement handoff releases all broker admission state"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown deinit replacement ownership")
+        }
+    }
+
+    mutating func verifyCrossInstanceSubmitAdmission() async {
+        let now = Date(timeIntervalSinceReferenceDate: 56_750)
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldSource = ManualCalendarSource(authorization: .fullAccess)
+            let oldClock = ManualGlanceClock(now: now)
+            let oldMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-late-drop",
+                title: "CALENDAR OLD LATE DROP",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await oldSource.setMeeting(oldMeeting)
+            var oldProvider: CalendarGlanceProvider? = CalendarGlanceProvider(
+                broker: broker,
+                source: oldSource,
+                clock: oldClock
+            )
+            let weakOldProvider = WeakProviderReference(oldProvider!)
+            await broker.gateNextSubmit()
+            let oldEnable = Task { [weak provider = oldProvider] in
+                await provider?.enable()
+            }
+            check(
+                await waitUntil { await broker.submitPending },
+                "calendar drop fixture gates old submit before broker admission"
+            )
+            oldProvider = nil
+
+            let replacementSource = ManualCalendarSource(authorization: .fullAccess)
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-late-drop-replacement",
+                title: "CALENDAR DROP REPLACEMENT",
+                startDate: now.addingTimeInterval(90),
+                endDate: now.addingTimeInterval(210)
+            )
+            await replacementSource.setMeeting(replacementMeeting)
+            let replacement = CalendarGlanceProvider(
+                broker: broker,
+                source: replacementSource,
+                clock: replacementClock
+            )
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR DROP REPLACEMENT",
+                "calendar replacement publishes before old gated submit"
+            )
+
+            await broker.releaseSubmit()
+            await oldEnable.value
+            check(
+                await waitUntil { await broker.ownedSubmitCompletionCount == 2 },
+                "calendar late old submit reaches shared admission"
+            )
+            check(
+                await broker.lastOwnedSubmitAccepted == false,
+                "calendar retired generation rejects the late old submit"
+            )
+            check(
+                await waitUntil { weakOldProvider.isReleased },
+                "calendar old provider releases after rejected submit"
+            )
+            check(
+                await waitUntil { await broker.conditionalCancelCompletionCount == 1 },
+                "calendar old detached cleanup settles after rejected submit"
+            )
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "calendar old cleanup is fenced by successor generation"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR DROP REPLACEMENT",
+                "calendar late old submit and cleanup preserve replacement"
+            )
+            check(!(await oldSource.isActive), "calendar dropped old observer settles to zero")
+            check(
+                await waitUntil { await oldClock.pendingCount == 0 },
+                "calendar dropped old boundary settles to zero"
+            )
+
+            await replacement.disable()
+            check(await broker.snapshot().ordered.isEmpty, "calendar drop replacement clears its generation")
+            check(await replacement.workState().isIdle, "calendar drop replacement disable drains work")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "calendar drop replacement prunes all admission generations"
+            )
+        } catch {
+            recordUnexpected(error, context: "calendar gated submit drop replacement")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldSource = ManualCalendarSource(authorization: .fullAccess)
+            let oldClock = ManualGlanceClock(now: now)
+            let initialMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-disable-initial",
+                title: "Calendar disable initial",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            let lateMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-disable-late",
+                title: "CALENDAR OLD LATE DISABLE",
+                startDate: now.addingTimeInterval(120),
+                endDate: now.addingTimeInterval(240)
+            )
+            await oldSource.setMeeting(initialMeeting)
+            let oldProvider = CalendarGlanceProvider(
+                broker: broker,
+                source: oldSource,
+                clock: oldClock
+            )
+            await oldProvider.enable()
+            await broker.gateNextSubmit()
+            await oldSource.setMeeting(lateMeeting)
+            await oldSource.emitChange()
+            check(
+                await waitUntil { await broker.submitPending },
+                "calendar disable fixture gates an old refresh submit"
+            )
+            let disable = Task { await oldProvider.disable() }
+            await yieldSeveralTimes()
+
+            let replacementSource = ManualCalendarSource(authorization: .fullAccess)
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-disable-submit-replacement",
+                title: "CALENDAR DISABLE REPLACEMENT",
+                startDate: now.addingTimeInterval(90),
+                endDate: now.addingTimeInterval(210)
+            )
+            await replacementSource.setMeeting(replacementMeeting)
+            let replacement = CalendarGlanceProvider(
+                broker: broker,
+                source: replacementSource,
+                clock: replacementClock
+            )
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR DISABLE REPLACEMENT",
+                "calendar replacement publishes while old disable drains submit"
+            )
+
+            await broker.releaseSubmit()
+            await disable.value
+            check(
+                await broker.lastOwnedSubmitAccepted == false,
+                "calendar disable closes admission for its gated submit"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR DISABLE REPLACEMENT",
+                "calendar disabled old submit cannot overwrite replacement"
+            )
+            check(await oldProvider.workState().isIdle, "calendar old disable settles all work")
+            check(!(await oldSource.isActive), "calendar old disable stops observation")
+            check(await oldClock.pendingCount == 0, "calendar old disable drains boundaries")
+
+            await replacement.disable()
+            check(await broker.snapshot().ordered.isEmpty, "calendar disable replacement clears its generation")
+            check(await replacement.workState().isIdle, "calendar disable replacement drains work")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "calendar disable replacement prunes all admission generations"
+            )
+        } catch {
+            recordUnexpected(error, context: "calendar gated submit disable replacement")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldClock = ManualGlanceClock(now: now)
+            let oldTimer = try CountdownTimer(
+                title: "COUNTDOWN OLD LATE DROP",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            var oldProvider: CountdownGlanceProvider? = CountdownGlanceProvider(
+                broker: broker,
+                clock: oldClock
+            )
+            await oldProvider?.setCountdown(oldTimer)
+            let weakOldProvider = WeakProviderReference(oldProvider!)
+            await broker.gateNextSubmit()
+            let oldEnable = Task { [weak provider = oldProvider] in
+                await provider?.enable()
+            }
+            check(
+                await waitUntil { await broker.submitPending },
+                "countdown drop fixture gates old submit before broker admission"
+            )
+            oldProvider = nil
+
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementTimer = try CountdownTimer(
+                title: "COUNTDOWN DROP REPLACEMENT",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            let replacement = CountdownGlanceProvider(
+                broker: broker,
+                clock: replacementClock
+            )
+            await replacement.setCountdown(replacementTimer)
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN DROP REPLACEMENT",
+                "countdown replacement publishes before old gated submit"
+            )
+
+            await broker.releaseSubmit()
+            await oldEnable.value
+            check(
+                await waitUntil { await broker.ownedSubmitCompletionCount == 2 },
+                "countdown late old submit reaches shared admission"
+            )
+            check(
+                await broker.lastOwnedSubmitAccepted == false,
+                "countdown retired generation rejects the late old submit"
+            )
+            check(
+                await waitUntil { weakOldProvider.isReleased },
+                "countdown old provider releases after rejected submit"
+            )
+            check(
+                await waitUntil { await broker.conditionalCancelCompletionCount == 1 },
+                "countdown old detached cleanup settles after rejected submit"
+            )
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "countdown old cleanup is fenced by successor generation"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN DROP REPLACEMENT",
+                "countdown late old submit and cleanup preserve replacement"
+            )
+            check(
+                await waitUntil { await oldClock.pendingCount == 0 },
+                "countdown dropped old boundary settles to zero"
+            )
+
+            await replacement.disable()
+            check(await broker.snapshot().ordered.isEmpty, "countdown drop replacement clears its generation")
+            check(await replacement.workState().isIdle, "countdown drop replacement disable drains work")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "countdown drop replacement prunes all admission generations"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown gated submit drop replacement")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldClock = ManualGlanceClock(now: now)
+            let initialTimer = try CountdownTimer(
+                title: "Countdown disable initial",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            let lateTimer = try CountdownTimer(
+                title: "COUNTDOWN OLD LATE DISABLE",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            let oldProvider = CountdownGlanceProvider(
+                broker: broker,
+                clock: oldClock
+            )
+            await oldProvider.setCountdown(initialTimer)
+            await oldProvider.enable()
+            await broker.gateNextSubmit()
+            let lateSet = Task { await oldProvider.setCountdown(lateTimer) }
+            check(
+                await waitUntil { await broker.submitPending },
+                "countdown disable fixture gates an old replacement submit"
+            )
+            let disable = Task { await oldProvider.disable() }
+            await yieldSeveralTimes()
+
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementTimer = try CountdownTimer(
+                title: "COUNTDOWN DISABLE REPLACEMENT",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(240)
+            )
+            let replacement = CountdownGlanceProvider(
+                broker: broker,
+                clock: replacementClock
+            )
+            await replacement.setCountdown(replacementTimer)
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN DISABLE REPLACEMENT",
+                "countdown replacement publishes while old disable drains submit"
+            )
+
+            await broker.releaseSubmit()
+            await lateSet.value
+            await disable.value
+            check(
+                await broker.lastOwnedSubmitAccepted == false,
+                "countdown disable closes admission for its gated submit"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN DISABLE REPLACEMENT",
+                "countdown disabled old submit cannot overwrite replacement"
+            )
+            check(await oldProvider.workState().isIdle, "countdown old disable settles all work")
+            check(await oldClock.pendingCount == 0, "countdown old disable drains boundaries")
+
+            await replacement.disable()
+            check(await broker.snapshot().ordered.isEmpty, "countdown disable replacement clears its generation")
+            check(await replacement.workState().isIdle, "countdown disable replacement drains work")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "countdown disable replacement prunes all admission generations"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown gated submit disable replacement")
+        }
+    }
+
+    mutating func verifyCrossInstanceClaimAdmission() async {
+        let now = Date(timeIntervalSinceReferenceDate: 56_625)
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldProvider = CalendarGlanceProvider(
+                broker: broker,
+                source: ManualCalendarSource(authorization: .fullAccess),
+                clock: ManualGlanceClock(now: now)
+            )
+            await broker.gateNextClaim()
+            let oldEnable = Task { await oldProvider.enable() }
+            check(
+                await waitUntil { await broker.claimPending },
+                "calendar disable gates old claim after synchronous intent admission"
+            )
+            await oldProvider.disable()
+            check(await oldProvider.status() == .disabled, "calendar pending-claim disable completes")
+            check(await oldProvider.workState().isIdle, "calendar pending-claim disable owns no work")
+
+            let replacementSource = ManualCalendarSource(authorization: .fullAccess)
+            let replacementMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-claim-disable-replacement",
+                title: "CALENDAR CLAIM DISABLE REPLACEMENT",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await replacementSource.setMeeting(replacementMeeting)
+            let replacement = CalendarGlanceProvider(
+                broker: broker,
+                source: replacementSource,
+                clock: ManualGlanceClock(now: now)
+            )
+            await replacement.enable()
+            let replacementSnapshot = await broker.snapshot()
+            check(
+                replacementSnapshot.current?.activity.presentation.title
+                    == "CALENDAR CLAIM DISABLE REPLACEMENT",
+                "calendar successor is visible before old claim release"
+            )
+            let pendingWork = await broker.workState()
+            check(
+                pendingWork.activeOwnershipCount == 1
+                    && pendingWork.pendingOwnershipIntentCount == 0,
+                "calendar disable retires its delayed intent while retaining the successor"
+            )
+
+            await broker.releaseClaim()
+            await oldEnable.value
+            check(
+                await waitUntil { await broker.claimCompletionCount == 2 },
+                "calendar delayed old claim settles"
+            )
+            check(await broker.lastClaimAccepted == false, "calendar delayed old claim is rejected")
+            check(
+                await broker.snapshot() == replacementSnapshot,
+                "calendar rejected old claim performs no record mutation"
+            )
+            await replacement.disable()
+            let finalWork = await broker.workState()
+            check(
+                finalWork.activeOwnershipCount == 0
+                    && finalWork.pendingOwnershipIntentCount == 0,
+                "calendar claim-disable cleanup releases all admission state"
+            )
+        } catch {
+            recordUnexpected(error, context: "calendar gated old claim versus disable")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            var oldProvider: CalendarGlanceProvider? = CalendarGlanceProvider(
+                broker: broker,
+                source: ManualCalendarSource(authorization: .fullAccess),
+                clock: ManualGlanceClock(now: now)
+            )
+            let weakOldProvider = WeakProviderReference(oldProvider!)
+            await broker.gateNextClaim()
+            let oldEnable = Task { [weak provider = oldProvider] in
+                await provider?.enable()
+            }
+            check(
+                await waitUntil { await broker.claimPending },
+                "calendar drop gates old claim after synchronous intent admission"
+            )
+            oldProvider = nil
+
+            let replacementSource = ManualCalendarSource(authorization: .fullAccess)
+            let replacementMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-claim-drop-replacement",
+                title: "CALENDAR CLAIM DROP REPLACEMENT",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await replacementSource.setMeeting(replacementMeeting)
+            let replacement = CalendarGlanceProvider(
+                broker: broker,
+                source: replacementSource,
+                clock: ManualGlanceClock(now: now)
+            )
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR CLAIM DROP REPLACEMENT",
+                "calendar drop successor is visible before old claim release"
+            )
+            await replacement.disable()
+            let releasedSnapshot = await broker.snapshot()
+            let retainedWork = await broker.workState()
+            check(
+                retainedWork.activeOwnershipCount == 1
+                    && retainedWork.pendingOwnershipIntentCount == 1,
+                "calendar released successor retains bounded stale-claim high-water"
+            )
+
+            await broker.releaseClaim()
+            await oldEnable.value
+            check(
+                await waitUntil { weakOldProvider.isReleased },
+                "calendar dropped old provider releases after claim rejection"
+            )
+            check(await broker.lastClaimAccepted == false, "calendar dropped old claim is rejected")
+            check(
+                await broker.snapshot() == releasedSnapshot,
+                "calendar dropped old claim cannot mutate after successor release"
+            )
+            let prunedWork = await broker.workState()
+            check(
+                prunedWork.activeOwnershipCount == 0
+                    && prunedWork.pendingOwnershipIntentCount == 0,
+                "calendar stale high-water prunes after old claim settles"
+            )
+
+            let freshSource = ManualCalendarSource(authorization: .fullAccess)
+            let freshMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-claim-fresh",
+                title: "CALENDAR FRESH CLAIM",
+                startDate: now.addingTimeInterval(90),
+                endDate: now.addingTimeInterval(210)
+            )
+            await freshSource.setMeeting(freshMeeting)
+            let fresh = CalendarGlanceProvider(
+                broker: broker,
+                source: freshSource,
+                clock: ManualGlanceClock(now: now)
+            )
+            await fresh.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR FRESH CLAIM",
+                "calendar capacity is reusable after stale high-water pruning"
+            )
+            await fresh.disable()
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "calendar fresh claim releases reusable capacity"
+            )
+        } catch {
+            recordUnexpected(error, context: "calendar gated old claim versus drop")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldTimer = try CountdownTimer(
+                title: "Countdown pending claim disable",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            let oldProvider = CountdownGlanceProvider(
+                broker: broker,
+                clock: ManualGlanceClock(now: now)
+            )
+            await oldProvider.setCountdown(oldTimer)
+            await broker.gateNextClaim()
+            let oldEnable = Task { await oldProvider.enable() }
+            check(
+                await waitUntil { await broker.claimPending },
+                "countdown disable gates old claim after synchronous intent admission"
+            )
+            await oldProvider.disable()
+            check(await oldProvider.status() == .disabled, "countdown pending-claim disable completes")
+            check(await oldProvider.workState().isIdle, "countdown pending-claim disable owns no work")
+
+            let replacementTimer = try CountdownTimer(
+                title: "COUNTDOWN CLAIM DISABLE REPLACEMENT",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            let replacement = CountdownGlanceProvider(
+                broker: broker,
+                clock: ManualGlanceClock(now: now)
+            )
+            await replacement.setCountdown(replacementTimer)
+            await replacement.enable()
+            let replacementSnapshot = await broker.snapshot()
+            check(
+                replacementSnapshot.current?.activity.presentation.title
+                    == "COUNTDOWN CLAIM DISABLE REPLACEMENT",
+                "countdown successor is visible before old claim release"
+            )
+            let pendingWork = await broker.workState()
+            check(
+                pendingWork.activeOwnershipCount == 1
+                    && pendingWork.pendingOwnershipIntentCount == 0,
+                "countdown disable retires its delayed intent while retaining the successor"
+            )
+
+            await broker.releaseClaim()
+            await oldEnable.value
+            check(
+                await waitUntil { await broker.claimCompletionCount == 2 },
+                "countdown delayed old claim settles"
+            )
+            check(await broker.lastClaimAccepted == false, "countdown delayed old claim is rejected")
+            check(
+                await broker.snapshot() == replacementSnapshot,
+                "countdown rejected old claim performs no record mutation"
+            )
+            await replacement.disable()
+            let finalWork = await broker.workState()
+            check(
+                finalWork.activeOwnershipCount == 0
+                    && finalWork.pendingOwnershipIntentCount == 0,
+                "countdown claim-disable cleanup releases all admission state"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown gated old claim versus disable")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let oldTimer = try CountdownTimer(
+                title: "Countdown pending claim drop",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            var oldProvider: CountdownGlanceProvider? = CountdownGlanceProvider(
+                broker: broker,
+                clock: ManualGlanceClock(now: now)
+            )
+            await oldProvider?.setCountdown(oldTimer)
+            let weakOldProvider = WeakProviderReference(oldProvider!)
+            await broker.gateNextClaim()
+            let oldEnable = Task { [weak provider = oldProvider] in
+                await provider?.enable()
+            }
+            check(
+                await waitUntil { await broker.claimPending },
+                "countdown drop gates old claim after synchronous intent admission"
+            )
+            oldProvider = nil
+
+            let replacementTimer = try CountdownTimer(
+                title: "COUNTDOWN CLAIM DROP REPLACEMENT",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            let replacement = CountdownGlanceProvider(
+                broker: broker,
+                clock: ManualGlanceClock(now: now)
+            )
+            await replacement.setCountdown(replacementTimer)
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN CLAIM DROP REPLACEMENT",
+                "countdown drop successor is visible before old claim release"
+            )
+            await replacement.disable()
+            let releasedSnapshot = await broker.snapshot()
+            let retainedWork = await broker.workState()
+            check(
+                retainedWork.activeOwnershipCount == 1
+                    && retainedWork.pendingOwnershipIntentCount == 1,
+                "countdown released successor retains bounded stale-claim high-water"
+            )
+
+            await broker.releaseClaim()
+            await oldEnable.value
+            check(
+                await waitUntil { weakOldProvider.isReleased },
+                "countdown dropped old provider releases after claim rejection"
+            )
+            check(await broker.lastClaimAccepted == false, "countdown dropped old claim is rejected")
+            check(
+                await broker.snapshot() == releasedSnapshot,
+                "countdown dropped old claim cannot mutate after successor release"
+            )
+            let prunedWork = await broker.workState()
+            check(
+                prunedWork.activeOwnershipCount == 0
+                    && prunedWork.pendingOwnershipIntentCount == 0,
+                "countdown stale high-water prunes after old claim settles"
+            )
+
+            let freshTimer = try CountdownTimer(
+                title: "COUNTDOWN FRESH CLAIM",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(210)
+            )
+            let fresh = CountdownGlanceProvider(
+                broker: broker,
+                clock: ManualGlanceClock(now: now)
+            )
+            await fresh.setCountdown(freshTimer)
+            await fresh.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN FRESH CLAIM",
+                "countdown capacity is reusable after stale high-water pruning"
+            )
+            await fresh.disable()
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "countdown fresh claim releases reusable capacity"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown gated old claim versus drop")
+        }
+    }
+
+    mutating func verifyDisableDeinitOverlap() async {
+        let now = Date(timeIntervalSinceReferenceDate: 57_000)
+
+        do {
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let clock = ManualGlanceClock(now: now)
+            let broker = GatedGlanceBroker()
+            let meeting = try CalendarMeeting(
+                eventIdentifier: "calendar-disable-drop",
+                title: "Calendar disable drop",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await source.setMeeting(meeting)
+            var provider: CalendarGlanceProvider? = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            await provider?.enable()
+            let weakProvider = WeakProviderReference(provider!)
+            await broker.gateNextCancel()
+            let disable = Task { [provider] in
+                await provider?.disable()
+            }
+            check(
+                await waitUntil { await broker.cancelPending },
+                "calendar disable-drop overlap gates explicit terminal clear"
+            )
+            let oldRevision = await broker.gatedConditionalExpectedRevision
+            check(
+                await broker.gatedConditionalComparisonMatched,
+                "calendar disable gate observes the old revision before replacement"
+            )
+            provider = nil
+            check(!weakProvider.isReleased, "calendar explicit disable owns provider until its drain completes")
+
+            let replacementSource = ManualCalendarSource(authorization: .fullAccess)
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-disable-replacement",
+                title: "Calendar disable replacement survives",
+                startDate: now.addingTimeInterval(90),
+                endDate: now.addingTimeInterval(210)
+            )
+            await replacementSource.setMeeting(replacementMeeting)
+            let replacement = CalendarGlanceProvider(
+                broker: broker,
+                source: replacementSource,
+                clock: replacementClock
+            )
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Calendar disable replacement survives",
+                "calendar replacement publishes during old disable/deinit overlap"
+            )
+            check(
+                await broker.snapshot().current?.revision != oldRevision,
+                "calendar disable replacement advances the broker revision"
+            )
+            await broker.releaseCancel()
+            await disable.value
+            check(
+                await waitUntil { weakProvider.isReleased },
+                "calendar provider releases after explicit disable drain"
+            )
+            await yieldSeveralTimes()
+            check(await broker.cancelCallCount == 1, "calendar deinit does not duplicate old explicit clear")
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "calendar old disable removal fails closed after replacement"
+            )
+            check(await source.stopCount == 1, "calendar deinit does not duplicate explicit source stop")
+            check(!(await source.isActive), "calendar disable-drop overlap leaves no observer")
+            check(await clock.pendingCount == 0, "calendar disable-drop overlap leaves no boundary")
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Calendar disable replacement survives",
+                "calendar old disable cannot erase replacement revision"
+            )
+            await replacement.disable()
+            check(await broker.cancelCallCount == 2, "calendar replacement clears only its own revision")
+            check(await broker.snapshot().ordered.isEmpty, "calendar replacement disable leaves no activity")
+            check(await replacement.workState().isIdle, "calendar replacement disable drains work")
+        } catch {
+            recordUnexpected(error, context: "calendar disable/deinit overlap")
+        }
+
+        do {
+            let clock = ManualGlanceClock(now: now)
+            let broker = GatedGlanceBroker()
+            let timer = try CountdownTimer(
+                title: "Countdown disable drop",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            var provider: CountdownGlanceProvider? = CountdownGlanceProvider(
+                broker: broker,
+                clock: clock
+            )
+            await provider?.setCountdown(timer)
+            await provider?.enable()
+            let weakProvider = WeakProviderReference(provider!)
+            await broker.gateNextCancel()
+            let disable = Task { [provider] in
+                await provider?.disable()
+            }
+            check(
+                await waitUntil { await broker.cancelPending },
+                "countdown disable-drop overlap gates explicit terminal clear"
+            )
+            let oldRevision = await broker.gatedConditionalExpectedRevision
+            check(
+                await broker.gatedConditionalComparisonMatched,
+                "countdown disable gate observes the old revision before replacement"
+            )
+            provider = nil
+            check(!weakProvider.isReleased, "countdown explicit disable owns provider until its drain completes")
+
+            let replacementClock = ManualGlanceClock(now: now)
+            let replacementTimer = try CountdownTimer(
+                title: "Countdown disable replacement survives",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            let replacement = CountdownGlanceProvider(
+                broker: broker,
+                clock: replacementClock
+            )
+            await replacement.setCountdown(replacementTimer)
+            await replacement.enable()
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Countdown disable replacement survives",
+                "countdown replacement publishes during old disable/deinit overlap"
+            )
+            check(
+                await broker.snapshot().current?.revision != oldRevision,
+                "countdown disable replacement advances the broker revision"
+            )
+            await broker.releaseCancel()
+            await disable.value
+            check(
+                await waitUntil { weakProvider.isReleased },
+                "countdown provider releases after explicit disable drain"
+            )
+            await yieldSeveralTimes()
+            check(await broker.cancelCallCount == 1, "countdown deinit does not duplicate old explicit clear")
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "countdown old disable removal fails closed after replacement"
+            )
+            check(await clock.pendingCount == 0, "countdown disable-drop overlap leaves no boundary")
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Countdown disable replacement survives",
+                "countdown old disable cannot erase replacement revision"
+            )
+            await replacement.disable()
+            check(await broker.cancelCallCount == 2, "countdown replacement clears only its own revision")
+            check(await broker.snapshot().ordered.isEmpty, "countdown replacement disable leaves no activity")
+            check(await replacement.workState().isIdle, "countdown replacement disable drains work")
+        } catch {
+            recordUnexpected(error, context: "countdown disable/deinit overlap")
+        }
+    }
+
+    mutating func verifyUnleasedReplacementFencing() async {
+        let now = Date(timeIntervalSinceReferenceDate: 57_500)
+
+        do {
+            let broker = GatedGlanceBroker()
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let clock = ManualGlanceClock(now: now)
+            let ownedMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-owned-disable",
+                title: "Calendar owned before public replacement",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await source.setMeeting(ownedMeeting)
+            let provider = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            await provider.enable()
+
+            let publicMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-public-disable",
+                title: "CALENDAR PUBLIC DISABLE SURVIVES",
+                startDate: now.addingTimeInterval(90),
+                endDate: now.addingTimeInterval(210)
+            )
+            _ = try await broker.submit(
+                GlanceRequestFactory.meeting(publicMeeting, now: now)
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "calendar public replacement invalidates provider admission"
+            )
+            await provider.disable()
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "calendar disable cannot cancel a later unleased record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR PUBLIC DISABLE SURVIVES",
+                "calendar unleased replacement survives old disable"
+            )
+            check(await provider.workState().isIdle, "calendar public replacement disable drains work")
+            check(!(await source.isActive), "calendar public replacement disable stops observation")
+            check(await clock.pendingCount == 0, "calendar public replacement disable stops its boundary")
+            if let identity = await broker.snapshot().current?.activity.identity {
+                _ = await broker.cancel(identity)
+            }
+            check(await broker.snapshot().ordered.isEmpty, "calendar public replacement fixture cleans up")
+        } catch {
+            recordUnexpected(error, context: "calendar unleased replacement versus disable")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let source = ManualCalendarSource(authorization: .fullAccess)
+            let clock = ManualGlanceClock(now: now)
+            let ownedMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-owned-drop",
+                title: "Calendar owned before public drop",
+                startDate: now.addingTimeInterval(60),
+                endDate: now.addingTimeInterval(180)
+            )
+            await source.setMeeting(ownedMeeting)
+            var provider: CalendarGlanceProvider? = CalendarGlanceProvider(
+                broker: broker,
+                source: source,
+                clock: clock
+            )
+            await provider?.enable()
+
+            let publicMeeting = try CalendarMeeting(
+                eventIdentifier: "calendar-public-drop",
+                title: "CALENDAR PUBLIC DROP SURVIVES",
+                startDate: now.addingTimeInterval(90),
+                endDate: now.addingTimeInterval(210)
+            )
+            _ = try await broker.submit(
+                GlanceRequestFactory.meeting(publicMeeting, now: now)
+            )
+            let weakProvider = WeakProviderReference(provider!)
+            provider = nil
+            check(
+                await waitUntil { weakProvider.isReleased },
+                "calendar owner releases after an unleased replacement"
+            )
+            check(
+                await waitUntil { await broker.conditionalCancelCompletionCount == 1 },
+                "calendar detached old cleanup settles after public replacement"
+            )
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "calendar detached cleanup cannot cancel an unleased record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "CALENDAR PUBLIC DROP SURVIVES",
+                "calendar unleased replacement survives old deinit"
+            )
+            check(!(await source.isActive), "calendar public replacement deinit stops observation")
+            check(
+                await waitUntil { await clock.pendingCount == 0 },
+                "calendar public replacement deinit stops its boundary"
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "calendar public replacement deinit leaves no admission generation"
+            )
+            if let identity = await broker.snapshot().current?.activity.identity {
+                _ = await broker.cancel(identity)
+            }
+            check(await broker.snapshot().ordered.isEmpty, "calendar public drop fixture cleans up")
+        } catch {
+            recordUnexpected(error, context: "calendar unleased replacement versus deinit")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let clock = ManualGlanceClock(now: now)
+            let ownedTimer = try CountdownTimer(
+                title: "Countdown owned before public replacement",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            let provider = CountdownGlanceProvider(broker: broker, clock: clock)
+            await provider.setCountdown(ownedTimer)
+            await provider.enable()
+
+            let publicTimer = try CountdownTimer(
+                title: "COUNTDOWN PUBLIC DISABLE SURVIVES",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            _ = try await broker.submit(
+                GlanceRequestFactory.countdown(publicTimer, now: now)
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "countdown public replacement invalidates provider admission"
+            )
+            await provider.disable()
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "countdown disable cannot cancel a later unleased record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN PUBLIC DISABLE SURVIVES",
+                "countdown unleased replacement survives old disable"
+            )
+            check(await provider.workState().isIdle, "countdown public replacement disable drains work")
+            check(await clock.pendingCount == 0, "countdown public replacement disable stops its boundary")
+            if let identity = await broker.snapshot().current?.activity.identity {
+                _ = await broker.cancel(identity)
+            }
+            check(await broker.snapshot().ordered.isEmpty, "countdown public replacement fixture cleans up")
+        } catch {
+            recordUnexpected(error, context: "countdown unleased replacement versus disable")
+        }
+
+        do {
+            let broker = GatedGlanceBroker()
+            let clock = ManualGlanceClock(now: now)
+            let ownedTimer = try CountdownTimer(
+                title: "Countdown owned before public drop",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(120)
+            )
+            var provider: CountdownGlanceProvider? = CountdownGlanceProvider(
+                broker: broker,
+                clock: clock
+            )
+            await provider?.setCountdown(ownedTimer)
+            await provider?.enable()
+
+            let publicTimer = try CountdownTimer(
+                title: "COUNTDOWN PUBLIC DROP SURVIVES",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(180)
+            )
+            _ = try await broker.submit(
+                GlanceRequestFactory.countdown(publicTimer, now: now)
+            )
+            let weakProvider = WeakProviderReference(provider!)
+            provider = nil
+            check(
+                await waitUntil { weakProvider.isReleased },
+                "countdown owner releases after an unleased replacement"
+            )
+            check(
+                await waitUntil { await broker.conditionalCancelCompletionCount == 1 },
+                "countdown detached old cleanup settles after public replacement"
+            )
+            check(
+                await broker.lastConditionalCancelResult == false,
+                "countdown detached cleanup cannot cancel an unleased record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "COUNTDOWN PUBLIC DROP SURVIVES",
+                "countdown unleased replacement survives old deinit"
+            )
+            check(
+                await waitUntil { await clock.pendingCount == 0 },
+                "countdown public replacement deinit stops its boundary"
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "countdown public replacement deinit leaves no admission generation"
+            )
+            if let identity = await broker.snapshot().current?.activity.identity {
+                _ = await broker.cancel(identity)
+            }
+            check(await broker.snapshot().ordered.isEmpty, "countdown public drop fixture cleans up")
+        } catch {
+            recordUnexpected(error, context: "countdown unleased replacement versus deinit")
+        }
+    }
+
+    mutating func verifyLifecycleStress() async {
+        let broker = makeBroker()
+        let powerSource = ManualPowerSource()
+        let calendarSource = ManualCalendarSource(authorization: .fullAccess)
+        let clock = ManualGlanceClock(now: Date(timeIntervalSinceReferenceDate: 58_000))
+        let power = PowerGlanceProvider(broker: broker, source: powerSource)
+        let calendar = CalendarGlanceProvider(broker: broker, source: calendarSource, clock: clock)
+
+        for cycle in 0..<50 {
+            let firstPowerEnable = Task { await power.enable() }
+            let secondPowerEnable = Task { await power.enable() }
+            let firstCalendarEnable = Task { await calendar.enable() }
+            let secondCalendarEnable = Task { await calendar.enable() }
+            await firstPowerEnable.value
+            await secondPowerEnable.value
+            await firstCalendarEnable.value
+            await secondCalendarEnable.value
+
+            check(await powerSource.startCount == cycle + 1, "power stress cycle owns no duplicate observer")
+            check(await calendarSource.startCount == cycle + 1, "calendar stress cycle owns no duplicate observer")
+            check(await power.workState().activeConsumerTaskCount == 1, "power stress cycle owns one consumer")
+            check(await calendar.workState().activeConsumerTaskCount == 1, "calendar stress cycle owns one consumer")
+            check(
+                await broker.workState().activeOwnershipCount == 1,
+                "calendar rapid re-enable owns one bounded admission generation"
+            )
+
+            let firstPowerDisable = Task { await power.disable() }
+            let secondPowerDisable = Task { await power.disable() }
+            let firstCalendarDisable = Task { await calendar.disable() }
+            let secondCalendarDisable = Task { await calendar.disable() }
+            await firstPowerDisable.value
+            await secondPowerDisable.value
+            await firstCalendarDisable.value
+            await secondCalendarDisable.value
+
+            check(await power.workState().isIdle, "power stress disable fully drains")
+            check(await calendar.workState().isIdle, "calendar stress disable fully drains")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "calendar rapid disable prunes its admission generation"
+            )
+        }
+        check(await powerSource.stopCount == 50, "power stress cycles stop every observer exactly once")
+        check(await calendarSource.stopCount == 50, "calendar stress cycles stop every observer exactly once")
+        check(await calendarSource.permissionRequestCount == 0, "calendar stress restore cycles never request permission")
     }
 
     mutating func verifyNormalizedFailureHealth() async {
@@ -811,6 +3867,16 @@ private struct GlanceHarness {
         let permission = CalendarGlanceProvider(broker: makeBroker(), source: permissionSource, clock: ManualGlanceClock())
         await permission.enable()
         check(
+            await permission.status().health == .healthy,
+            "prompt-free calendar enable reports healthy idle machinery"
+        )
+        do {
+            _ = try await permission.requestFullAccess()
+            check(false, "explicit permission failure throws a normalized error")
+        } catch {
+            check(error == .requestFailed, "explicit permission failure returns a typed normalized error")
+        }
+        check(
             await permission.status().health == .unavailable(.permissionRequestFailed),
             "permission request error is normalized"
         )
@@ -822,10 +3888,12 @@ private struct GlanceHarness {
     }
 
     private func waitUntil(_ condition: () async -> Bool) async -> Bool {
-        for _ in 0..<2_000 {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        repeat {
             if await condition() { return true }
-            await Task.yield()
-        }
+            try? await clock.sleep(for: .milliseconds(1))
+        } while clock.now < deadline
         return false
     }
 
@@ -869,15 +3937,99 @@ private actor CompletionFlag {
     }
 }
 
-private actor GatedGlanceBroker: GlanceActivityBroker {
+private final class WeakProviderReference<Value: AnyObject>: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var value: Value?
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    var isReleased: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value == nil
+    }
+}
+
+private actor LegacyGlanceBroker: GlanceActivityBroker {
     private let broker = ActivityBroker(expirationScheduler: ManualBrokerScheduler())
+    private(set) var submitCallCount = 0
+    private(set) var cancelCallCount = 0
+
+    func submit(_ request: ActivityRequest) async throws -> ActivityBrokerSnapshot {
+        submitCallCount += 1
+        return try await broker.submit(request)
+    }
+
+    func cancel(_ identity: ActivityIdentity) async -> Bool {
+        cancelCallCount += 1
+        return await broker.cancel(identity)
+    }
+
+    func snapshot() async -> ActivityBrokerSnapshot {
+        await broker.snapshot()
+    }
+}
+
+private actor GatedGlanceBroker: GlanceOwnershipActivityBroker, GlanceRevisionActivityBroker {
+    private let broker = ActivityBroker(expirationScheduler: ManualBrokerScheduler())
+    private var shouldGateClaim = false
     private var shouldGateSubmit = false
     private var shouldGateCancel = false
+    private var claimContinuation: CheckedContinuation<Void, Never>?
     private var submitContinuation: CheckedContinuation<Void, Never>?
     private var cancelContinuation: CheckedContinuation<Void, Never>?
+    private(set) var claimCallCount = 0
+    private(set) var claimCompletionCount = 0
+    private(set) var lastClaimAccepted: Bool?
+    private(set) var submitCallCount = 0
+    private(set) var ownedSubmitCompletionCount = 0
+    private(set) var lastOwnedSubmitAccepted: Bool?
+    private(set) var cancelCallCount = 0
+    private(set) var conditionalCancelCompletionCount = 0
+    private(set) var gatedConditionalExpectedRevision: UInt64?
+    private(set) var gatedConditionalComparisonMatched = false
+    private(set) var lastConditionalCancelResult: Bool?
 
+    var claimPending: Bool { claimContinuation != nil }
     var submitPending: Bool { submitContinuation != nil }
     var cancelPending: Bool { cancelContinuation != nil }
+    var physicalCallCount: Int { submitCallCount + cancelCallCount }
+
+    nonisolated var ownershipCoordinator: ActivityOwnershipCoordinator {
+        broker.ownershipCoordinator
+    }
+
+    func claimOwnership(
+        of identity: ActivityIdentity,
+        admitting intent: ActivityOwnershipClaimIntent
+    ) async -> ActivityOwnershipLease? {
+        claimCallCount += 1
+        if shouldGateClaim {
+            shouldGateClaim = false
+            await withCheckedContinuation { continuation in
+                claimContinuation = continuation
+            }
+        }
+        let lease = await broker.claimOwnership(of: identity, admitting: intent)
+        lastClaimAccepted = lease != nil
+        claimCompletionCount += 1
+        return lease
+    }
+
+    func releaseOwnership(_ lease: ActivityOwnershipLease) async -> Bool {
+        await broker.releaseOwnership(lease)
+    }
+
+    func gateNextClaim() {
+        shouldGateClaim = true
+    }
+
+    func releaseClaim() {
+        claimContinuation?.resume()
+        claimContinuation = nil
+    }
 
     func gateNextSubmit() {
         shouldGateSubmit = true
@@ -898,6 +4050,7 @@ private actor GatedGlanceBroker: GlanceActivityBroker {
     }
 
     func submit(_ request: ActivityRequest) async throws -> ActivityBrokerSnapshot {
+        submitCallCount += 1
         if shouldGateSubmit {
             shouldGateSubmit = false
             await withCheckedContinuation { continuation in
@@ -907,7 +4060,25 @@ private actor GatedGlanceBroker: GlanceActivityBroker {
         return try await broker.submit(request)
     }
 
+    func submit(
+        _ request: ActivityRequest,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) async throws -> ActivityBrokerSnapshot? {
+        submitCallCount += 1
+        if shouldGateSubmit {
+            shouldGateSubmit = false
+            await withCheckedContinuation { continuation in
+                submitContinuation = continuation
+            }
+        }
+        let result = try await broker.submit(request, ifOwnedBy: lease)
+        lastOwnedSubmitAccepted = result != nil
+        ownedSubmitCompletionCount += 1
+        return result
+    }
+
     func cancel(_ identity: ActivityIdentity) async -> Bool {
+        cancelCallCount += 1
         if shouldGateCancel {
             shouldGateCancel = false
             await withCheckedContinuation { continuation in
@@ -915,6 +4086,110 @@ private actor GatedGlanceBroker: GlanceActivityBroker {
             }
         }
         return await broker.cancel(identity)
+    }
+
+    func cancel(_ identity: ActivityIdentity, ifRevision revision: UInt64) async -> Bool {
+        cancelCallCount += 1
+        if shouldGateCancel {
+            shouldGateCancel = false
+            let comparedRevision = await broker.snapshot().ordered.first {
+                $0.activity.identity == identity
+            }?.revision
+            gatedConditionalExpectedRevision = revision
+            gatedConditionalComparisonMatched = comparedRevision == revision
+            await withCheckedContinuation { continuation in
+                cancelContinuation = continuation
+            }
+        }
+        let result = await broker.cancel(identity, ifRevision: revision)
+        lastConditionalCancelResult = result
+        conditionalCancelCompletionCount += 1
+        return result
+    }
+
+    func cancel(
+        _ identity: ActivityIdentity,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) async -> Bool {
+        cancelCallCount += 1
+        if shouldGateCancel {
+            shouldGateCancel = false
+            let comparedRevision = await broker.snapshot().ordered.first {
+                $0.activity.identity == identity
+            }?.revision
+            gatedConditionalExpectedRevision = comparedRevision
+            gatedConditionalComparisonMatched = comparedRevision != nil
+            await withCheckedContinuation { continuation in
+                cancelContinuation = continuation
+            }
+        }
+        let result = await broker.cancel(identity, ifOwnedBy: lease)
+        lastConditionalCancelResult = result
+        conditionalCancelCompletionCount += 1
+        return result
+    }
+
+    func snapshot() async -> ActivityBrokerSnapshot {
+        await broker.snapshot()
+    }
+
+    func workState() async -> ActivityBrokerWorkState {
+        await broker.workState()
+    }
+}
+
+private actor CancellationRecordingBroker: GlanceOwnershipActivityBroker, GlanceRevisionActivityBroker {
+    private let broker = ActivityBroker(expirationScheduler: ManualBrokerScheduler())
+    private(set) var physicalCallCount = 0
+    private(set) var cancelObservedCancellation = false
+
+    nonisolated var ownershipCoordinator: ActivityOwnershipCoordinator {
+        broker.ownershipCoordinator
+    }
+
+    func claimOwnership(
+        of identity: ActivityIdentity,
+        admitting intent: ActivityOwnershipClaimIntent
+    ) async -> ActivityOwnershipLease? {
+        await broker.claimOwnership(of: identity, admitting: intent)
+    }
+
+    func releaseOwnership(_ lease: ActivityOwnershipLease) async -> Bool {
+        await broker.releaseOwnership(lease)
+    }
+
+    func submit(_ request: ActivityRequest) async throws -> ActivityBrokerSnapshot {
+        physicalCallCount += 1
+        return try await broker.submit(request)
+    }
+
+    func submit(
+        _ request: ActivityRequest,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) async throws -> ActivityBrokerSnapshot? {
+        physicalCallCount += 1
+        return try await broker.submit(request, ifOwnedBy: lease)
+    }
+
+    func cancel(_ identity: ActivityIdentity) async -> Bool {
+        physicalCallCount += 1
+        cancelObservedCancellation = cancelObservedCancellation || Task.isCancelled
+        return await broker.cancel(identity)
+    }
+
+    func cancel(_ identity: ActivityIdentity, ifRevision revision: UInt64) async -> Bool {
+        physicalCallCount += 1
+        cancelObservedCancellation = cancelObservedCancellation || Task.isCancelled
+        return await broker.cancel(identity, ifRevision: revision)
+    }
+
+    func cancel(
+        _ identity: ActivityIdentity,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) async -> Bool {
+        physicalCallCount += 1
+        cancelObservedCancellation = cancelObservedCancellation || Task.isCancelled
+        return await broker.cancel(identity, ifOwnedBy: lease)
     }
 
     func snapshot() async -> ActivityBrokerSnapshot {
@@ -931,6 +4206,7 @@ private actor ManualPowerSource: PowerEventSource {
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var stopCallCount = 0
+    private(set) var stopObservedCancellation = false
 
     init(failStart: Bool = false) {
         self.failStart = failStart
@@ -946,6 +4222,7 @@ private actor ManualPowerSource: PowerEventSource {
     }
 
     func stop() async {
+        stopObservedCancellation = stopObservedCancellation || Task.isCancelled
         stopCallCount += 1
         guard activeHandlerIndex != nil else { return }
         stopCount += 1
@@ -965,6 +4242,7 @@ private actor ManualVolumeSource: VolumeEventSource {
     private var handler: Handler?
     private(set) var startCount = 0
     private(set) var stopCount = 0
+    private(set) var stopObservedCancellation = false
 
     var isActive: Bool { handler != nil }
 
@@ -975,6 +4253,7 @@ private actor ManualVolumeSource: VolumeEventSource {
     }
 
     func stop() async {
+        stopObservedCancellation = stopObservedCancellation || Task.isCancelled
         guard handler != nil else { return }
         stopCount += 1
         handler = nil
@@ -999,32 +4278,56 @@ private actor ManualVolumeSource: VolumeEventSource {
     }
 }
 
+private enum CalendarClearScenario: CaseIterable, Equatable {
+    case noMeeting
+    case distantMeeting
+    case queryFailure
+
+    var label: String {
+        switch self {
+        case .noMeeting:
+            "nil meeting"
+        case .distantMeeting:
+            "distant meeting"
+        case .queryFailure:
+            "query failure"
+        }
+    }
+}
+
 private actor ManualCalendarSource: CalendarEventSource {
-    typealias Handler = @Sendable () -> Void
+    typealias Handler = @Sendable (CalendarSourceEvent) -> Void
 
     private var authorization: CalendarAuthorization
     private let authorizationAfterRequest: CalendarAuthorization
     private let requestResult: Bool
     private let failPermissionRequest: Bool
-    private let failQueries: Bool
+    private let failStart: Bool
+    private var failQueries: Bool
     private var meeting: CalendarMeeting?
     private var handler: Handler?
+    private var handlers: [Handler] = []
     private(set) var permissionRequestCount = 0
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var queryCount = 0
+    private(set) var stopObservedCancellation = false
+
+    var isActive: Bool { handler != nil }
 
     init(
         authorization: CalendarAuthorization = .fullAccess,
         authorizationAfterRequest: CalendarAuthorization = .fullAccess,
         requestResult: Bool = true,
         failPermissionRequest: Bool = false,
+        failStart: Bool = false,
         failQueries: Bool = false
     ) {
         self.authorization = authorization
         self.authorizationAfterRequest = authorizationAfterRequest
         self.requestResult = requestResult
         self.failPermissionRequest = failPermissionRequest
+        self.failStart = failStart
         self.failQueries = failQueries
     }
 
@@ -1039,13 +4342,24 @@ private actor ManualCalendarSource: CalendarEventSource {
         return requestResult
     }
 
-    func start(changeHandler: @escaping Handler) async throws {
+    func start(changeHandler: @escaping @Sendable () -> Void) async throws {
+        try installHandler { _ in changeHandler() }
+    }
+
+    func start(eventHandler: @escaping Handler) async throws {
+        try installHandler(eventHandler)
+    }
+
+    private func installHandler(_ eventHandler: @escaping Handler) throws {
         guard handler == nil else { return }
         startCount += 1
-        handler = changeHandler
+        if failStart { throw GlanceEventSourceError.observerRegistrationFailed }
+        handler = eventHandler
+        handlers.append(eventHandler)
     }
 
     func stop() async {
+        stopObservedCancellation = stopObservedCancellation || Task.isCancelled
         guard handler != nil else { return }
         stopCount += 1
         handler = nil
@@ -1064,8 +4378,21 @@ private actor ManualCalendarSource: CalendarEventSource {
         self.meeting = meeting
     }
 
+    func setFailQueries(_ failQueries: Bool) {
+        self.failQueries = failQueries
+    }
+
     func emitChange() {
-        handler?()
+        handler?(.eventStoreChanged)
+    }
+
+    func emit(_ event: CalendarSourceEvent) {
+        handler?(event)
+    }
+
+    func emitStale(_ event: CalendarSourceEvent, handlerIndex: Int = 0) {
+        guard handlers.indices.contains(handlerIndex) else { return }
+        handlers[handlerIndex](event)
     }
 }
 
@@ -1161,6 +4488,39 @@ private actor DeferredVolumeSource: VolumeEventSource {
     }
 }
 
+private actor DeferredPermissionCalendarSource: CalendarEventSource {
+    private var authorization: CalendarAuthorization = .notDetermined
+    private var permissionContinuation: CheckedContinuation<Bool, Never>?
+    private(set) var permissionRequestCount = 0
+
+    var requestPending: Bool { permissionContinuation != nil }
+
+    func authorizationStatus() async -> CalendarAuthorization {
+        authorization
+    }
+
+    func requestFullAccess() async throws -> Bool {
+        permissionRequestCount += 1
+        return await withCheckedContinuation { continuation in
+            permissionContinuation = continuation
+        }
+    }
+
+    func start(changeHandler: @escaping @Sendable () -> Void) async throws {}
+
+    func stop() async {}
+
+    func nextMeeting(after startDate: Date, until endDate: Date) async throws -> CalendarMeeting? {
+        nil
+    }
+
+    func finishPermission(granted: Bool) {
+        authorization = granted ? .fullAccess : .denied
+        permissionContinuation?.resume(returning: granted)
+        permissionContinuation = nil
+    }
+}
+
 private actor DeferredCalendarSource: CalendarEventSource {
     typealias Handler = @Sendable () -> Void
 
@@ -1230,12 +4590,14 @@ private actor ManualGlanceClock: GlanceClock {
     private var waiters: [Waiter] = []
     private var cancelledBeforeRegistration: Set<UUID> = []
     private(set) var cancellationCount = 0
+    private(set) var totalSleepCount = 0
 
     init(now: Date = Date(timeIntervalSinceReferenceDate: 60_000)) {
         currentDate = now
     }
 
     var pendingCount: Int { waiters.count }
+    var pendingDeadlines: [Date] { waiters.map(\.deadline).sorted() }
 
     func now() async -> Date {
         currentDate
@@ -1247,6 +4609,7 @@ private actor ManualGlanceClock: GlanceClock {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<Void, any Error>) in
+                totalSleepCount += 1
                 if cancelledBeforeRegistration.remove(identifier) != nil {
                     cancellationCount += 1
                     continuation.resume(throwing: CancellationError())
@@ -1272,6 +4635,10 @@ private actor ManualGlanceClock: GlanceClock {
         ready.forEach { $0.continuation.resume() }
     }
 
+    func setNow(_ date: Date) {
+        currentDate = date
+    }
+
     private func cancel(_ identifier: UUID) {
         guard let index = waiters.firstIndex(where: { $0.identifier == identifier }) else {
             cancelledBeforeRegistration.insert(identifier)
@@ -1284,14 +4651,23 @@ private actor ManualGlanceClock: GlanceClock {
 
 /// Deliberately ignores task cancellation so provider generation checks get exercised.
 private actor NonCooperativeGlanceClock: GlanceClock {
+    private struct Waiter {
+        let identifier: UUID
+        let deadline: Date
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
     private var currentDate: Date
-    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var waiters: [Waiter] = []
+    private(set) var totalSleepCount = 0
+    private(set) var cancellationAttemptCount = 0
 
     init(now: Date) {
         currentDate = now
     }
 
-    var waiterCount: Int { continuations.count }
+    var waiterCount: Int { waiters.count }
+    var pendingDeadlines: [Date] { waiters.map(\.deadline).sorted() }
 
     func now() async -> Date {
         currentDate
@@ -1299,14 +4675,36 @@ private actor NonCooperativeGlanceClock: GlanceClock {
 
     func sleep(until deadline: Date) async throws {
         guard deadline > currentDate else { return }
-        await withCheckedContinuation { continuation in
-            continuations.append(continuation)
+        let identifier = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                totalSleepCount += 1
+                waiters.append(
+                    Waiter(
+                        identifier: identifier,
+                        deadline: deadline,
+                        continuation: continuation
+                    )
+                )
+            }
+        } onCancel: {
+            Task { await self.recordCancellationAttempt(identifier) }
         }
     }
 
-    func fire(index: Int) {
-        guard continuations.indices.contains(index) else { return }
-        continuations.remove(at: index).resume()
+    func setNow(_ date: Date) {
+        currentDate = date
+    }
+
+    func fire(index: Int, at date: Date? = nil) {
+        guard waiters.indices.contains(index) else { return }
+        if let date { currentDate = date }
+        waiters.remove(at: index).continuation.resume()
+    }
+
+    private func recordCancellationAttempt(_ identifier: UUID) {
+        guard waiters.contains(where: { $0.identifier == identifier }) else { return }
+        cancellationAttemptCount += 1
     }
 }
 
@@ -1319,6 +4717,8 @@ private actor ManualBrokerScheduler: ActivityExpirationScheduling {
     private var waiters: [Waiter] = []
     private var cancelledBeforeRegistration: Set<UUID> = []
     private(set) var totalSleepCount = 0
+
+    var pendingCount: Int { waiters.count }
 
     func sleep(for duration: Duration) async throws {
         let identifier = UUID()

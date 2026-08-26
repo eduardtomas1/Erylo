@@ -4,6 +4,7 @@ import Foundation
 public actor PowerGlanceProvider {
     private let broker: any GlanceActivityBroker
     private let source: any PowerEventSource
+    private let presentationPolicy: BatteryPresentationPolicy
     private var enabled = false
     private var generation: UInt64 = 0
     private var sourceActive = false
@@ -13,11 +14,28 @@ public actor PowerGlanceProvider {
     private var eventContinuation: AsyncStream<PowerSourceEvent>.Continuation?
     private var eventConsumerTask: Task<Void, Never>?
     private var lastEvent: PowerSourceEvent?
+    private var lastSnapshot: PowerSnapshot?
     private var currentStatus = GlanceProviderStatus.disabled
 
-    public init(broker: any GlanceActivityBroker, source: any PowerEventSource) {
+    public init(
+        broker: any GlanceActivityBroker,
+        source: any PowerEventSource
+    ) {
+        self.init(
+            broker: broker,
+            source: source,
+            presentationPolicy: .standard
+        )
+    }
+
+    public init(
+        broker: any GlanceActivityBroker,
+        source: any PowerEventSource,
+        presentationPolicy: BatteryPresentationPolicy
+    ) {
         self.broker = broker
         self.source = source
+        self.presentationPolicy = presentationPolicy
     }
 
     public func enable() async {
@@ -60,7 +78,7 @@ public actor PowerGlanceProvider {
         activationTask = nil
         pendingActivation?.cancel()
         let consumer = finishEventRelay()
-        let task = Task { [weak self] in
+        let task = Task.detached { [weak self] in
             guard let self else { return }
             await self.performDisable(
                 pendingActivation: pendingActivation,
@@ -82,6 +100,12 @@ public actor PowerGlanceProvider {
             activeConsumerTaskCount: eventConsumerTask == nil ? 0 : 1,
             scheduledBoundaryCount: 0
         )
+    }
+
+    /// Deterministic package seam for proving that the quiet first snapshot was
+    /// consumed before a later change is injected. It performs no source work.
+    package func latestProcessedSnapshot() -> PowerSnapshot? {
+        lastSnapshot
     }
 
     private func activate(
@@ -129,6 +153,7 @@ public actor PowerGlanceProvider {
         sourceActive = false
         await consumer?.value
         lastEvent = nil
+        lastSnapshot = nil
         currentStatus = .disabled
         _ = await broker.cancel(GlanceActivityIdentity.battery)
     }
@@ -174,8 +199,24 @@ public actor PowerGlanceProvider {
 
         switch event {
         case let .snapshot(snapshot):
+            let lifetime = presentationPolicy.lifetime(
+                for: snapshot,
+                previous: lastSnapshot
+            )
+            lastSnapshot = snapshot
+            guard let request = GlanceRequestFactory.power(
+                snapshot,
+                lifetime: lifetime
+            ) else {
+                currentStatus = GlanceProviderStatus(
+                    isEnabled: true,
+                    capability: .available,
+                    health: .healthy
+                )
+                return
+            }
             do {
-                _ = try await broker.submit(GlanceRequestFactory.power(snapshot))
+                _ = try await broker.submit(request)
                 currentStatus = GlanceProviderStatus(
                     isEnabled: true,
                     capability: .available,
@@ -258,7 +299,7 @@ public actor VolumeGlanceProvider {
         activationTask = nil
         pendingActivation?.cancel()
         let consumer = finishEventRelay()
-        let task = Task { [weak self] in
+        let task = Task.detached { [weak self] in
             guard let self else { return }
             await self.performDisable(
                 pendingActivation: pendingActivation,

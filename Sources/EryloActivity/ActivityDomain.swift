@@ -16,6 +16,8 @@ public enum ActivityLimits {
     public static let minimumPriority = 0
     public static let maximumPriority = 100
     public static let maximumActivityCount = 128
+    public static let maximumOwnershipCount = 128
+    public static let maximumOwnershipIntentCount = 256
     public static let maximumSubscriberCount = 32
 }
 

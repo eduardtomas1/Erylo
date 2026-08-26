@@ -1,3 +1,4 @@
+import AppKit
 import AudioToolbox
 import CoreAudio
 import EventKit
@@ -27,8 +28,19 @@ public protocol CalendarEventSource: Sendable {
     func authorizationStatus() async -> CalendarAuthorization
     func requestFullAccess() async throws -> Bool
     func start(changeHandler: @escaping @Sendable () -> Void) async throws
+    func start(eventHandler: @escaping @Sendable (CalendarSourceEvent) -> Void) async throws
     func stop() async
     func nextMeeting(after startDate: Date, until endDate: Date) async throws -> CalendarMeeting?
+}
+
+public extension CalendarEventSource {
+    /// Compatibility path for sources that only distinguish EventKit changes. Production
+    /// adapters override this seam to identify clock, time-zone, and wake convergence.
+    func start(eventHandler: @escaping @Sendable (CalendarSourceEvent) -> Void) async throws {
+        try await start {
+            eventHandler(.eventStoreChanged)
+        }
+    }
 }
 
 private final class PowerCallbackBox: @unchecked Sendable {
@@ -364,13 +376,18 @@ public final class CoreAudioVolumeEventSource: VolumeEventSource, @unchecked Sen
 
 /// Public EventKit access. Permission is requested only when the calendar provider calls it.
 private final class CalendarObserverState: @unchecked Sendable {
-    var observer: NSObjectProtocol?
+    struct Registration {
+        let center: NotificationCenter
+        let observer: NSObjectProtocol
+    }
+
+    var registrations: [Registration] = []
 
     func removeObserver() {
-        if let observer {
-            NotificationCenter.default.removeObserver(observer)
-            self.observer = nil
+        for registration in registrations {
+            registration.center.removeObserver(registration.observer)
         }
+        registrations.removeAll(keepingCapacity: true)
     }
 
     deinit {
@@ -417,14 +434,60 @@ public final class EventKitCalendarEventSource: CalendarEventSource {
     }
 
     public func start(changeHandler: @escaping @Sendable () -> Void) async throws {
-        guard observerState.observer == nil else { return }
-        observerState.observer = NotificationCenter.default.addObserver(
+        try await start { _ in
+            changeHandler()
+        }
+    }
+
+    public func start(
+        eventHandler: @escaping @Sendable (CalendarSourceEvent) -> Void
+    ) async throws {
+        guard observerState.registrations.isEmpty else { return }
+
+        let eventStoreObserver = NotificationCenter.default.addObserver(
             forName: .EKEventStoreChanged,
             object: eventStore,
             queue: .main
         ) { _ in
-            changeHandler()
+            eventHandler(.eventStoreChanged)
         }
+        observerState.registrations.append(
+            .init(center: .default, observer: eventStoreObserver)
+        )
+
+        let clockObserver = NotificationCenter.default.addObserver(
+            forName: .NSSystemClockDidChange,
+            object: nil,
+            queue: .main
+        ) { _ in
+            eventHandler(.wallClockChanged)
+        }
+        observerState.registrations.append(
+            .init(center: .default, observer: clockObserver)
+        )
+
+        let timeZoneObserver = NotificationCenter.default.addObserver(
+            forName: .NSSystemTimeZoneDidChange,
+            object: nil,
+            queue: .main
+        ) { _ in
+            eventHandler(.timeZoneChanged)
+        }
+        observerState.registrations.append(
+            .init(center: .default, observer: timeZoneObserver)
+        )
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        let wakeObserver = workspaceCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            eventHandler(.didWake)
+        }
+        observerState.registrations.append(
+            .init(center: workspaceCenter, observer: wakeObserver)
+        )
     }
 
     public func stop() async {

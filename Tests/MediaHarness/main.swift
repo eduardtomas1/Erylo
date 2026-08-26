@@ -7,7 +7,7 @@ import Foundation
 @main
 enum MediaHarnessMain {
     static func main() async {
-        if MediaProcessHelper.runIfRequested() {
+        if await MediaProcessHelper.runIfRequested() {
             return
         }
         let harness = MediaHarness()
@@ -27,6 +27,7 @@ private final class MediaHarness {
         await verifyDisabledZeroWorkAndUnavailableApplication()
         await verifyCommandSerializationRevalidationAndBounds()
         await verifyLifecycleAndRefreshGenerations()
+        await verifyRefreshAndConvenienceCancellationPrecedence()
         await verifyDesktopAdapterSerializationCapacityAndCancellation()
         await verifyAdapterCancellationDrainBarriers()
         await verifyAdapterErrorMappingAndScriptIsolation()
@@ -332,9 +333,108 @@ private final class MediaHarness {
             "already-cancelled command cannot start adapter work"
         )
         await alreadyCancelledCoordinator.stop()
+
+        let delayedCancellation = GatedCommandCancellationObserver()
+        let failingCommandAdapter = GatedFailingCommandAdapter(source: .spotify)
+        let cancellationPrecedenceCoordinator = MediaCoordinator(
+            adapters: [failingCommandAdapter],
+            policy: MediaCoordinatorPolicy(maximumPendingCommands: 1),
+            commandCancellationObserver: delayedCancellation
+        )
+        await cancellationPrecedenceCoordinator.setEnabled(true, for: .spotify)
+        _ = try! await cancellationPrecedenceCoordinator.refresh(.spotify)
+        let failingCommand = Task {
+            try await cancellationPrecedenceCoordinator.perform(.play, on: .spotify)
+        }
+        await failingCommandAdapter.firstCommandStarted.wait()
+        failingCommand.cancel()
+        await delayedCancellation.dispatchStarted.wait()
+        await failingCommandAdapter.releaseFirstCommandFailure()
+        let failingCommandError = await mediaError(from: failingCommand.result)
+        check(
+            failingCommandError == .cancelled(source: .spotify),
+            "synchronous command cancellation latch wins over adapter failure"
+        )
+        let retainedSnapshot = await cancellationPrecedenceCoordinator.snapshot(for: .spotify)
+        check(
+            retainedSnapshot?.title == "Stable",
+            "cancelled failing command cannot mutate the coordinator snapshot"
+        )
+        await delayedCancellation.releaseDispatch()
+        await delayedCancellation.dispatchFinished.wait()
+        try! await cancellationPrecedenceCoordinator.perform(.next, on: .spotify)
+        let precedenceMetrics = await failingCommandAdapter.metrics()
+        check(
+            precedenceMetrics.performCalls == 2 && precedenceMetrics.cancelCalls == 0,
+            "late cancel cleanup releases command capacity exactly once"
+        )
+        await cancellationPrecedenceCoordinator.stop()
     }
 
     private func verifyLifecycleAndRefreshGenerations() async {
+        let cancelledRefreshAdapter = TestMediaAdapter(
+            source: .appleMusic,
+            refreshActions: [
+                .update(.snapshot(try! makeSnapshot(sequence: 1))),
+            ]
+        )
+        let cancelledRefreshCoordinator = MediaCoordinator(
+            adapters: [cancelledRefreshAdapter]
+        )
+        await cancelledRefreshCoordinator.setEnabled(true, for: .appleMusic)
+        let alreadyCancelledRefresh = Task {
+            withUnsafeCurrentTask { task in task?.cancel() }
+            return try await cancelledRefreshCoordinator.refresh(.appleMusic)
+        }
+        let alreadyCancelledRefreshError = await mediaError(from: alreadyCancelledRefresh.result)
+        var cancelledRefreshMetrics = await cancelledRefreshAdapter.metrics()
+        check(
+            alreadyCancelledRefreshError == .cancelled(source: .appleMusic),
+            "already-cancelled coordinator refresh is rejected at entry"
+        )
+        check(
+            cancelledRefreshMetrics.refreshCalls == 0
+                && cancelledRefreshMetrics.cancelCalls == 0,
+            "already-cancelled coordinator refresh starts no adapter work"
+        )
+        _ = try! await cancelledRefreshCoordinator.refresh(.appleMusic)
+        cancelledRefreshMetrics = await cancelledRefreshAdapter.metrics()
+        check(
+            cancelledRefreshMetrics.refreshCalls == 1,
+            "cancelled refresh leaves no reservation that blocks later work"
+        )
+        await cancelledRefreshCoordinator.stop()
+
+        let convenienceAdapter = TestMediaAdapter(
+            source: .spotify,
+            refreshActions: [
+                .update(.snapshot(try! makeSnapshot(source: .spotify, sequence: 1))),
+            ]
+        )
+        let erasedConvenienceAdapter: any MediaAdapter = convenienceAdapter
+        let cancelledConvenienceRefresh = Task {
+            withUnsafeCurrentTask { task in task?.cancel() }
+            return try await erasedConvenienceAdapter.refresh()
+        }
+        let cancelledConvenienceCommand = Task {
+            withUnsafeCurrentTask { task in task?.cancel() }
+            try await erasedConvenienceAdapter.perform(.play)
+        }
+        let convenienceRefreshError = await mediaError(from: cancelledConvenienceRefresh.result)
+        let convenienceCommandError = await mediaError(from: cancelledConvenienceCommand.result)
+        let convenienceMetrics = await convenienceAdapter.metrics()
+        check(
+            convenienceRefreshError == .cancelled(source: .spotify)
+                && convenienceCommandError == .cancelled(source: .spotify),
+            "already-cancelled adapter convenience calls return typed cancellation"
+        )
+        check(
+            convenienceMetrics.refreshCalls == 0
+                && convenienceMetrics.performCalls == 0
+                && convenienceMetrics.cancelCalls == 0,
+            "adapter convenience cancellation guards invoke no conformer work"
+        )
+
         let activationGate = AsyncGate()
         let activationStarted = AsyncGate()
         let adapter = TestMediaAdapter(
@@ -422,6 +522,232 @@ private final class MediaHarness {
         check(
             gatedRequests.isEmpty,
             "deactivated adapter cannot start new script work after an awaited status check"
+        )
+    }
+
+    private func verifyRefreshAndConvenienceCancellationPrecedence() async {
+        let coordinatorSuccessStarted = AsyncGate()
+        let coordinatorSuccessRelease = AsyncGate()
+        let coordinatorFailureStarted = AsyncGate()
+        let coordinatorFailureRelease = AsyncGate()
+        let coordinatorCancelRelease1 = AsyncGate()
+        let coordinatorCancelRelease2 = AsyncGate()
+        let stable = MediaAdapterUpdate.snapshot(
+            try! makeSnapshot(source: .spotify, sequence: 1, title: "Stable")
+        )
+        let late = MediaAdapterUpdate.snapshot(
+            try! makeSnapshot(source: .spotify, sequence: 2, title: "Late")
+        )
+        let reusable = MediaAdapterUpdate.snapshot(
+            try! makeSnapshot(source: .spotify, sequence: 3, title: "Reusable")
+        )
+        let coordinatorAdapter = CancellationIgnoringMediaAdapter(
+            source: .spotify,
+            refreshSteps: [
+                .immediateSuccess(stable),
+                .gatedSuccess(
+                    started: coordinatorSuccessStarted,
+                    release: coordinatorSuccessRelease,
+                    update: late
+                ),
+                .gatedFailure(
+                    started: coordinatorFailureStarted,
+                    release: coordinatorFailureRelease,
+                    error: .automationFailed(source: .spotify, exitCode: 94)
+                ),
+                .immediateSuccess(reusable),
+            ],
+            commandSteps: [],
+            cancellationGates: [coordinatorCancelRelease1, coordinatorCancelRelease2]
+        )
+        let coordinator = MediaCoordinator(adapters: [coordinatorAdapter])
+        await coordinator.setEnabled(true, for: .spotify)
+        _ = try! await coordinator.refresh(.spotify)
+        let stableHealth = await coordinator.health(for: .spotify)
+
+        let lateSuccess = Task { try await coordinator.refresh(.spotify) }
+        await coordinatorSuccessStarted.wait()
+        lateSuccess.cancel()
+        await coordinatorAdapter.waitForCancellationCount(1)
+        await coordinatorSuccessRelease.open()
+        let lateSuccessError = await mediaError(from: lateSuccess.result)
+        let snapshotAfterLateSuccess = await coordinator.snapshot(for: .spotify)
+        let healthAfterLateSuccess = await coordinator.health(for: .spotify)
+        check(
+            lateSuccessError == .cancelled(source: .spotify),
+            "coordinator cancellation latch wins over late refresh success"
+        )
+        check(
+            snapshotAfterLateSuccess?.title == "Stable"
+                && healthAfterLateSuccess == stableHealth,
+            "late cancelled refresh success cannot publish snapshot or health"
+        )
+        await coordinatorCancelRelease1.open()
+        await coordinatorAdapter.waitForCancellationSettlementCount(1)
+
+        let lateFailure = Task { try await coordinator.refresh(.spotify) }
+        await coordinatorFailureStarted.wait()
+        lateFailure.cancel()
+        await coordinatorAdapter.waitForCancellationCount(2)
+        await coordinatorFailureRelease.open()
+        let lateFailureError = await mediaError(from: lateFailure.result)
+        let snapshotAfterLateFailure = await coordinator.snapshot(for: .spotify)
+        let healthAfterLateFailure = await coordinator.health(for: .spotify)
+        check(
+            lateFailureError == .cancelled(source: .spotify),
+            "coordinator cancellation latch wins over late refresh failure"
+        )
+        check(
+            snapshotAfterLateFailure?.title == "Stable"
+                && healthAfterLateFailure == stableHealth,
+            "late cancelled refresh failure cannot publish stale health"
+        )
+        await coordinatorCancelRelease2.open()
+        await coordinatorAdapter.waitForCancellationSettlementCount(2)
+        let reusableSnapshot = try! await coordinator.refresh(.spotify)
+        let coordinatorMetrics = await coordinatorAdapter.metrics()
+        check(
+            reusableSnapshot?.title == "Reusable"
+                && coordinatorMetrics.activeOperations == 0
+                && coordinatorMetrics.maximumConcurrentOperations == 1,
+            "coordinator refresh cancellation settles exactly and reuses capacity"
+        )
+        await coordinator.stop()
+
+        let convenienceRefreshSuccessStarted = AsyncGate()
+        let convenienceRefreshSuccessRelease = AsyncGate()
+        let convenienceRefreshFailureStarted = AsyncGate()
+        let convenienceRefreshFailureRelease = AsyncGate()
+        let convenienceRefreshCancel1 = AsyncGate()
+        let convenienceRefreshCancel2 = AsyncGate()
+        let convenienceRefreshAdapter = CancellationIgnoringMediaAdapter(
+            source: .appleMusic,
+            refreshSteps: [
+                .gatedSuccess(
+                    started: convenienceRefreshSuccessStarted,
+                    release: convenienceRefreshSuccessRelease,
+                    update: .snapshot(try! makeSnapshot(sequence: 1, title: "Late"))
+                ),
+                .gatedFailure(
+                    started: convenienceRefreshFailureStarted,
+                    release: convenienceRefreshFailureRelease,
+                    error: .automationFailed(source: .appleMusic, exitCode: 95)
+                ),
+                .immediateSuccess(
+                    .snapshot(try! makeSnapshot(sequence: 2, title: "Reusable"))
+                ),
+            ],
+            commandSteps: [],
+            cancellationGates: [convenienceRefreshCancel1, convenienceRefreshCancel2]
+        )
+        let erasedRefreshAdapter: any MediaAdapter = convenienceRefreshAdapter
+
+        let convenienceRefreshSuccess = Task { try await erasedRefreshAdapter.refresh() }
+        await convenienceRefreshSuccessStarted.wait()
+        convenienceRefreshSuccess.cancel()
+        await convenienceRefreshAdapter.waitForCancellationCount(1)
+        await convenienceRefreshSuccessRelease.open()
+        let convenienceRefreshSuccessError = await mediaError(
+            from: convenienceRefreshSuccess.result
+        )
+        check(
+            convenienceRefreshSuccessError == .cancelled(source: .appleMusic),
+            "adapter refresh convenience cancellation wins over late success"
+        )
+        await convenienceRefreshCancel1.open()
+        await convenienceRefreshAdapter.waitForCancellationSettlementCount(1)
+
+        let convenienceRefreshFailure = Task { try await erasedRefreshAdapter.refresh() }
+        await convenienceRefreshFailureStarted.wait()
+        convenienceRefreshFailure.cancel()
+        await convenienceRefreshAdapter.waitForCancellationCount(2)
+        await convenienceRefreshFailureRelease.open()
+        let convenienceRefreshFailureError = await mediaError(
+            from: convenienceRefreshFailure.result
+        )
+        check(
+            convenienceRefreshFailureError == .cancelled(source: .appleMusic),
+            "adapter refresh convenience cancellation wins over late failure"
+        )
+        await convenienceRefreshCancel2.open()
+        await convenienceRefreshAdapter.waitForCancellationSettlementCount(2)
+        let convenienceRefreshReuse = try! await erasedRefreshAdapter.refresh()
+        let convenienceRefreshMetrics = await convenienceRefreshAdapter.metrics()
+        if case let .snapshot(snapshot) = convenienceRefreshReuse {
+            check(
+                snapshot.title == "Reusable"
+                    && convenienceRefreshMetrics.activeOperations == 0
+                    && convenienceRefreshMetrics.maximumConcurrentOperations == 1,
+                "adapter refresh convenience settles and reuses capacity"
+            )
+        } else {
+            check(false, "adapter refresh convenience settles and reuses capacity")
+        }
+
+        let convenienceCommandSuccessStarted = AsyncGate()
+        let convenienceCommandSuccessRelease = AsyncGate()
+        let convenienceCommandFailureStarted = AsyncGate()
+        let convenienceCommandFailureRelease = AsyncGate()
+        let convenienceCommandCancel1 = AsyncGate()
+        let convenienceCommandCancel2 = AsyncGate()
+        let convenienceCommandAdapter = CancellationIgnoringMediaAdapter(
+            source: .spotify,
+            refreshSteps: [],
+            commandSteps: [
+                .gatedSuccess(
+                    started: convenienceCommandSuccessStarted,
+                    release: convenienceCommandSuccessRelease
+                ),
+                .gatedFailure(
+                    started: convenienceCommandFailureStarted,
+                    release: convenienceCommandFailureRelease,
+                    error: .automationFailed(source: .spotify, exitCode: 96)
+                ),
+                .immediateSuccess,
+            ],
+            cancellationGates: [convenienceCommandCancel1, convenienceCommandCancel2]
+        )
+        let erasedCommandAdapter: any MediaAdapter = convenienceCommandAdapter
+
+        let convenienceCommandSuccess = Task {
+            try await erasedCommandAdapter.perform(.play)
+        }
+        await convenienceCommandSuccessStarted.wait()
+        convenienceCommandSuccess.cancel()
+        await convenienceCommandAdapter.waitForCancellationCount(1)
+        await convenienceCommandSuccessRelease.open()
+        let convenienceCommandSuccessError = await mediaError(
+            from: convenienceCommandSuccess.result
+        )
+        check(
+            convenienceCommandSuccessError == .cancelled(source: .spotify),
+            "adapter perform convenience cancellation wins over late success"
+        )
+        await convenienceCommandCancel1.open()
+        await convenienceCommandAdapter.waitForCancellationSettlementCount(1)
+
+        let convenienceCommandFailure = Task {
+            try await erasedCommandAdapter.perform(.pause)
+        }
+        await convenienceCommandFailureStarted.wait()
+        convenienceCommandFailure.cancel()
+        await convenienceCommandAdapter.waitForCancellationCount(2)
+        await convenienceCommandFailureRelease.open()
+        let convenienceCommandFailureError = await mediaError(
+            from: convenienceCommandFailure.result
+        )
+        check(
+            convenienceCommandFailureError == .cancelled(source: .spotify),
+            "adapter perform convenience cancellation wins over late failure"
+        )
+        await convenienceCommandCancel2.open()
+        await convenienceCommandAdapter.waitForCancellationSettlementCount(2)
+        try! await erasedCommandAdapter.perform(.next)
+        let convenienceCommandMetrics = await convenienceCommandAdapter.metrics()
+        check(
+            convenienceCommandMetrics.activeOperations == 0
+                && convenienceCommandMetrics.maximumConcurrentOperations == 1,
+            "adapter perform convenience settles and reuses capacity"
         )
     }
 
@@ -726,6 +1052,72 @@ private final class MediaHarness {
         )
         try? FileManager.default.removeItem(atPath: readinessPath)
 
+        let lateFailureExecutor = CancellationIgnoringFailureExecutor()
+        let lateFailureAdapter = AppleMusicDesktopAdapter(
+            applicationStatus: TestApplicationStatus(isRunning: true),
+            scriptExecutor: lateFailureExecutor,
+            maximumPendingOperations: 1,
+            cancellationDrainTimeoutNanoseconds: 1_000_000_000
+        )
+        await lateFailureAdapter.activate()
+        _ = try! await lateFailureAdapter.refresh()
+
+        let explicitlyCancelledID = MediaOperationID()
+        let explicitlyCancelledRefresh = Task {
+            try await lateFailureAdapter.refresh(operationID: explicitlyCancelledID)
+        }
+        await lateFailureExecutor.firstFailureStarted.wait()
+        let explicitCancellation = Task {
+            await lateFailureAdapter.cancel(explicitlyCancelledID)
+        }
+        await lateFailureExecutor.waitForCancelCount(1)
+        await lateFailureExecutor.releaseFirstFailure()
+        await explicitCancellation.value
+        let explicitFailureResult = await mediaError(from: explicitlyCancelledRefresh.result)
+        let snapshotAfterExplicitCancel = await lateFailureAdapter.latestSnapshotForTesting
+        let outstandingAfterExplicitCancel = await lateFailureAdapter.outstandingWorkCountForTesting
+        check(
+            explicitFailureResult == .cancelled(source: .appleMusic),
+            "explicit cancellation wins over a later noncooperative executor failure"
+        )
+        check(
+            snapshotAfterExplicitCancel?.title == "Stable"
+                && outstandingAfterExplicitCancel == 0,
+            "cancelled executor failure preserves state and releases capacity once"
+        )
+
+        let deactivatedRefresh = Task { try await lateFailureAdapter.refresh() }
+        await lateFailureExecutor.secondFailureStarted.wait()
+        let lateFailureDeactivation = Task { await lateFailureAdapter.deactivate() }
+        await lateFailureExecutor.waitForCancelCount(2)
+        await lateFailureExecutor.releaseSecondFailure()
+        await lateFailureDeactivation.value
+        let deactivatedFailureResult = await mediaError(from: deactivatedRefresh.result)
+        let snapshotAfterFailureDeactivation = await lateFailureAdapter.latestSnapshotForTesting
+        let outstandingAfterFailureDeactivation = await lateFailureAdapter
+            .outstandingWorkCountForTesting
+        check(
+            deactivatedFailureResult == .cancelled(source: .appleMusic),
+            "deactivation wins over a later noncooperative executor failure"
+        )
+        check(
+            snapshotAfterFailureDeactivation == nil
+                && outstandingAfterFailureDeactivation == 0,
+            "deactivated executor failure cannot restore state or leak admission"
+        )
+        await lateFailureAdapter.activate()
+        let replacementAfterFailures = try! await lateFailureAdapter.refresh()
+        let lateFailurePeak = await lateFailureExecutor.maximumConcurrentExecutions
+        if case let .snapshot(snapshot) = replacementAfterFailures {
+            check(
+                snapshot.title == "Replacement" && lateFailurePeak == 1,
+                "failure cancellation capacity is reusable without duplicate release"
+            )
+        } else {
+            check(false, "failure cancellation capacity is reusable without duplicate release")
+        }
+        await lateFailureAdapter.deactivate()
+
         let noncooperative = NonCooperativeScriptExecutor()
         let boundedAdapter = AppleMusicDesktopAdapter(
             applicationStatus: TestApplicationStatus(isRunning: true),
@@ -882,6 +1274,107 @@ private final class MediaHarness {
         }
         await malformedAdapter.deactivate()
 
+        let invalidNumericTokens = ["alphabetic", "", "NaN", "+Inf", "-Inf", "1e9999"]
+        var malformedNumericOutputs: [(field: String, token: String, output: String)] = []
+        for token in invalidNumericTokens {
+            malformedNumericOutputs.append(
+                ("duration", token, validScriptOutput(duration: token))
+            )
+            malformedNumericOutputs.append(
+                ("position", token, validScriptOutput(position: token))
+            )
+            malformedNumericOutputs.append(
+                ("volume", token, validScriptOutput(volume: token))
+            )
+        }
+        let numericExecutor = RecordingScriptExecutor(
+            actions: [.output(validScriptOutput(title: "Stable"))]
+                + malformedNumericOutputs.map { .output($0.output) }
+                + [.output(validScriptOutput(title: "Reusable"))]
+        )
+        let numericAdapter = AppleMusicDesktopAdapter(
+            applicationStatus: running,
+            scriptExecutor: numericExecutor,
+            maximumPendingOperations: 1
+        )
+        let numericCoordinator = MediaCoordinator(adapters: [numericAdapter])
+        await numericCoordinator.setEnabled(true, for: .appleMusic)
+        _ = try! await numericCoordinator.refresh(.appleMusic)
+        for malformed in malformedNumericOutputs {
+            let refreshResult = await result {
+                try await numericCoordinator.refresh(.appleMusic)
+            }
+            check(
+                mediaError(from: refreshResult) == .malformedResponse(source: .appleMusic),
+                "\(malformed.field) rejects malformed numeric token '\(malformed.token)'"
+            )
+            let retainedSnapshot = await numericCoordinator.snapshot(for: .appleMusic)
+            let malformedHealth = await numericCoordinator.health(for: .appleMusic)
+            let outstanding = await numericAdapter.outstandingWorkCountForTesting
+            check(
+                retainedSnapshot?.title == "Stable"
+                    && malformedHealth.availability == .degraded
+                    && malformedHealth.lastError == .malformedResponse(source: .appleMusic)
+                    && outstanding == 0,
+                "\(malformed.field) malformed token cannot publish state or retain capacity"
+            )
+        }
+        let numericReuse = try! await numericCoordinator.refresh(.appleMusic)
+        let numericRequestCount = await numericExecutor.requests().count
+        check(
+            numericReuse?.title == "Reusable"
+                && numericRequestCount == malformedNumericOutputs.count + 2,
+            "malformed numeric response capacity is reusable after every rejection"
+        )
+        await numericCoordinator.stop()
+
+        let invalidUTF8Runner = StaticResultProcessRunner(
+            result: MediaScriptProcessResult(
+                exitCode: 0,
+                standardOutput: Data([0xff, 0xfe, 0x80]),
+                standardError: Data()
+            )
+        )
+        let invalidUTF8Executor = ProcessMediaScriptExecutor(
+            processRunner: invalidUTF8Runner
+        )
+        let invalidUTF8Result = await result {
+            try await invalidUTF8Executor.execute(
+                MediaScriptRequest(route: .appleMusicSnapshot)
+            )
+        }
+        let invalidUTF8Error: MediaScriptExecutionError?
+        switch invalidUTF8Result {
+        case .success:
+            invalidUTF8Error = nil
+        case let .failure(error):
+            invalidUTF8Error = error as? MediaScriptExecutionError
+        }
+        let invalidUTF8Runs = await invalidUTF8Runner.runCount
+        check(
+            invalidUTF8Error == .malformedResponse && invalidUTF8Runs == 1,
+            "process executor rejects replacement-decoded invalid UTF-8 stdout"
+        )
+        let invalidUTF8Adapter = AppleMusicDesktopAdapter(
+            applicationStatus: running,
+            scriptExecutor: invalidUTF8Executor,
+            maximumPendingOperations: 1
+        )
+        await invalidUTF8Adapter.activate()
+        await expectMediaError(
+            .malformedResponse(source: .appleMusic),
+            "invalid UTF-8 process output maps to typed adapter malformed response"
+        ) {
+            _ = try await invalidUTF8Adapter.refresh()
+        }
+        let invalidUTF8Outstanding = await invalidUTF8Adapter.outstandingWorkCountForTesting
+        let mappedInvalidUTF8Runs = await invalidUTF8Runner.runCount
+        check(
+            invalidUTF8Outstanding == 0 && mappedInvalidUTF8Runs == 2,
+            "invalid UTF-8 adapter failure releases process and adapter capacity"
+        )
+        await invalidUTF8Adapter.deactivate()
+
         let maliciousTitle = "Song \"; quit application \"Music\"; --"
         let isolatedExecutor = RecordingScriptExecutor(
             actions: [
@@ -990,9 +1483,74 @@ private final class MediaHarness {
             limits: normalLimits
         )
         check(exitOne.exitCode == 1, "process runner decodes wait status into an exit code")
+
+        let collisionDescriptorsBefore = openFileDescriptorCount()
+        var collisionRunsAreSafe = true
+        for mask in ["0", "1", "2", "01", "02", "12", "012"] {
+            do {
+                let result = try await normalRunner.run(
+                    arguments: [MediaProcessHelper.flag, "stdio-collision", mask],
+                    operationID: MediaOperationID(),
+                    limits: normalLimits
+                )
+                collisionRunsAreSafe = collisionRunsAreSafe
+                    && result.exitCode == 0
+                    && result.standardOutput == Data("23\tstdout|fds=0\tstderr".utf8)
+                    && result.standardError.isEmpty
+            } catch {
+                collisionRunsAreSafe = false
+            }
+        }
+        check(
+            collisionRunsAreSafe,
+            "closed or remapped host stdio cannot collide with child pipe actions"
+        )
+        let collisionDescriptorsAfter = openFileDescriptorCount()
+        let collisionProcesses = await normalRunner.activeProcessCount
+        let collisionReaders = await normalRunner.activeReaderCount
+        check(
+            collisionDescriptorsAfter == collisionDescriptorsBefore
+                && collisionProcesses == 0
+                && collisionReaders == 0,
+            "all low-descriptor collision runs close pipes, readers, and processes"
+        )
         await normalRunner.cancel(normalID)
         let normalRemaining = await normalRunner.activeProcessCount
         check(normalRemaining == 0, "late process cancellation leaves no tombstone")
+
+        let failingSpawnSystem = FailingSpawnPOSIXProcessSystem()
+        let failingSpawnRunner = FoundationMediaScriptProcessRunner(
+            executableURL: executableURL,
+            system: failingSpawnSystem
+        )
+        _ = await result {
+            try await failingSpawnRunner.run(
+                arguments: [MediaProcessHelper.flag, "normal"],
+                operationID: MediaOperationID(),
+                limits: normalLimits
+            )
+        }
+        let descriptorsBeforeFailures = openFileDescriptorCount()
+        var allLaunchesFailedSafely = true
+        for _ in 0 ..< 32 {
+            let launchResult = await result {
+                try await failingSpawnRunner.run(
+                    arguments: [MediaProcessHelper.flag, "normal"],
+                    operationID: MediaOperationID(),
+                    limits: normalLimits
+                )
+            }
+            allLaunchesFailedSafely = allLaunchesFailedSafely
+                && processError(from: launchResult) == .launchFailed
+        }
+        check(allLaunchesFailedSafely, "spawn failure maps to a typed launch failure")
+        let descriptorsAfterFailures = openFileDescriptorCount()
+        let failedLaunchProcesses = await failingSpawnRunner.activeProcessCount
+        check(
+            descriptorsAfterFailures == descriptorsBeforeFailures
+                && failedLaunchProcesses == 0,
+            "spawn failures release partially prepared pipes and admission"
+        )
 
         let outputRunner = FoundationMediaScriptProcessRunner(executableURL: executableURL)
         let outputResult = await result {
@@ -1042,10 +1600,19 @@ private final class MediaHarness {
             "stdout and stderr drain concurrently without pipe deadlock"
         )
 
+        let inheritedCleanupPath = temporaryMediaHelperMarkerPath()
+        let inheritedReadyPath = temporaryMediaHelperMarkerPath()
+        let inheritedSettledPath = temporaryMediaHelperMarkerPath()
         let inheritedPipeRunner = FoundationMediaScriptProcessRunner(executableURL: executableURL)
         let inheritedPipeStart = ContinuousClock.now
         let inheritedPipeResult = try! await inheritedPipeRunner.run(
-            arguments: [MediaProcessHelper.flag, "descendant-holds-fds"],
+            arguments: [
+                MediaProcessHelper.flag,
+                "descendant-holds-fds",
+                inheritedCleanupPath,
+                inheritedReadyPath,
+                inheritedSettledPath,
+            ],
             operationID: MediaOperationID(),
             limits: MediaScriptProcessLimits(
                 timeoutNanoseconds: 2_000_000_000,
@@ -1056,16 +1623,43 @@ private final class MediaHarness {
         let inheritedProcesses = await inheritedPipeRunner.activeProcessCount
         let inheritedReaders = await inheritedPipeRunner.activeReaderCount
         check(inheritedPipeResult.exitCode == 0, "direct child exit is retained with inherited pipes")
-        check(inheritedPipeDuration < .seconds(1), "descendant-held pipes have a bounded drain lifetime")
+        check(
+            inheritedPipeDuration < .seconds(1),
+            "descendant-held pipes use the configured deadline, not ten-second EOF"
+        )
         check(
             inheritedProcesses == 0 && inheritedReaders == 0,
             "bounded inherited-pipe completion leaves no process or reader work"
         )
+        let inheritedReady = await waitForFile(atPath: inheritedReadyPath)
+        _ = FileManager.default.createFile(atPath: inheritedCleanupPath, contents: Data())
+        let inheritedSettled = await waitForFile(atPath: inheritedSettledPath)
+        let inheritedHelpersExited = await waitForRecordedProcessesToExit(
+            atPath: inheritedReadyPath
+        )
+        check(
+            inheritedReady && inheritedSettled && inheritedHelpersExited,
+            "descendant-held-pipe helper is explicitly stopped and reaped"
+        )
+        removeMediaHelperFiles([
+            inheritedCleanupPath,
+            inheritedReadyPath,
+            inheritedSettledPath,
+        ])
 
+        let trickleCleanupPath = temporaryMediaHelperMarkerPath()
+        let trickleReadyPath = temporaryMediaHelperMarkerPath()
+        let trickleSettledPath = temporaryMediaHelperMarkerPath()
         let trickleRunner = FoundationMediaScriptProcessRunner(executableURL: executableURL)
         let trickleStart = ContinuousClock.now
         _ = try! await trickleRunner.run(
-            arguments: [MediaProcessHelper.flag, "descendant-trickle"],
+            arguments: [
+                MediaProcessHelper.flag,
+                "descendant-trickle",
+                trickleCleanupPath,
+                trickleReadyPath,
+                trickleSettledPath,
+            ],
             operationID: MediaOperationID(),
             limits: MediaScriptProcessLimits(
                 maximumStandardOutputBytes: 512 * 1_024,
@@ -1076,8 +1670,26 @@ private final class MediaHarness {
         )
         check(
             trickleStart.duration(to: .now) < .seconds(1),
-            "post-exit drain deadline also bounds continuous descendant output"
+            "post-exit absolute deadline bounds successful-read trickle before ten-second EOF"
         )
+        let trickleReady = await waitForFile(atPath: trickleReadyPath)
+        _ = FileManager.default.createFile(atPath: trickleCleanupPath, contents: Data())
+        let trickleSettled = await waitForFile(atPath: trickleSettledPath)
+        let trickleHelpersExited = await waitForRecordedProcessesToExit(
+            atPath: trickleReadyPath
+        )
+        let trickleProcesses = await trickleRunner.activeProcessCount
+        let trickleReaders = await trickleRunner.activeReaderCount
+        check(
+            trickleReady && trickleSettled && trickleHelpersExited
+                && trickleProcesses == 0 && trickleReaders == 0,
+            "trickle descendant is explicitly reaped without reader or process leaks"
+        )
+        removeMediaHelperFiles([
+            trickleCleanupPath,
+            trickleReadyPath,
+            trickleSettledPath,
+        ])
 
         let timeoutRunner = FoundationMediaScriptProcessRunner(executableURL: executableURL)
         let timeoutResult = await result {
@@ -1227,19 +1839,24 @@ private final class MediaHarness {
         check(stoppedProcess.stopReason == .cancelled, "first requested terminal cause remains stable")
         check(signalExit == 128 + SIGKILL, "signal termination decodes WTERMSIG semantics")
 
-        let earlyExitSystem = ScriptedPOSIXProcessSystem(waitResults: [.running])
+        let earlyExitSystem = ScriptedPOSIXProcessSystem(
+            waitResults: [.exited(rawStatus: 0)]
+        )
+        let earlyExitScheduler = GatedEscalationScheduler()
         let earlyExitProcess = OwnedMediaProcess(
             system: earlyExitSystem,
-            terminationGraceNanoseconds: 20_000_000
+            terminationGraceNanoseconds: 20_000_000,
+            escalationScheduler: earlyExitScheduler
         )
         earlyExitProcess.markStarted(4_204)
         earlyExitProcess.requestStop(.timedOut)
-        earlyExitSystem.appendWaitResult(.exited(rawStatus: 0))
+        await earlyExitScheduler.waitUntilStarted()
         _ = try! await earlyExitProcess.waitForExit()
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        await earlyExitScheduler.release()
+        await earlyExitScheduler.waitUntilSettled()
         check(
             earlyExitSystem.signals == [SIGTERM],
-            "natural exit before escalation cancels the pending hard stop"
+            "reaped natural exit deterministically cancels the pending hard stop"
         )
 
         let fatalSystem = ScriptedPOSIXProcessSystem(
@@ -1261,6 +1878,51 @@ private final class MediaHarness {
         check(
             fatalSystem.signals == [SIGKILL],
             "fatal wait failure does not silently orphan the owned child"
+        )
+
+        let lifecycleFirstSystem = ScriptedPOSIXProcessSystem(
+            waitResults: [
+                .failed(errno: EIO),
+                .running,
+            ]
+        )
+        let lifecycleFirstProcess = OwnedMediaProcess(
+            system: lifecycleFirstSystem,
+            terminationGraceNanoseconds: 100_000_000
+        )
+        lifecycleFirstProcess.markStarted(4_207)
+        let lifecycleFirstWaiter = Task {
+            try await lifecycleFirstProcess.waitForExit()
+        }
+        for _ in 0 ..< 1_000 {
+            if lifecycleFirstSystem.waitCallCount >= 1 { break }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        lifecycleFirstProcess.requestStop(.timedOut)
+        lifecycleFirstSystem.appendWaitResult(.exited(rawStatus: SIGKILL))
+        let lifecycleFirstResult = await lifecycleFirstWaiter.result
+        check(
+            processError(from: lifecycleFirstResult) == .processLifecycleFailed(errno: EIO)
+                && lifecycleFirstProcess.stopReason == nil,
+            "later timeout cannot replace an earlier fatal lifecycle cause"
+        )
+
+        let cancellationFirstSystem = ScriptedPOSIXProcessSystem(
+            waitResults: [
+                .failed(errno: EIO),
+                .exited(rawStatus: SIGKILL),
+            ]
+        )
+        let cancellationFirstProcess = OwnedMediaProcess(
+            system: cancellationFirstSystem,
+            terminationGraceNanoseconds: 100_000_000
+        )
+        cancellationFirstProcess.markStarted(4_208)
+        cancellationFirstProcess.requestStop(.cancelled)
+        _ = try! await cancellationFirstProcess.waitForExit()
+        check(
+            cancellationFirstProcess.stopReason == .cancelled,
+            "later lifecycle failure cannot replace an earlier cancellation cause"
         )
 
         let raceSystem = BlockingKillPOSIXProcessSystem()
@@ -1617,7 +2279,9 @@ private func makeSnapshot(
 
 private func validScriptOutput(
     title: String = "Track",
-    duration: String = "180"
+    duration: String = "180",
+    position: String = "30",
+    volume: String = "50"
 ) -> String {
     [
         "playing",
@@ -1626,8 +2290,8 @@ private func validScriptOutput(
         "Album",
         "track-1",
         duration,
-        "30",
-        "50",
+        position,
+        volume,
         "sourceAsset",
         "track-1",
     ].joined(separator: "\t")
@@ -1703,6 +2367,192 @@ private actor CompletionCounter {
         await withCheckedContinuation { continuation in
             waiters.append((expected, continuation))
         }
+    }
+}
+
+private actor GatedCommandCancellationObserver: MediaCoordinatorCancellationObserving {
+    let dispatchStarted = AsyncGate()
+    let dispatchFinished = AsyncGate()
+    private let dispatchGate = AsyncGate()
+
+    func willDispatchCommandCancellation() async {
+        await dispatchStarted.open()
+        await dispatchGate.wait()
+        await dispatchFinished.open()
+    }
+
+    func releaseDispatch() async {
+        await dispatchGate.open()
+    }
+}
+
+private struct GatedFailingCommandMetrics: Sendable {
+    let performCalls: Int
+    let cancelCalls: Int
+}
+
+private enum CancellationIgnoringRefreshStep: Sendable {
+    case immediateSuccess(MediaAdapterUpdate)
+    case gatedSuccess(started: AsyncGate, release: AsyncGate, update: MediaAdapterUpdate)
+    case gatedFailure(started: AsyncGate, release: AsyncGate, error: MediaError)
+}
+
+private enum CancellationIgnoringCommandStep: Sendable {
+    case immediateSuccess
+    case gatedSuccess(started: AsyncGate, release: AsyncGate)
+    case gatedFailure(started: AsyncGate, release: AsyncGate, error: MediaError)
+}
+
+private struct CancellationIgnoringMediaMetrics: Sendable {
+    let activeOperations: Int
+    let maximumConcurrentOperations: Int
+}
+
+private actor CancellationIgnoringMediaAdapter: MediaAdapter {
+    let source: MediaSource
+    private var refreshSteps: [CancellationIgnoringRefreshStep]
+    private var commandSteps: [CancellationIgnoringCommandStep]
+    private let cancellationGates: [AsyncGate]
+    private let cancellationStarts = CompletionCounter()
+    private let cancellationSettlements = CompletionCounter()
+    private var cancellationCount = 0
+    private var activeOperations = 0
+    private var maximumConcurrentOperations = 0
+
+    init(
+        source: MediaSource,
+        refreshSteps: [CancellationIgnoringRefreshStep],
+        commandSteps: [CancellationIgnoringCommandStep],
+        cancellationGates: [AsyncGate]
+    ) {
+        self.source = source
+        self.refreshSteps = refreshSteps
+        self.commandSteps = commandSteps
+        self.cancellationGates = cancellationGates
+    }
+
+    func activate() async {}
+    func deactivate() async {}
+
+    func updates() async -> AsyncStream<MediaAdapterUpdate> {
+        AsyncStream { continuation in continuation.finish() }
+    }
+
+    func refresh(operationID: MediaOperationID) async throws -> MediaAdapterUpdate {
+        activeOperations += 1
+        maximumConcurrentOperations = max(maximumConcurrentOperations, activeOperations)
+        defer { activeOperations -= 1 }
+        guard !refreshSteps.isEmpty else {
+            throw MediaError.sourceUnavailable(source: source)
+        }
+        switch refreshSteps.removeFirst() {
+        case let .immediateSuccess(update):
+            return update
+        case let .gatedSuccess(started, release, update):
+            await started.open()
+            await release.wait()
+            return update
+        case let .gatedFailure(started, release, error):
+            await started.open()
+            await release.wait()
+            throw error
+        }
+    }
+
+    func perform(_ command: MediaCommand, operationID: MediaOperationID) async throws {
+        activeOperations += 1
+        maximumConcurrentOperations = max(maximumConcurrentOperations, activeOperations)
+        defer { activeOperations -= 1 }
+        guard !commandSteps.isEmpty else {
+            throw MediaError.sourceUnavailable(source: source)
+        }
+        switch commandSteps.removeFirst() {
+        case .immediateSuccess:
+            return
+        case let .gatedSuccess(started, release):
+            await started.open()
+            await release.wait()
+        case let .gatedFailure(started, release, error):
+            await started.open()
+            await release.wait()
+            throw error
+        }
+    }
+
+    func cancel(_ operationID: MediaOperationID) async {
+        let index = cancellationCount
+        cancellationCount += 1
+        await cancellationStarts.recordCompletion()
+        if index < cancellationGates.count {
+            await cancellationGates[index].wait()
+        }
+        await cancellationSettlements.recordCompletion()
+    }
+
+    func cancelAllPendingWork() async {}
+
+    func waitForCancellationCount(_ count: Int) async {
+        await cancellationStarts.waitForCount(count)
+    }
+
+    func waitForCancellationSettlementCount(_ count: Int) async {
+        await cancellationSettlements.waitForCount(count)
+    }
+
+    func metrics() -> CancellationIgnoringMediaMetrics {
+        CancellationIgnoringMediaMetrics(
+            activeOperations: activeOperations,
+            maximumConcurrentOperations: maximumConcurrentOperations
+        )
+    }
+}
+
+private actor GatedFailingCommandAdapter: MediaAdapter {
+    let source: MediaSource
+    let firstCommandStarted = AsyncGate()
+    private let firstCommandFailureGate = AsyncGate()
+    private var performCalls = 0
+    private var cancelCalls = 0
+
+    init(source: MediaSource) {
+        self.source = source
+    }
+
+    func activate() async {}
+    func deactivate() async {}
+
+    func updates() async -> AsyncStream<MediaAdapterUpdate> {
+        AsyncStream { continuation in continuation.finish() }
+    }
+
+    func refresh(operationID: MediaOperationID) async throws -> MediaAdapterUpdate {
+        .snapshot(try makeSnapshot(source: source, sequence: 1, title: "Stable"))
+    }
+
+    func perform(_ command: MediaCommand, operationID: MediaOperationID) async throws {
+        performCalls += 1
+        if performCalls == 1 {
+            await firstCommandStarted.open()
+            await firstCommandFailureGate.wait()
+            throw MediaError.automationFailed(source: source, exitCode: 91)
+        }
+    }
+
+    func cancel(_ operationID: MediaOperationID) async {
+        cancelCalls += 1
+    }
+
+    func cancelAllPendingWork() async {}
+
+    func releaseFirstCommandFailure() async {
+        await firstCommandFailureGate.open()
+    }
+
+    func metrics() -> GatedFailingCommandMetrics {
+        GatedFailingCommandMetrics(
+            performCalls: performCalls,
+            cancelCalls: cancelCalls
+        )
     }
 }
 
@@ -1956,6 +2806,26 @@ private actor RecordingScriptExecutor: MediaScriptExecuting {
     }
 }
 
+private actor StaticResultProcessRunner: MediaScriptProcessRunning {
+    private let result: MediaScriptProcessResult
+    private(set) var runCount = 0
+
+    init(result: MediaScriptProcessResult) {
+        self.result = result
+    }
+
+    func run(
+        arguments: [String],
+        operationID: MediaOperationID,
+        limits: MediaScriptProcessLimits
+    ) async throws -> MediaScriptProcessResult {
+        runCount += 1
+        return result
+    }
+
+    func cancel(_ operationID: MediaOperationID) async {}
+}
+
 private actor PreRegistrationProcessRunner: MediaScriptProcessRunning {
     let registrationStarted = AsyncGate()
     let registrationGate = AsyncGate()
@@ -2029,6 +2899,51 @@ private final class ScriptedPOSIXProcessSystem: MediaPOSIXProcessSystem, @unchec
     }
 }
 
+private actor GatedEscalationScheduler: MediaProcessEscalationScheduling {
+    private let started = AsyncGate()
+    private let deadline = AsyncGate()
+    private let settled = AsyncGate()
+
+    func waitForEscalation(afterNanoseconds: UInt64) async -> Bool {
+        await started.open()
+        await deadline.wait()
+        let shouldEscalate = !Task.isCancelled
+        await settled.open()
+        return shouldEscalate
+    }
+
+    func waitUntilStarted() async {
+        await started.wait()
+    }
+
+    func release() async {
+        await deadline.open()
+    }
+
+    func waitUntilSettled() async {
+        await settled.wait()
+    }
+}
+
+private struct FailingSpawnPOSIXProcessSystem: MediaPOSIXProcessSystem {
+    func spawn(
+        executablePath: String,
+        arguments: [String],
+        standardOutput: Int32,
+        standardError: Int32
+    ) throws -> pid_t {
+        throw MediaScriptProcessError.launchFailed
+    }
+
+    func sendSignal(_ signal: Int32, to processIdentifier: pid_t) -> Int32 {
+        -1
+    }
+
+    func waitNonBlocking(for processIdentifier: pid_t) -> MediaPOSIXWaitResult {
+        .failed(errno: ECHILD)
+    }
+}
+
 private final class BlockingKillPOSIXProcessSystem: MediaPOSIXProcessSystem, @unchecked Sendable {
     let killStarted = AsyncGate()
     private let lock = NSLock()
@@ -2082,13 +2997,19 @@ private final class BlockingKillPOSIXProcessSystem: MediaPOSIXProcessSystem, @un
 private enum MediaProcessHelper {
     static let flag = "--media-process-helper"
 
-    static func runIfRequested() -> Bool {
+    static func runIfRequested() async -> Bool {
         guard CommandLine.arguments.count >= 3,
               CommandLine.arguments[1] == flag else { return false }
 
+        let mode = CommandLine.arguments[2]
+        if mode == "stdio-collision" {
+            await runStdioCollision()
+            return true
+        }
+
         let output = FileHandle.standardOutput
         let error = FileHandle.standardError
-        switch CommandLine.arguments[2] {
+        switch mode {
         case "normal":
             output.write(Data("stdout".utf8))
             error.write(Data("stderr".utf8))
@@ -2117,19 +3038,41 @@ private enum MediaProcessHelper {
             guard marker >= 0 else { exit(66) }
             _ = Darwin.close(marker)
             while true { _ = Darwin.pause() }
-        case "descendant-holds-fds":
-            guard spawnDescendant(mode: "hold-fds-leaf") else { exit(67) }
-        case "descendant-trickle":
-            guard spawnDescendant(mode: "trickle-leaf") else { exit(68) }
-        case "hold-fds-leaf":
-            _ = Darwin.usleep(750_000)
-        case "trickle-leaf":
+        case "descendant-holds-fds", "descendant-trickle":
+            guard CommandLine.arguments.count == 6 else { exit(67) }
+            let leafMode = mode == "descendant-holds-fds" ? "hold-fds-leaf" : "trickle-leaf"
+            guard spawnDescendant(
+                mode: "supervise-fd-leaf",
+                additionalArguments: [
+                    leafMode,
+                    CommandLine.arguments[3],
+                    CommandLine.arguments[4],
+                    CommandLine.arguments[5],
+                ]
+            ) != nil else { exit(68) }
+        case "supervise-fd-leaf":
+            superviseFDLeaf()
+        case "hold-fds-leaf", "trickle-leaf":
+            guard CommandLine.arguments.count == 4 else { exit(69) }
+            let cleanupPath = CommandLine.arguments[3]
+            let trickles = mode == "trickle-leaf"
+            let deadline = DispatchTime.now().uptimeNanoseconds + 10_000_000_000
             var byte: UInt8 = 0x74
-            for _ in 0 ..< 750 {
-                _ = Darwin.write(STDOUT_FILENO, &byte, 1)
-                _ = Darwin.write(STDERR_FILENO, &byte, 1)
+            while !FileManager.default.fileExists(atPath: cleanupPath),
+                  DispatchTime.now().uptimeNanoseconds < deadline {
+                if trickles {
+                    _ = Darwin.write(STDOUT_FILENO, &byte, 1)
+                    _ = Darwin.write(STDERR_FILENO, &byte, 1)
+                }
                 _ = Darwin.usleep(1_000)
             }
+        case "fd-audit":
+            let inherited = (STDERR_FILENO + 1 ..< 256).filter {
+                fcntl($0, F_GETFD) >= 0
+            }
+            output.write(Data("stdout|fds=\(inherited.count)".utf8))
+            error.write(Data("stderr".utf8))
+            exit(23)
         case "hang":
             while true { _ = Darwin.pause() }
         default:
@@ -2138,15 +3081,88 @@ private enum MediaProcessHelper {
         return true
     }
 
-    private static func spawnDescendant(mode: String) -> Bool {
+    private static func runStdioCollision() async {
+        guard CommandLine.arguments.count == 4 else { exit(70) }
+        let controlDescriptor = fcntl(
+            STDOUT_FILENO,
+            F_DUPFD_CLOEXEC,
+            STDERR_FILENO + 1
+        )
+        guard controlDescriptor >= STDERR_FILENO + 1 else { exit(71) }
+        defer { _ = Darwin.close(controlDescriptor) }
+
+        for scalar in CommandLine.arguments[3].unicodeScalars {
+            guard let descriptor = Int32(String(scalar)),
+                  descriptor >= STDIN_FILENO,
+                  descriptor <= STDERR_FILENO else { exit(72) }
+            _ = Darwin.close(descriptor)
+        }
+
+        let runner = FoundationMediaScriptProcessRunner(
+            executableURL: mediaHelperExecutableURL()
+        )
+        do {
+            let result = try await runner.run(
+                arguments: [flag, "fd-audit"],
+                operationID: MediaOperationID(),
+                limits: MediaScriptProcessLimits(
+                    maximumStandardOutputBytes: 1_024,
+                    maximumStandardErrorBytes: 1_024,
+                    timeoutNanoseconds: 2_000_000_000
+                )
+            )
+            let report = [
+                String(result.exitCode),
+                String(decoding: result.standardOutput, as: UTF8.self),
+                String(decoding: result.standardError, as: UTF8.self),
+            ].joined(separator: "\t")
+            guard writeAll(Data(report.utf8), to: controlDescriptor) else { exit(73) }
+        } catch {
+            _ = writeAll(Data("error:\(error)".utf8), to: controlDescriptor)
+            exit(74)
+        }
+    }
+
+    private static func superviseFDLeaf() -> Never {
+        guard CommandLine.arguments.count == 7 else { exit(75) }
+        let leafMode = CommandLine.arguments[3]
+        let cleanupPath = CommandLine.arguments[4]
+        let readyPath = CommandLine.arguments[5]
+        let settledPath = CommandLine.arguments[6]
+        guard let leafPID = spawnDescendant(
+            mode: leafMode,
+            additionalArguments: [cleanupPath]
+        ) else { exit(76) }
+        let ready = Data("\(getpid()) \(leafPID)".utf8)
+        guard FileManager.default.createFile(atPath: readyPath, contents: ready) else {
+            _ = Darwin.kill(leafPID, SIGKILL)
+            exit(77)
+        }
+        _ = Darwin.close(STDOUT_FILENO)
+        _ = Darwin.close(STDERR_FILENO)
+        var status: Int32 = 0
+        while Darwin.waitpid(leafPID, &status, 0) < 0 {
+            if errno != EINTR { exit(78) }
+        }
+        guard FileManager.default.createFile(
+            atPath: settledPath,
+            contents: Data("reaped".utf8)
+        ) else { exit(79) }
+        exit(0)
+    }
+
+    private static func spawnDescendant(
+        mode: String,
+        additionalArguments: [String] = []
+    ) -> pid_t? {
         let executable = mediaHelperExecutableURL().path
-        let argumentStrings: [String] = [executable, flag, mode]
+        let argumentStrings: [String] = [executable, flag, mode] + additionalArguments
         let argumentStorage: [UnsafeMutablePointer<CChar>?] = argumentStrings.map {
             strdup($0)
         }
         guard argumentStorage.allSatisfy({ $0 != nil }) else {
             for pointer in argumentStorage { free(pointer) }
-            return false
+            return nil
         }
         defer { for pointer in argumentStorage { free(pointer) } }
         var arguments = argumentStorage + [nil]
@@ -2161,7 +3177,26 @@ private enum MediaProcessHelper {
                 environ
             )
         }
-        return result == 0
+        return result == 0 ? processIdentifier : nil
+    }
+
+    private static func writeAll(_ data: Data, to descriptor: Int32) -> Bool {
+        data.withUnsafeBytes { rawBuffer in
+            guard var address = rawBuffer.baseAddress else { return true }
+            var remaining = rawBuffer.count
+            while remaining > 0 {
+                let count = Darwin.write(descriptor, address, remaining)
+                if count > 0 {
+                    remaining -= count
+                    address = address.advanced(by: count)
+                } else if count < 0, errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
     }
 }
 
@@ -2172,15 +3207,48 @@ private func mediaHelperExecutableURL() -> URL {
     ).standardizedFileURL
 }
 
+private func openFileDescriptorCount() -> Int {
+    (0 ..< 1_024).reduce(into: 0) { count, descriptor in
+        if fcntl(Int32(descriptor), F_GETFD) >= 0 {
+            count += 1
+        }
+    }
+}
+
 private func temporaryMediaHelperMarkerPath() -> String {
     URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("erylo-media-helper-\(UUID().uuidString)")
         .path
 }
 
+private func removeMediaHelperFiles(_ paths: [String]) {
+    for path in paths where FileManager.default.fileExists(atPath: path) {
+        try? FileManager.default.removeItem(atPath: path)
+    }
+}
+
 private func waitForFile(atPath path: String) async -> Bool {
     for _ in 0 ..< 1_000 {
         if FileManager.default.fileExists(atPath: path) { return true }
+        try? await Task.sleep(nanoseconds: 1_000_000)
+    }
+    return false
+}
+
+private func waitForRecordedProcessesToExit(atPath path: String) async -> Bool {
+    guard let data = FileManager.default.contents(atPath: path),
+          let contents = String(data: data, encoding: .utf8) else { return false }
+    let processIdentifiers = contents.split(separator: " ").compactMap {
+        pid_t($0)
+    }
+    guard processIdentifiers.count == 2 else { return false }
+
+    for _ in 0 ..< 1_000 {
+        let allExited = processIdentifiers.allSatisfy { processIdentifier in
+            errno = 0
+            return Darwin.kill(processIdentifier, 0) < 0 && errno == ESRCH
+        }
+        if allExited { return true }
         try? await Task.sleep(nanoseconds: 1_000_000)
     }
     return false
@@ -2234,6 +3302,59 @@ private actor IgnoreTermProcessExecutor: MediaScriptExecuting {
 
     func cancel(_ operationID: MediaOperationID) async {
         await runner.cancel(operationID)
+    }
+}
+
+private actor CancellationIgnoringFailureExecutor: MediaScriptExecuting {
+    let firstFailureStarted = AsyncGate()
+    let secondFailureStarted = AsyncGate()
+    private let firstFailureGate = AsyncGate()
+    private let secondFailureGate = AsyncGate()
+    private let cancellations = CompletionCounter()
+    private var callCount = 0
+    private var activeExecutions = 0
+    private(set) var maximumConcurrentExecutions = 0
+
+    func execute(
+        _ request: MediaScriptRequest,
+        operationID: MediaOperationID
+    ) async throws -> String {
+        callCount += 1
+        let call = callCount
+        activeExecutions += 1
+        maximumConcurrentExecutions = max(maximumConcurrentExecutions, activeExecutions)
+        defer { activeExecutions -= 1 }
+
+        switch call {
+        case 1:
+            return validScriptOutput(title: "Stable")
+        case 2:
+            await firstFailureStarted.open()
+            await firstFailureGate.wait()
+            throw MediaScriptExecutionError.failed(exitCode: 92)
+        case 3:
+            await secondFailureStarted.open()
+            await secondFailureGate.wait()
+            throw MediaScriptExecutionError.failed(exitCode: 93)
+        default:
+            return validScriptOutput(title: "Replacement")
+        }
+    }
+
+    func cancel(_ operationID: MediaOperationID) async {
+        await cancellations.recordCompletion()
+    }
+
+    func waitForCancelCount(_ count: Int) async {
+        await cancellations.waitForCount(count)
+    }
+
+    func releaseFirstFailure() async {
+        await firstFailureGate.open()
+    }
+
+    func releaseSecondFailure() async {
+        await secondFailureGate.open()
     }
 }
 

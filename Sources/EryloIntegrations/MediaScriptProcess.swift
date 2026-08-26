@@ -74,6 +74,23 @@ public struct MediaScriptProcessLimits: Equatable, Sendable {
     func waitNonBlocking(for processIdentifier: pid_t) -> MediaPOSIXWaitResult
 }
 
+@_spi(Testing)
+public protocol MediaProcessEscalationScheduling: Sendable {
+    /// Returns true only when the deadline elapsed without cancellation.
+    func waitForEscalation(afterNanoseconds: UInt64) async -> Bool
+}
+
+private struct TaskMediaProcessEscalationScheduler: MediaProcessEscalationScheduling {
+    func waitForEscalation(afterNanoseconds: UInt64) async -> Bool {
+        do {
+            try await Task.sleep(nanoseconds: afterNanoseconds)
+            return !Task.isCancelled
+        } catch {
+            return false
+        }
+    }
+}
+
 /// Raw argv access is testing SPI only. Production clients use `ProcessMediaScriptExecutor`.
 @_spi(Testing) public actor FoundationMediaScriptProcessRunner: MediaScriptProcessRunning {
     private struct ActiveProcess: Sendable {
@@ -291,18 +308,32 @@ public struct MediaScriptProcessLimits: Equatable, Sendable {
 @_spi(Testing) public final class OwnedMediaProcess: @unchecked Sendable {
     private let system: any MediaPOSIXProcessSystem
     private let terminationGraceNanoseconds: UInt64
+    private let escalationScheduler: any MediaProcessEscalationScheduling
     private let lock = NSLock()
     private var processIdentifier: pid_t?
     private var isReaped = false
     private var terminationRequested = false
     private var storedStopReason: MediaProcessStopReason?
     private var storedLifecycleError: Int32?
+    private var lifecycleHardStopRequested = false
     private var escalationTask: Task<Void, Never>?
 
     @_spi(Testing)
     public init(system: any MediaPOSIXProcessSystem, terminationGraceNanoseconds: UInt64) {
         self.system = system
         self.terminationGraceNanoseconds = terminationGraceNanoseconds
+        escalationScheduler = TaskMediaProcessEscalationScheduler()
+    }
+
+    @_spi(Testing)
+    public init(
+        system: any MediaPOSIXProcessSystem,
+        terminationGraceNanoseconds: UInt64,
+        escalationScheduler: any MediaProcessEscalationScheduling
+    ) {
+        self.system = system
+        self.terminationGraceNanoseconds = terminationGraceNanoseconds
+        self.escalationScheduler = escalationScheduler
     }
 
     @_spi(Testing) public var stopReason: MediaProcessStopReason? {
@@ -321,7 +352,9 @@ public struct MediaScriptProcessLimits: Equatable, Sendable {
     @_spi(Testing) public func requestStop(_ reason: MediaProcessStopReason) {
         lock.lock()
         guard !isReaped else { lock.unlock(); return }
-        if storedStopReason == nil { storedStopReason = reason }
+        if storedStopReason == nil, storedLifecycleError == nil {
+            storedStopReason = reason
+        }
         let shouldStop = processIdentifier != nil && !terminationRequested
         lock.unlock()
         if shouldStop { requestTerminationAndEscalation() }
@@ -349,11 +382,12 @@ public struct MediaScriptProcessLimits: Equatable, Sendable {
         }
         terminationRequested = true
         _ = system.sendSignal(SIGTERM, to: processIdentifier)
+        let scheduler = escalationScheduler
         let task = Task.detached { [weak self, terminationGraceNanoseconds] in
-            do {
-                try await Task.sleep(nanoseconds: terminationGraceNanoseconds)
-                self?.forceStopIfOwned()
-            } catch {}
+            guard await scheduler.waitForEscalation(
+                afterNanoseconds: terminationGraceNanoseconds
+            ), !Task.isCancelled else { return }
+            self?.forceStopIfOwned()
         }
         escalationTask = task
         lock.unlock()
@@ -381,8 +415,12 @@ public struct MediaScriptProcessLimits: Equatable, Sendable {
                 // other fixed-call failure is fatal; retain ownership, request a hard
                 // stop, and keep attempting to reap before publishing the failure.
                 if errorNumber != ECHILD {
-                    if storedLifecycleError == nil {
+                    if storedLifecycleError == nil, storedStopReason == nil {
                         storedLifecycleError = errorNumber
+                    }
+                    if !lifecycleHardStopRequested {
+                        lifecycleHardStopRequested = true
+                        terminationRequested = true
                         _ = system.sendSignal(SIGKILL, to: processIdentifier)
                     }
                     lock.unlock()
@@ -494,15 +532,15 @@ private final class MediaPOSIXPipe: @unchecked Sendable {
     init() throws {
         var descriptors = [Int32](repeating: -1, count: 2)
         guard Darwin.pipe(&descriptors) == 0 else { throw MediaScriptProcessError.launchFailed }
-        readStorage = descriptors[0]
-        writeStorage = descriptors[1]
-        guard Self.setCloseOnExec(readStorage), Self.setCloseOnExec(writeStorage) else {
-            _ = Darwin.close(readStorage)
-            _ = Darwin.close(writeStorage)
-            readStorage = -1
-            writeStorage = -1
+        var ownedRead = descriptors[0]
+        var ownedWrite = descriptors[1]
+        guard Self.normalize(&ownedRead), Self.normalize(&ownedWrite) else {
+            if ownedRead >= 0 { _ = Darwin.close(ownedRead) }
+            if ownedWrite >= 0 { _ = Darwin.close(ownedWrite) }
             throw MediaScriptProcessError.launchFailed
         }
+        readStorage = ownedRead
+        writeStorage = ownedWrite
     }
 
     deinit { closeAll() }
@@ -521,9 +559,22 @@ private final class MediaPOSIXPipe: @unchecked Sendable {
     func closeWriteEnd() { close(&writeStorage) }
     func closeAll() { close(&readStorage); close(&writeStorage) }
 
-    private static func setCloseOnExec(_ descriptor: Int32) -> Bool {
+    private static func normalize(_ descriptor: inout Int32) -> Bool {
+        if descriptor <= STDERR_FILENO {
+            let duplicated = fcntl(
+                descriptor,
+                F_DUPFD_CLOEXEC,
+                STDERR_FILENO + 1
+            )
+            guard duplicated >= STDERR_FILENO + 1 else { return false }
+            _ = Darwin.close(descriptor)
+            descriptor = duplicated
+            return true
+        }
+
         let flags = fcntl(descriptor, F_GETFD)
-        return flags >= 0 && fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) >= 0
+        return flags >= 0
+            && fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) >= 0
     }
 
     private func close(_ storage: inout Int32) {

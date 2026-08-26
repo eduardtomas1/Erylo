@@ -167,13 +167,14 @@ where Loader: MediaArtworkDataLoading, Decoder: MediaArtworkDecoding {
             }
             return decoded
         }
-        inFlight[key] = InFlight(
+        let operation = InFlight(
             identifier: identifier,
             generation: generation,
             state: requestState,
             task: task
         )
-        outstanding[identifier] = inFlight[key]
+        inFlight[key] = operation
+        outstanding[identifier] = operation
 
         do {
             let decoded = try await task.value

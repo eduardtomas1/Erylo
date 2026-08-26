@@ -57,6 +57,7 @@ public struct MediaScriptRequest: Equatable, Sendable {
 public enum MediaScriptExecutionError: Error, Equatable, Sendable {
     case permissionDenied
     case applicationUnavailable
+    case malformedResponse
     case timedOut
     case responseTooLarge
     case failed(exitCode: Int32?)
@@ -150,8 +151,10 @@ public actor ProcessMediaScriptExecutor: MediaScriptExecuting {
             throw MediaScriptExecutionError.failed(exitCode: completed.exitCode)
         }
 
-        return String(decoding: completed.standardOutput, as: UTF8.self)
-            .trimmingCharacters(in: .newlines)
+        guard let output = String(data: completed.standardOutput, encoding: .utf8) else {
+            throw MediaScriptExecutionError.malformedResponse
+        }
+        return output.trimmingCharacters(in: .newlines)
     }
 
     public func cancel(_ operationID: MediaOperationID) async {
@@ -690,12 +693,18 @@ private actor ScriptedDesktopMediaAdapter {
                 } else {
                     continuation.resume()
                 }
-            case let (.refresh(_, _, _, continuation), .failure(error)):
-                cancelledExecutionIDs.remove(executionID)
-                continuation.resume(throwing: map(error))
-            case let (.command(_, _, _, _, continuation), .failure(error)):
-                cancelledExecutionIDs.remove(executionID)
-                continuation.resume(throwing: map(error))
+            case let (.refresh(_, _, generation, continuation), .failure(error)):
+                if consumeCancellation(for: executionID, generation: generation) {
+                    continuation.resume(throwing: MediaError.cancelled(source: source))
+                } else {
+                    continuation.resume(throwing: map(error))
+                }
+            case let (.command(_, _, generation, _, continuation), .failure(error)):
+                if consumeCancellation(for: executionID, generation: generation) {
+                    continuation.resume(throwing: MediaError.cancelled(source: source))
+                } else {
+                    continuation.resume(throwing: map(error))
+                }
             default:
                 resume(work, throwing: MediaError.automationFailed(source: source, exitCode: nil))
             }
@@ -1020,6 +1029,8 @@ private actor ScriptedDesktopMediaAdapter {
             .permissionDenied(source: source)
         case .applicationUnavailable:
             .sourceUnavailable(source: source)
+        case .malformedResponse:
+            .malformedResponse(source: source)
         case .timedOut:
             .automationTimedOut(source: source)
         case .responseTooLarge:
@@ -1060,17 +1071,21 @@ private enum MediaSnapshotParser {
             throw MediaError.malformedResponse(source: source)
         }
 
-        let durationScale = source == .spotify ? 0.001 : 1.0
-        let rawDuration = Double(fields[5]).map { $0 * durationScale }
-        let duration = rawDuration.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
-        let rawPosition = Double(fields[6]) ?? 0
-        let rawVolume = Double(fields[7]).map { $0 / 100 }
-        guard rawPosition.isFinite, rawVolume?.isFinite != false else {
+        guard let rawDuration = Double(fields[5]),
+              rawDuration.isFinite,
+              rawDuration >= 0,
+              let rawPosition = Double(fields[6]),
+              rawPosition.isFinite,
+              let rawVolume = Double(fields[7]),
+              rawVolume.isFinite else {
             throw MediaError.malformedResponse(source: source)
         }
+        let durationScale = source == .spotify ? 0.001 : 1.0
+        let duration = rawDuration * durationScale
+        let volume = rawVolume / 100
 
         var capabilities: MediaCapabilities = [.transport, .volume]
-        if let duration, duration > 0 {
+        if duration > 0 {
             capabilities.insert(.seek)
         }
 
@@ -1092,7 +1107,7 @@ private enum MediaSnapshotParser {
             duration: duration,
             position: rawPosition,
             playbackState: playbackState,
-            volume: rawVolume,
+            volume: volume,
             capabilities: capabilities,
             artwork: artwork
         )

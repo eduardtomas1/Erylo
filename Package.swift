@@ -12,6 +12,7 @@ let package = Package(
         .library(name: "EryloActivity", targets: ["EryloActivity"]),
         .library(name: "EryloAppIntents", targets: ["EryloAppIntents"]),
         .library(name: "EryloCore", targets: ["EryloCore"]),
+        .library(name: "EryloFileHold", targets: ["EryloFileHold"]),
         .library(name: "EryloGlance", targets: ["EryloGlance"]),
         .library(name: "EryloIntegrations", targets: ["EryloIntegrations"]),
         .library(name: "EryloSettingsUI", targets: ["EryloSettingsUI"]),
@@ -20,6 +21,7 @@ let package = Package(
         .library(name: "EryloTrust", targets: ["EryloTrust"]),
         .library(name: "EryloWindowing", targets: ["EryloWindowing"]),
         .executable(name: "EryloActivityTests", targets: ["EryloActivityTests"]),
+        .executable(name: "EryloFileHoldTests", targets: ["EryloFileHoldTests"]),
         .executable(name: "EryloFoundationTests", targets: ["EryloFoundationTests"]),
         .executable(name: "EryloGlanceTests", targets: ["EryloGlanceTests"]),
         .executable(name: "EryloMediaTests", targets: ["EryloMediaTests"]),
@@ -33,6 +35,7 @@ let package = Package(
             dependencies: ["EryloLocalIntegrations"]
         ),
         .target(name: "EryloCore"),
+        .target(name: "EryloFileHold"),
         .target(
             name: "EryloGlance",
             dependencies: ["EryloActivity"]
@@ -89,6 +92,11 @@ let package = Package(
                 "EryloWindowing",
             ],
             path: "Tests/FoundationHarness"
+        ),
+        .executableTarget(
+            name: "EryloFileHoldTests",
+            dependencies: ["EryloFileHold"],
+            path: "Tests/FileHoldHarness"
         ),
         .executableTarget(
             name: "EryloGlanceTests",

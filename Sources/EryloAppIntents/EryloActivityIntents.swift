@@ -104,7 +104,10 @@ public struct CancelEryloActivityIntent: AppIntent {
         )
         let response = try await gateway.handle(request)
         let cancelled = response.result?.cancelled == true
-        return .result(dialog: cancelled ? "Activity cancelled." : "No matching activity was active.")
+        let dialog: IntentDialog = cancelled
+            ? "Activity cancelled."
+            : "No matching activity was active."
+        return .result(dialog: dialog)
     }
 }
 

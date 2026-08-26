@@ -72,6 +72,18 @@ public struct GlanceProviderWorkState: Equatable, Sendable {
     }
 }
 
+/// Injectable broker boundary used to deterministically exercise provider lifecycle races.
+/// `ActivityBroker` remains the production implementation.
+public protocol GlanceActivityBroker: Sendable {
+    @discardableResult
+    func submit(_ request: ActivityRequest) async throws -> ActivityBrokerSnapshot
+
+    @discardableResult
+    func cancel(_ identity: ActivityIdentity) async -> Bool
+}
+
+extension ActivityBroker: GlanceActivityBroker {}
+
 public enum GlanceDataError: Error, Equatable, Sendable {
     case invalidChargeLevel
     case invalidVolume
@@ -266,7 +278,8 @@ public struct CountdownPresentation: Equatable, Sendable {
 
 public protocol GlanceClock: Sendable {
     func now() async -> Date
-    /// Suspends once until a boundary. Implementations must not poll or repeat.
+    /// Suspends once until a boundary. Implementations must not poll or repeat and must
+    /// promptly finish by throwing when the calling task is cancelled.
     func sleep(until deadline: Date) async throws
 }
 

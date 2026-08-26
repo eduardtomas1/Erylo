@@ -15,6 +15,7 @@ enum GlanceHarnessMain {
         await harness.verifyCalendarChangesAndBoundaries()
         await harness.verifyCalendarPermissionSeams()
         await harness.verifyCountdownCancellationReplacementAndExpiry()
+        await harness.verifyBoundaryAndMutationDraining()
         await harness.verifyNonCooperativeTimerGenerationBackstop()
         await harness.verifyNormalizedFailureHealth()
         harness.finish()
@@ -409,7 +410,10 @@ private struct GlanceHarness {
                 await waitUntil { await broker.snapshot().current?.activity.presentation.title == "Roadmap" },
                 "calendar store change replaces the next meeting"
             )
-            check(await clock.pendingCount == 1, "calendar replacement keeps one boundary")
+            check(
+                await waitUntil { await clock.pendingCount == 1 },
+                "calendar replacement keeps one boundary"
+            )
 
             await clock.advance(to: changed.startDate)
             check(
@@ -537,6 +541,216 @@ private struct GlanceHarness {
         }
     }
 
+    mutating func verifyBoundaryAndMutationDraining() async {
+        let calendarNow = Date(timeIntervalSinceReferenceDate: 45_000)
+        let calendarClock = ManualGlanceClock(now: calendarNow)
+        let calendarSource = ManualCalendarSource(authorization: .fullAccess)
+        let calendarBroker = GatedGlanceBroker()
+        let calendar = CalendarGlanceProvider(
+            broker: calendarBroker,
+            source: calendarSource,
+            clock: calendarClock
+        )
+
+        do {
+            let meeting = try CalendarMeeting(
+                eventIdentifier: "gated-boundary",
+                title: "Boundary review",
+                startDate: calendarNow.addingTimeInterval(30),
+                endDate: calendarNow.addingTimeInterval(90)
+            )
+            await calendarSource.setMeeting(meeting)
+            await calendar.enable()
+            await calendarBroker.gateNextSubmit()
+            await calendarClock.advance(to: meeting.startDate)
+            check(
+                await waitUntil { await calendarBroker.submitPending },
+                "calendar boundary refresh reaches gated broker submission"
+            )
+
+            let disableFlag = CompletionFlag()
+            let disable = Task {
+                await calendar.disable()
+                await disableFlag.markComplete()
+            }
+            await yieldSeveralTimes()
+            check(
+                !(await disableFlag.isComplete),
+                "calendar disable drains an in-flight boundary refresh"
+            )
+            await calendarBroker.releaseSubmit()
+            await disable.value
+            check(await calendar.status() == .disabled, "calendar stale boundary cannot overwrite disabled health")
+            check(await calendar.workState().isIdle, "calendar boundary drain returns with zero work")
+            check(await calendarBroker.snapshot().ordered.isEmpty, "calendar final disable cancellation wins after stale submission")
+
+            await calendar.enable()
+            check(
+                await calendarBroker.snapshot().current?.activity.presentation.title == "Boundary review",
+                "calendar re-enable submits after the stale completion was drained"
+            )
+            check(await calendar.status().health == .healthy, "calendar stale completion cannot overwrite re-enabled health")
+            await calendar.disable()
+        } catch {
+            recordUnexpected(error, context: "calendar boundary drain")
+        }
+
+        let countdownNow = Date(timeIntervalSinceReferenceDate: 46_000)
+        let countdownClock = ManualGlanceClock(now: countdownNow)
+        let countdownBroker = GatedGlanceBroker()
+        let countdown = CountdownGlanceProvider(broker: countdownBroker, clock: countdownClock)
+
+        do {
+            let first = try CountdownTimer(
+                title: "First gated timer",
+                startedAt: countdownNow,
+                endsAt: countdownNow.addingTimeInterval(120)
+            )
+            let replacement = try CountdownTimer(
+                title: "Replacement gated timer",
+                startedAt: countdownNow,
+                endsAt: countdownNow.addingTimeInterval(60)
+            )
+            await countdown.setCountdown(first)
+            await countdown.enable()
+
+            await countdownBroker.gateNextSubmit()
+            let replacementFlag = CompletionFlag()
+            let replacementTask = Task {
+                await countdown.setCountdown(replacement)
+                await replacementFlag.markComplete()
+            }
+            check(
+                await waitUntil { await countdownBroker.submitPending },
+                "countdown replacement reaches gated broker submission"
+            )
+            let disableFlag = CompletionFlag()
+            let disableTask = Task {
+                await countdown.disable()
+                await disableFlag.markComplete()
+            }
+            await yieldSeveralTimes()
+            check(!(await replacementFlag.isComplete), "gated countdown submission remains in flight")
+            check(!(await disableFlag.isComplete), "countdown disable drains an in-flight mutation submission")
+            await countdownBroker.releaseSubmit()
+            await replacementTask.value
+            await disableTask.value
+            check(await countdown.status() == .disabled, "stale countdown submission cannot overwrite disabled health")
+            check(await countdown.workState().isIdle, "countdown submission drain returns with zero work")
+            check(await countdownBroker.snapshot().ordered.isEmpty, "countdown final disable cancellation wins after stale submission")
+
+            await countdown.enable()
+            check(
+                await countdownBroker.snapshot().current?.activity.presentation.title == "Replacement gated timer",
+                "countdown re-enable uses the replacement after stale submission drains"
+            )
+            check(await countdown.status().health == .healthy, "stale countdown submission cannot overwrite re-enabled health")
+
+            await countdownBroker.gateNextCancel()
+            await countdownClock.advance(to: replacement.endsAt)
+            check(
+                await waitUntil { await countdownBroker.cancelPending },
+                "countdown expiry reaches gated broker cancellation"
+            )
+            let expiryDisableFlag = CompletionFlag()
+            let expiryDisable = Task {
+                await countdown.disable()
+                await expiryDisableFlag.markComplete()
+            }
+            await yieldSeveralTimes()
+            check(
+                !(await expiryDisableFlag.isComplete),
+                "countdown disable drains expiry already inside broker cancellation"
+            )
+            await countdownBroker.releaseCancel()
+            await expiryDisable.value
+            check(await countdown.status() == .disabled, "stale expiry cannot overwrite disabled health")
+            check(await countdown.countdown() == replacement, "stale expiry cannot clear the retained countdown")
+            check(await countdownBroker.snapshot().ordered.isEmpty, "expiry disable finishes with no timer activity")
+            check(await countdown.workState().isIdle, "expiry disable drains its boundary task")
+        } catch {
+            recordUnexpected(error, context: "countdown boundary and submission drain")
+        }
+
+        let mutationClock = ManualGlanceClock(now: countdownNow)
+        let mutationBroker = GatedGlanceBroker()
+        let mutationProvider = CountdownGlanceProvider(broker: mutationBroker, clock: mutationClock)
+        do {
+            let first = try CountdownTimer(
+                title: "Mutation first",
+                startedAt: countdownNow,
+                endsAt: countdownNow.addingTimeInterval(180)
+            )
+            let replacement = try CountdownTimer(
+                title: "Mutation replacement",
+                startedAt: countdownNow,
+                endsAt: countdownNow.addingTimeInterval(90)
+            )
+            await mutationProvider.setCountdown(first)
+            await mutationProvider.enable()
+            await mutationBroker.gateNextSubmit()
+            let replace = Task { await mutationProvider.setCountdown(replacement) }
+            check(
+                await waitUntil { await mutationBroker.submitPending },
+                "concurrent replacement reaches gated submission"
+            )
+            let cancelFlag = CompletionFlag()
+            let cancel = Task {
+                await mutationProvider.cancelCountdown()
+                await cancelFlag.markComplete()
+            }
+            await yieldSeveralTimes()
+            check(!(await cancelFlag.isComplete), "concurrent timer cancel queues behind replacement mutation")
+            await mutationBroker.releaseSubmit()
+            await replace.value
+            await cancel.value
+            check(await mutationProvider.countdown() == nil, "serialized concurrent cancel wins over replacement")
+            check(await mutationBroker.snapshot().ordered.isEmpty, "serialized concurrent cancel removes replacement submission")
+            check(await mutationProvider.workState().scheduledBoundaryCount == 0, "serialized concurrent mutations leave no boundary")
+            check(await mutationProvider.status().health == .healthy, "latest concurrent mutation owns final health")
+            await mutationProvider.disable()
+        } catch {
+            recordUnexpected(error, context: "concurrent countdown mutations")
+        }
+
+        let activationClock = ManualGlanceClock(now: countdownNow)
+        let activationBroker = GatedGlanceBroker()
+        let activationProvider = CountdownGlanceProvider(
+            broker: activationBroker,
+            clock: activationClock
+        )
+        do {
+            let timer = try CountdownTimer(
+                title: "Activation race",
+                startedAt: countdownNow,
+                endsAt: countdownNow.addingTimeInterval(120)
+            )
+            await activationProvider.setCountdown(timer)
+            await activationBroker.gateNextSubmit()
+            let enable = Task { await activationProvider.enable() }
+            check(
+                await waitUntil { await activationBroker.submitPending },
+                "countdown activation reaches gated submission"
+            )
+            let cancelFlag = CompletionFlag()
+            let cancel = Task {
+                await activationProvider.cancelCountdown()
+                await cancelFlag.markComplete()
+            }
+            await yieldSeveralTimes()
+            check(!(await cancelFlag.isComplete), "countdown cancel queues behind activation submission")
+            await activationBroker.releaseSubmit()
+            await enable.value
+            await cancel.value
+            check(await activationProvider.countdown() == nil, "cancel during activation clears countdown")
+            check(await activationBroker.snapshot().ordered.isEmpty, "cancel after activation tail prevents stale resurrection")
+            check(await activationProvider.workState().scheduledBoundaryCount == 0, "cancel during activation leaves no boundary")
+            await activationProvider.disable()
+        } catch {
+            recordUnexpected(error, context: "countdown activation mutation ordering")
+        }
+    }
+
     mutating func verifyNonCooperativeTimerGenerationBackstop() async {
         let now = Date(timeIntervalSinceReferenceDate: 50_000)
         let clock = NonCooperativeGlanceClock(now: now)
@@ -548,13 +762,18 @@ private struct GlanceHarness {
             await provider.setCountdown(first)
             await provider.enable()
             check(await waitUntil { await clock.waiterCount == 1 }, "old countdown registers one non-cooperative waiter")
-            await provider.setCountdown(replacement)
-            check(await waitUntil { await clock.waiterCount == 2 }, "replacement registers a new waiter")
-
-            await clock.fire(index: 0)
+            let replacementFlag = CompletionFlag()
+            let replacementTask = Task {
+                await provider.setCountdown(replacement)
+                await replacementFlag.markComplete()
+            }
             await yieldSeveralTimes()
+            check(!(await replacementFlag.isComplete), "replacement drains a non-cooperative old boundary")
+            await clock.fire(index: 0)
+            await replacementTask.value
             check(await provider.countdown() == replacement, "stale timer generation cannot expire replacement")
             check(await broker.snapshot().current?.activity.presentation.title == "New", "stale timer callback cannot cancel replacement activity")
+            check(await waitUntil { await clock.waiterCount == 1 }, "replacement registers a new waiter after the old one drains")
 
             await clock.fire(index: 0)
             check(await waitUntil { await provider.countdown() == nil }, "current timer generation can expire")
@@ -647,6 +866,59 @@ private actor CompletionFlag {
 
     func markComplete() {
         isComplete = true
+    }
+}
+
+private actor GatedGlanceBroker: GlanceActivityBroker {
+    private let broker = ActivityBroker(expirationScheduler: ManualBrokerScheduler())
+    private var shouldGateSubmit = false
+    private var shouldGateCancel = false
+    private var submitContinuation: CheckedContinuation<Void, Never>?
+    private var cancelContinuation: CheckedContinuation<Void, Never>?
+
+    var submitPending: Bool { submitContinuation != nil }
+    var cancelPending: Bool { cancelContinuation != nil }
+
+    func gateNextSubmit() {
+        shouldGateSubmit = true
+    }
+
+    func gateNextCancel() {
+        shouldGateCancel = true
+    }
+
+    func releaseSubmit() {
+        submitContinuation?.resume()
+        submitContinuation = nil
+    }
+
+    func releaseCancel() {
+        cancelContinuation?.resume()
+        cancelContinuation = nil
+    }
+
+    func submit(_ request: ActivityRequest) async throws -> ActivityBrokerSnapshot {
+        if shouldGateSubmit {
+            shouldGateSubmit = false
+            await withCheckedContinuation { continuation in
+                submitContinuation = continuation
+            }
+        }
+        return try await broker.submit(request)
+    }
+
+    func cancel(_ identity: ActivityIdentity) async -> Bool {
+        if shouldGateCancel {
+            shouldGateCancel = false
+            await withCheckedContinuation { continuation in
+                cancelContinuation = continuation
+            }
+        }
+        return await broker.cancel(identity)
+    }
+
+    func snapshot() async -> ActivityBrokerSnapshot {
+        await broker.snapshot()
     }
 }
 

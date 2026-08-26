@@ -2,7 +2,7 @@ import EryloActivity
 import Foundation
 
 public actor PowerGlanceProvider {
-    private let broker: ActivityBroker
+    private let broker: any GlanceActivityBroker
     private let source: any PowerEventSource
     private var enabled = false
     private var generation: UInt64 = 0
@@ -15,7 +15,7 @@ public actor PowerGlanceProvider {
     private var lastEvent: PowerSourceEvent?
     private var currentStatus = GlanceProviderStatus.disabled
 
-    public init(broker: ActivityBroker, source: any PowerEventSource) {
+    public init(broker: any GlanceActivityBroker, source: any PowerEventSource) {
         self.broker = broker
         self.source = source
     }
@@ -200,7 +200,7 @@ public actor PowerGlanceProvider {
 }
 
 public actor VolumeGlanceProvider {
-    private let broker: ActivityBroker
+    private let broker: any GlanceActivityBroker
     private let source: any VolumeEventSource
     private var enabled = false
     private var generation: UInt64 = 0
@@ -213,7 +213,7 @@ public actor VolumeGlanceProvider {
     private var lastEvent: VolumeSourceEvent?
     private var currentStatus = GlanceProviderStatus.disabled
 
-    public init(broker: ActivityBroker, source: any VolumeEventSource) {
+    public init(broker: any GlanceActivityBroker, source: any VolumeEventSource) {
         self.broker = broker
         self.source = source
     }

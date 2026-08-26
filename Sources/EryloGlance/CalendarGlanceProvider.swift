@@ -2,7 +2,7 @@ import EryloActivity
 import Foundation
 
 public actor CalendarGlanceProvider {
-    private let broker: ActivityBroker
+    private let broker: any GlanceActivityBroker
     private let source: any CalendarEventSource
     private let clock: any GlanceClock
     private let lookAhead: CalendarLookAhead
@@ -17,10 +17,11 @@ public actor CalendarGlanceProvider {
     private var eventConsumerTask: Task<Void, Never>?
     private var lastMeeting: CalendarMeeting?
     private var boundaryTask: Task<Void, Never>?
+    private var boundaryRevision: UInt64 = 0
     private var currentStatus = GlanceProviderStatus.disabled
 
     public init(
-        broker: ActivityBroker,
+        broker: any GlanceActivityBroker,
         source: any CalendarEventSource,
         clock: any GlanceClock = SystemGlanceClock(),
         lookAhead: CalendarLookAhead = .sevenDays
@@ -63,9 +64,9 @@ public actor CalendarGlanceProvider {
         }
         enabled = false
         generation &+= 1
+        let disableGeneration = generation
         refreshRevision &+= 1
-        boundaryTask?.cancel()
-        boundaryTask = nil
+        let boundary = takeBoundaryTask()
         let pendingActivation = activationTask
         activationTask = nil
         pendingActivation?.cancel()
@@ -74,7 +75,9 @@ public actor CalendarGlanceProvider {
             guard let self else { return }
             await self.performDisable(
                 pendingActivation: pendingActivation,
-                consumer: consumer
+                consumer: consumer,
+                boundary: boundary,
+                generation: disableGeneration
             )
         }
         deactivationRevision &+= 1
@@ -107,7 +110,12 @@ public actor CalendarGlanceProvider {
             do {
                 let granted = try await source.requestFullAccess()
                 guard enabled, self.generation == generation else { return }
-                authorization = granted ? .fullAccess : await source.authorizationStatus()
+                if granted {
+                    authorization = .fullAccess
+                } else {
+                    authorization = await source.authorizationStatus()
+                    guard enabled, self.generation == generation else { return }
+                }
             } catch {
                 guard enabled, self.generation == generation else { return }
                 currentStatus = GlanceProviderStatus(
@@ -128,15 +136,20 @@ public actor CalendarGlanceProvider {
 
     private func performDisable(
         pendingActivation: Task<Void, Never>?,
-        consumer: Task<Void, Never>?
+        consumer: Task<Void, Never>?,
+        boundary: Task<Void, Never>?,
+        generation: UInt64
     ) async {
         await pendingActivation?.value
         await source.stop()
         sourceActive = false
         await consumer?.value
+        await boundary?.value
+        guard !enabled, self.generation == generation else { return }
+        _ = await broker.cancel(GlanceActivityIdentity.meeting)
+        guard !enabled, self.generation == generation else { return }
         lastMeeting = nil
         currentStatus = .disabled
-        _ = await broker.cancel(GlanceActivityIdentity.meeting)
     }
 
     private func awaitDeactivationTail() async {
@@ -158,6 +171,7 @@ public actor CalendarGlanceProvider {
             guard enabled, self.generation == generation else { return }
             let consumer = finishEventRelay()
             await consumer?.value
+            guard enabled, self.generation == generation else { return }
             currentStatus = GlanceProviderStatus(
                 isEnabled: true,
                 capability: .unavailable,
@@ -178,7 +192,7 @@ public actor CalendarGlanceProvider {
             capability: .available,
             health: .healthy
         )
-        await refresh(generation: generation, forceSubmission: true)
+        _ = await refresh(generation: generation, forceSubmission: true)
     }
 
     private func installEventRelay(
@@ -209,16 +223,21 @@ public actor CalendarGlanceProvider {
 
     private func sourceChanged(generation: UInt64) async {
         guard enabled, self.generation == generation else { return }
-        await refresh(generation: generation, forceSubmission: false)
+        _ = await refresh(generation: generation, forceSubmission: false)
     }
 
-    private func refresh(generation: UInt64, forceSubmission: Bool) async {
+    /// Returns the query timestamp when the refresh completed for the current generation.
+    private func refresh(
+        generation: UInt64,
+        forceSubmission: Bool,
+        boundaryExecutionRevision: UInt64? = nil
+    ) async -> Date? {
         refreshRevision &+= 1
         let queryRevision = refreshRevision
         let now = await clock.now()
-        guard enabled,
-              self.generation == generation,
-              refreshRevision == queryRevision else { return }
+        guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+            return nil
+        }
 
         let meeting: CalendarMeeting?
         do {
@@ -227,39 +246,53 @@ public actor CalendarGlanceProvider {
                 until: now.addingTimeInterval(lookAhead.seconds)
             )
         } catch {
-            guard enabled,
-                  self.generation == generation,
-                  refreshRevision == queryRevision else { return }
-            boundaryTask?.cancel()
-            boundaryTask = nil
-            lastMeeting = nil
+            guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                return nil
+            }
+            if boundaryExecutionRevision == nil {
+                await cancelBoundaryTask()
+                guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                    return nil
+                }
+            }
             _ = await broker.cancel(GlanceActivityIdentity.meeting)
+            guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                return nil
+            }
+            lastMeeting = nil
             currentStatus = GlanceProviderStatus(
                 isEnabled: true,
                 capability: .available,
                 health: .degraded(.sourceQueryFailed)
             )
-            return
+            return now
         }
 
-        guard enabled,
-              self.generation == generation,
-              refreshRevision == queryRevision else { return }
+        guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+            return nil
+        }
 
         guard let meeting else {
             let hadMeeting = lastMeeting != nil
-            lastMeeting = nil
-            boundaryTask?.cancel()
-            boundaryTask = nil
+            if boundaryExecutionRevision == nil {
+                await cancelBoundaryTask()
+                guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                    return nil
+                }
+            }
             if hadMeeting {
                 _ = await broker.cancel(GlanceActivityIdentity.meeting)
+                guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                    return nil
+                }
             }
+            lastMeeting = nil
             currentStatus = GlanceProviderStatus(
                 isEnabled: true,
                 capability: .available,
                 health: .healthy
             )
-            return
+            return now
         }
 
         let changed = meeting != lastMeeting
@@ -267,58 +300,131 @@ public actor CalendarGlanceProvider {
             do {
                 _ = try await broker.submit(GlanceRequestFactory.meeting(meeting, now: now))
             } catch {
+                guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                    return nil
+                }
                 currentStatus = GlanceProviderStatus(
                     isEnabled: true,
                     capability: .available,
                     health: .degraded(.brokerRejected)
                 )
-                return
+                return nil
+            }
+            guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                return nil
             }
         }
 
         lastMeeting = meeting
-        if changed || forceSubmission || boundaryTask == nil {
-            scheduleBoundary(for: meeting, now: now, generation: generation)
+        if boundaryExecutionRevision == nil,
+           changed || forceSubmission || boundaryTask == nil {
+            await replaceBoundary(
+                for: meeting,
+                now: now,
+                generation: generation,
+                refreshRevision: queryRevision
+            )
+            guard isCurrentRefresh(generation: generation, revision: queryRevision) else {
+                return nil
+            }
         }
         currentStatus = GlanceProviderStatus(
             isEnabled: true,
             capability: .available,
             health: .healthy
         )
+        return now
     }
 
-    private func scheduleBoundary(
+    private func isCurrentRefresh(generation: UInt64, revision: UInt64) -> Bool {
+        enabled && self.generation == generation && refreshRevision == revision
+    }
+
+    private func replaceBoundary(
+        for meeting: CalendarMeeting,
+        now: Date,
+        generation: UInt64,
+        refreshRevision: UInt64
+    ) async {
+        let previous = takeBoundaryTask()
+        await previous?.value
+        guard isCurrentRefresh(generation: generation, revision: refreshRevision),
+              lastMeeting == meeting else { return }
+        startBoundary(for: meeting, now: now, generation: generation)
+    }
+
+    private func startBoundary(
         for meeting: CalendarMeeting,
         now: Date,
         generation: UInt64
     ) {
-        boundaryTask?.cancel()
         let deadline = meeting.startDate > now ? meeting.startDate : meeting.endDate
         guard deadline > now else {
             boundaryTask = nil
             return
         }
 
+        boundaryRevision &+= 1
+        let revision = boundaryRevision
         let clock = self.clock
         boundaryTask = Task { [weak self] in
             do {
                 try await clock.sleep(until: deadline)
             } catch {
+                await self?.boundaryStopped(revision: revision)
                 return
             }
             await self?.boundaryReached(
                 meeting: meeting,
-                generation: generation
+                generation: generation,
+                revision: revision
             )
         }
     }
 
-    private func boundaryReached(meeting: CalendarMeeting, generation: UInt64) async {
+    private func boundaryReached(
+        meeting: CalendarMeeting,
+        generation: UInt64,
+        revision: UInt64
+    ) async {
         guard enabled,
               self.generation == generation,
+              boundaryRevision == revision,
               lastMeeting == meeting else { return }
+        let refreshDate = await refresh(
+            generation: generation,
+            forceSubmission: true,
+            boundaryExecutionRevision: revision
+        )
+        guard enabled,
+              self.generation == generation,
+              boundaryRevision == revision else { return }
         boundaryTask = nil
-        await refresh(generation: generation, forceSubmission: true)
+        guard let refreshDate,
+              let currentMeeting = lastMeeting else { return }
+        startBoundary(
+            for: currentMeeting,
+            now: refreshDate,
+            generation: generation
+        )
+    }
+
+    private func boundaryStopped(revision: UInt64) {
+        guard boundaryRevision == revision else { return }
+        boundaryTask = nil
+    }
+
+    private func takeBoundaryTask() -> Task<Void, Never>? {
+        boundaryRevision &+= 1
+        let task = boundaryTask
+        boundaryTask = nil
+        task?.cancel()
+        return task
+    }
+
+    private func cancelBoundaryTask() async {
+        let task = takeBoundaryTask()
+        await task?.value
     }
 
     private func applyUnavailableAuthorization(_ authorization: CalendarAuthorization) {

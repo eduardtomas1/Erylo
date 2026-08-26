@@ -27,27 +27,55 @@ public struct EryloGlance: Sendable {
         calendarSource: any CalendarEventSource,
         clock: any GlanceClock
     ) {
-        power = PowerGlanceProvider(broker: broker, source: powerSource)
+        self.init(
+            broker: broker,
+            powerSource: powerSource,
+            volumeSource: volumeSource,
+            calendarSource: calendarSource,
+            clock: clock,
+            batteryPresentationPolicy: .standard,
+            calendarPresentationWindow: .standard
+        )
+    }
+
+    public init(
+        broker: ActivityBroker,
+        powerSource: any PowerEventSource,
+        volumeSource: any VolumeEventSource,
+        calendarSource: any CalendarEventSource,
+        clock: any GlanceClock,
+        batteryPresentationPolicy: BatteryPresentationPolicy = .standard,
+        calendarPresentationWindow: CalendarPresentationWindow = .standard
+    ) {
+        power = PowerGlanceProvider(
+            broker: broker,
+            source: powerSource,
+            presentationPolicy: batteryPresentationPolicy
+        )
         countdown = CountdownGlanceProvider(broker: broker, clock: clock)
         calendar = CalendarGlanceProvider(
             broker: broker,
             source: calendarSource,
-            clock: clock
+            clock: clock,
+            presentationWindow: calendarPresentationWindow
         )
         volume = VolumeGlanceProvider(broker: broker, source: volumeSource)
     }
 
     /// Awaits every lifecycle tail so no glance observer, consumer, or boundary remains on return.
     public func disableAll() async {
-        async let powerShutdown: Void = power.disable()
-        async let countdownShutdown: Void = countdown.disable()
-        async let calendarShutdown: Void = calendar.disable()
-        async let volumeShutdown: Void = volume.disable()
-        _ = await (
-            powerShutdown,
-            countdownShutdown,
-            calendarShutdown,
-            volumeShutdown
-        )
+        let shutdown = Task.detached { [power, countdown, calendar, volume] in
+            async let powerShutdown: Void = power.disable()
+            async let countdownShutdown: Void = countdown.disable()
+            async let calendarShutdown: Void = calendar.disable()
+            async let volumeShutdown: Void = volume.disable()
+            _ = await (
+                powerShutdown,
+                countdownShutdown,
+                calendarShutdown,
+                volumeShutdown
+            )
+        }
+        await shutdown.value
     }
 }

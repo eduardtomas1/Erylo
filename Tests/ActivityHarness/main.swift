@@ -15,6 +15,9 @@ enum ActivityHarnessMain {
         await harness.verifyFileHoldSchemaValues()
         await harness.verifyValidation()
         await harness.verifyActivityCapacity()
+        await harness.verifyOwnershipCapacityAndRelease()
+        await harness.verifyOwnershipClaimIntentAdmission()
+        await harness.verifyOwnedRecordFencing()
         await harness.verifySnapshotBackpressureAndLifecycle()
         await harness.verifySubscriberCapacity()
         await harness.verifySubscriberIdentityIsolation()
@@ -275,6 +278,400 @@ private struct ActivityHarness {
         }
     }
 
+    mutating func verifyOwnershipCapacityAndRelease() async {
+        let broker = ActivityBroker()
+        var leases: [ActivityOwnershipLease] = []
+
+        do {
+            for index in 0..<ActivityLimits.maximumOwnershipCount {
+                let identity = ActivityIdentity(
+                    source: .external,
+                    identifier: try ActivityIdentifier(validating: "owner-\(index)")
+                )
+                if let lease = await claimOwnership(of: identity, from: broker) {
+                    leases.append(lease)
+                }
+            }
+            check(
+                leases.count == ActivityLimits.maximumOwnershipCount,
+                "ownership capacity admits exactly its fixed bound"
+            )
+            check(
+                await broker.workState().activeOwnershipCount
+                    == ActivityLimits.maximumOwnershipCount,
+                "ownership work state reports the fixed live-generation bound"
+            )
+
+            let overflowIdentity = ActivityIdentity(
+                source: .external,
+                identifier: try ActivityIdentifier(validating: "owner-overflow")
+            )
+            let overflowLease = await claimOwnership(
+                of: overflowIdentity,
+                from: broker
+            )
+            check(
+                overflowLease == nil,
+                "unique ownership overflow fails closed without retaining state"
+            )
+            check(
+                await broker.workState().activeOwnershipCount
+                    == ActivityLimits.maximumOwnershipCount,
+                "rejected ownership overflow preserves bounded state"
+            )
+
+            for lease in leases {
+                lease.beginRetirement()
+                check(
+                    await broker.releaseOwnership(lease),
+                    "exact ownership generation releases its capacity"
+                )
+            }
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "retired ownership generations leave zero retained admission state"
+            )
+
+            let reclaimed = await claimOwnership(of: overflowIdentity, from: broker)
+            check(reclaimed != nil, "released ownership capacity is reusable")
+            if let reclaimed {
+                reclaimed.beginRetirement()
+                check(
+                    await broker.releaseOwnership(reclaimed),
+                    "reused ownership generation releases cleanly"
+                )
+            }
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "reused ownership capacity returns to zero"
+            )
+        } catch {
+            recordUnexpected(error, context: "ownership capacity and release")
+        }
+    }
+
+    mutating func verifyOwnershipClaimIntentAdmission() async {
+        let broker = ActivityBroker()
+
+        do {
+            let identity = ActivityIdentity(
+                source: .external,
+                identifier: try ActivityIdentifier(validating: "claim-order")
+            )
+            guard let delayedIntent = broker.ownershipCoordinator.prepareClaim(
+                for: identity
+            ), let successorIntent = broker.ownershipCoordinator.prepareClaim(
+                for: identity
+            ), let successorLease = await broker.claimOwnership(
+                of: identity,
+                admitting: successorIntent
+            ) else {
+                check(false, "ownership claim-order fixture prepares both intents")
+                return
+            }
+            let successorSnapshot = try await broker.submit(
+                request(
+                    id: identity.identifier.rawValue,
+                    source: "external",
+                    title: "Successor"
+                ),
+                ifOwnedBy: successorLease
+            )
+            check(
+                successorSnapshot?.current?.activity.presentation.title == "Successor",
+                "newer synchronously ordered intent owns the record"
+            )
+            check(
+                await broker.cancel(identity, ifOwnedBy: successorLease),
+                "successor removes its exact owned record before release"
+            )
+            check(
+                await broker.releaseOwnership(successorLease),
+                "successor releases while a delayed older intent remains"
+            )
+            let releasedSnapshot = await broker.snapshot()
+            let retainedWork = await broker.workState()
+            check(
+                retainedWork.activeOwnershipCount == 1
+                    && retainedWork.pendingOwnershipIntentCount == 1,
+                "delayed intent retains one bounded high-water lane after successor release"
+            )
+            check(
+                await broker.claimOwnership(of: identity, admitting: delayedIntent) == nil,
+                "delayed older intent cannot claim after the successor releases"
+            )
+            check(
+                await broker.snapshot() == releasedSnapshot,
+                "rejected delayed intent performs no broker mutation"
+            )
+            let prunedWork = await broker.workState()
+            check(
+                prunedWork.activeOwnershipCount == 0
+                    && prunedWork.pendingOwnershipIntentCount == 0,
+                "settled stale intent prunes its high-water lane"
+            )
+
+            guard let retiredIntent = broker.ownershipCoordinator.prepareClaim(
+                for: identity
+            ) else {
+                check(false, "ownership retirement fixture prepares an intent")
+                return
+            }
+            retiredIntent.retire()
+            check(
+                broker.ownershipCoordinator.workState()
+                    == ActivityOwnershipWorkState(
+                        retainedIdentityCount: 0,
+                        pendingIntentCount: 0,
+                        activeLeaseCount: 0
+                    ),
+                "synchronous intent retirement releases admission state"
+            )
+            check(
+                await broker.claimOwnership(of: identity, admitting: retiredIntent) == nil,
+                "a retired token remains rejected when a wrapper delivers it later"
+            )
+
+            var boundedIntents: [ActivityOwnershipClaimIntent] = []
+            for _ in 0..<ActivityLimits.maximumOwnershipIntentCount {
+                if let intent = broker.ownershipCoordinator.prepareClaim(for: identity) {
+                    boundedIntents.append(intent)
+                }
+            }
+            check(
+                boundedIntents.count == ActivityLimits.maximumOwnershipIntentCount,
+                "ownership pending-intent capacity admits exactly its fixed bound"
+            )
+            check(
+                broker.ownershipCoordinator.prepareClaim(for: identity) == nil,
+                "ownership pending-intent overflow fails closed"
+            )
+            check(
+                broker.ownershipCoordinator.workState()
+                    == ActivityOwnershipWorkState(
+                        retainedIdentityCount: 1,
+                        pendingIntentCount: ActivityLimits.maximumOwnershipIntentCount,
+                        activeLeaseCount: 0
+                    ),
+                "ownership pending-intent work remains globally bounded"
+            )
+            boundedIntents.forEach { $0.retire() }
+            check(
+                broker.ownershipCoordinator.workState()
+                    == ActivityOwnershipWorkState(
+                        retainedIdentityCount: 0,
+                        pendingIntentCount: 0,
+                        activeLeaseCount: 0
+                    ),
+                "retiring bounded pending intents prunes all retained state"
+            )
+
+            let freshLease = await claimOwnership(of: identity, from: broker)
+            check(freshLease != nil, "claim capacity is reusable after pending-intent pruning")
+            if let freshLease {
+                check(
+                    await broker.releaseOwnership(freshLease),
+                    "fresh reusable claim releases cleanly"
+                )
+            }
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "fresh reusable claim leaves no retained ownership state"
+            )
+        } catch {
+            recordUnexpected(error, context: "ownership claim intent admission")
+        }
+    }
+
+    mutating func verifyOwnedRecordFencing() async {
+        let scheduler = ManualExpirationScheduler()
+        let broker = ActivityBroker(expirationScheduler: scheduler)
+        do {
+            let identity = ActivityIdentity(
+                source: .timer,
+                identifier: try ActivityIdentifier(validating: "public-owner")
+            )
+            guard let submittedLease = await claimOwnership(
+                of: identity,
+                from: broker
+            ) else {
+                check(false, "public broker claims owned-record fixture")
+                return
+            }
+            let ownedRequest = request(id: identity.identifier.rawValue, title: "Owned")
+            check(
+                try await broker.submit(ownedRequest, ifOwnedBy: submittedLease) != nil,
+                "owned fixture binds its record to the lease generation"
+            )
+            let unleased = try await broker.submit(
+                request(id: identity.identifier.rawValue, title: "Unleased replacement")
+            )
+            check(
+                unleased.current?.activity.presentation.title == "Unleased replacement",
+                "public unleased submit replaces the owned record"
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "public unleased submit atomically invalidates provider admission"
+            )
+            submittedLease.beginRetirement()
+            check(
+                !(await broker.cancel(identity, ifOwnedBy: submittedLease)),
+                "retired owner cannot cancel a later unleased record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "Unleased replacement",
+                "later unleased record survives old owned cleanup"
+            )
+            check(
+                !(await broker.releaseOwnership(submittedLease)),
+                "stale owned release cannot disturb unleased state"
+            )
+
+            guard let cancelledLease = await claimOwnership(
+                of: identity,
+                from: broker
+            ) else {
+                check(false, "public broker reclaims generation after unleased replacement")
+                return
+            }
+            check(
+                await broker.snapshot().ordered.isEmpty,
+                "ownership takeover clears the preceding unleased record"
+            )
+            check(
+                try await broker.submit(ownedRequest, ifOwnedBy: cancelledLease) != nil,
+                "reclaimed generation submits an owned record"
+            )
+            check(await broker.cancel(identity), "unleased cancellation removes an owned record")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "unleased cancellation invalidates and prunes owned admission"
+            )
+            _ = try await broker.submit(
+                request(id: identity.identifier.rawValue, title: "After public cancel")
+            )
+            cancelledLease.beginRetirement()
+            check(
+                !(await broker.cancel(identity, ifOwnedBy: cancelledLease)),
+                "lease invalidated by public cancellation cannot erase a future record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "After public cancel",
+                "future record survives cleanup from a publicly cancelled lease"
+            )
+            _ = await broker.cancel(identity)
+
+            guard let actionLease = await claimOwnership(
+                of: identity,
+                from: broker
+            ) else {
+                check(false, "public broker claims action-cancellation ownership fixture")
+                return
+            }
+            let actionRequest = request(
+                id: identity.identifier.rawValue,
+                title: "Owned action",
+                actionIdentifier: "timer.cancel",
+                actionLabel: "Cancel",
+                actionIntent: "cancel"
+            )
+            let actionSnapshot = try await broker.submit(
+                actionRequest,
+                ifOwnedBy: actionLease
+            )
+            if let actionRevision = actionSnapshot?.current?.revision {
+                check(
+                    await broker.cancelCurrentAction(
+                        identity: identity,
+                        revision: actionRevision,
+                        actionIdentifier: "timer.cancel",
+                        intent: .cancel
+                    ),
+                    "public current-action cancellation removes its exact owned record"
+                )
+            } else {
+                check(false, "owned action fixture exposes its current revision")
+            }
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "public current-action cancellation invalidates owned admission"
+            )
+            _ = try await broker.submit(
+                request(id: identity.identifier.rawValue, title: "After current action")
+            )
+            check(
+                try await broker.submit(actionRequest, ifOwnedBy: actionLease) == nil,
+                "action-invalidated lease cannot submit over a future record"
+            )
+            actionLease.beginRetirement()
+            check(
+                !(await broker.cancel(identity, ifOwnedBy: actionLease)),
+                "action-invalidated lease cannot cancel a future record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "After current action",
+                "future record survives cleanup from action-invalidated ownership"
+            )
+            check(
+                !(await broker.releaseOwnership(actionLease)),
+                "stale action-owned release cannot disturb future state"
+            )
+            _ = await broker.cancel(identity)
+
+            guard let expiringLease = await claimOwnership(
+                of: identity,
+                from: broker
+            ) else {
+                check(false, "public broker claims expiring ownership fixture")
+                return
+            }
+            let expiringRequest = request(
+                id: identity.identifier.rawValue,
+                title: "Owned expiry",
+                ttlMilliseconds: 10
+            )
+            check(
+                try await broker.submit(expiringRequest, ifOwnedBy: expiringLease) != nil,
+                "owned expiring record is admitted"
+            )
+            check(
+                await waitUntil { await scheduler.pendingDurations == [.milliseconds(10)] },
+                "owned expiry installs one bounded one-shot"
+            )
+            await scheduler.fireOldest()
+            check(
+                await waitUntil {
+                    let snapshot = await broker.snapshot()
+                    let work = await broker.workState()
+                    return snapshot.ordered.isEmpty
+                        && work.scheduledExpiryCount == 0
+                        && work.activeOwnershipCount == 0
+                },
+                "owned expiry removes its record, task, and admission generation"
+            )
+            _ = try await broker.submit(
+                request(id: identity.identifier.rawValue, title: "After owned expiry")
+            )
+            expiringLease.beginRetirement()
+            check(
+                !(await broker.cancel(identity, ifOwnedBy: expiringLease)),
+                "expired ownership cannot erase a future unleased record"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title
+                    == "After owned expiry",
+                "future record survives cleanup from an expired ownership generation"
+            )
+            _ = await broker.cancel(identity)
+        } catch {
+            recordUnexpected(error, context: "owned record fencing")
+        }
+    }
+
     mutating func verifyDeclarativeAction() async {
         let broker = ActivityBroker()
         do {
@@ -450,6 +847,16 @@ private struct ActivityHarness {
             actionIntent: actionIntent,
             ttlMilliseconds: ttlMilliseconds
         )
+    }
+
+    private func claimOwnership(
+        of identity: ActivityIdentity,
+        from broker: ActivityBroker
+    ) async -> ActivityOwnershipLease? {
+        guard let intent = broker.ownershipCoordinator.prepareClaim(for: identity) else {
+            return nil
+        }
+        return await broker.claimOwnership(of: identity, admitting: intent)
     }
 
     private func identifiers(in snapshot: ActivityBrokerSnapshot) -> [String] {

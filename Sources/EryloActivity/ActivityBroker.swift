@@ -44,10 +44,276 @@ public struct ActivityBrokerSnapshot: Equatable, Sendable {
 public struct ActivityBrokerWorkState: Equatable, Sendable {
     public let scheduledExpiryCount: Int
     public let subscriberCount: Int
+    public let activeOwnershipCount: Int
+    public let pendingOwnershipIntentCount: Int
 
     public init(scheduledExpiryCount: Int, subscriberCount: Int) {
         self.scheduledExpiryCount = scheduledExpiryCount
         self.subscriberCount = subscriberCount
+        activeOwnershipCount = 0
+        pendingOwnershipIntentCount = 0
+    }
+
+    public init(
+        scheduledExpiryCount: Int,
+        subscriberCount: Int,
+        activeOwnershipCount: Int
+    ) {
+        self.scheduledExpiryCount = scheduledExpiryCount
+        self.subscriberCount = subscriberCount
+        self.activeOwnershipCount = activeOwnershipCount
+        pendingOwnershipIntentCount = 0
+    }
+
+    public init(
+        scheduledExpiryCount: Int,
+        subscriberCount: Int,
+        activeOwnershipCount: Int,
+        pendingOwnershipIntentCount: Int
+    ) {
+        self.scheduledExpiryCount = scheduledExpiryCount
+        self.subscriberCount = subscriberCount
+        self.activeOwnershipCount = activeOwnershipCount
+        self.pendingOwnershipIntentCount = pendingOwnershipIntentCount
+    }
+}
+
+public struct ActivityOwnershipWorkState: Equatable, Sendable {
+    public let retainedIdentityCount: Int
+    public let pendingIntentCount: Int
+    public let activeLeaseCount: Int
+
+    public init(
+        retainedIdentityCount: Int,
+        pendingIntentCount: Int,
+        activeLeaseCount: Int
+    ) {
+        self.retainedIdentityCount = retainedIdentityCount
+        self.pendingIntentCount = pendingIntentCount
+        self.activeLeaseCount = activeLeaseCount
+    }
+}
+
+public final class ActivityOwnershipClaimIntent: @unchecked Sendable {
+    public let identity: ActivityIdentity
+    fileprivate let sequence: UInt64
+    fileprivate let coordinator: ActivityOwnershipCoordinator
+
+    private let lock = NSLock()
+    private var consumed = false
+
+    fileprivate init(
+        identity: ActivityIdentity,
+        sequence: UInt64,
+        coordinator: ActivityOwnershipCoordinator
+    ) {
+        self.identity = identity
+        self.sequence = sequence
+        self.coordinator = coordinator
+    }
+
+    deinit {
+        lock.lock()
+        let shouldAbandon = !consumed
+        consumed = true
+        lock.unlock()
+        if shouldAbandon {
+            coordinator.abandon(identity: identity, sequence: sequence)
+        }
+    }
+
+    fileprivate func consume(by coordinator: ActivityOwnershipCoordinator) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !consumed, self.coordinator === coordinator else { return false }
+        consumed = true
+        return true
+    }
+
+    /// Retires a not-yet-forwarded claim synchronously. A wrapper may still
+    /// deliver the token later, but admission will reject it without mutation.
+    package func retire() {
+        guard consume(by: coordinator) else { return }
+        coordinator.abandon(identity: identity, sequence: sequence)
+    }
+}
+
+public final class ActivityOwnershipCoordinator: @unchecked Sendable {
+    private struct Lane {
+        var nextSequence: UInt64 = 0
+        var latestSequence: UInt64 = 0
+        var pendingSequences: Set<UInt64> = []
+        var activeSequences: Set<UInt64> = []
+    }
+
+    private let lock = NSLock()
+    private var lanes: [ActivityIdentity: Lane] = [:]
+    private var pendingIntentCount = 0
+
+    public init() {}
+
+    /// Establishes caller order synchronously, before a claim crosses an async
+    /// broker or wrapper boundary. The returned intent cannot be forged or reused.
+    public func prepareClaim(
+        for identity: ActivityIdentity
+    ) -> ActivityOwnershipClaimIntent? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard lanes[identity] != nil
+                || lanes.count < ActivityLimits.maximumOwnershipCount else {
+            return nil
+        }
+        guard pendingIntentCount < ActivityLimits.maximumOwnershipIntentCount else {
+            return nil
+        }
+        var lane = lanes[identity] ?? Lane()
+        precondition(
+            lane.nextSequence < UInt64.max,
+            "ActivityBroker ownership intent space exhausted"
+        )
+        lane.nextSequence += 1
+        lane.latestSequence = lane.nextSequence
+        lane.pendingSequences.insert(lane.nextSequence)
+        pendingIntentCount += 1
+        lanes[identity] = lane
+        return ActivityOwnershipClaimIntent(
+            identity: identity,
+            sequence: lane.nextSequence,
+            coordinator: self
+        )
+    }
+
+    public func workState() -> ActivityOwnershipWorkState {
+        lock.lock()
+        defer { lock.unlock() }
+        return ActivityOwnershipWorkState(
+            retainedIdentityCount: lanes.count,
+            pendingIntentCount: pendingIntentCount,
+            activeLeaseCount: lanes.values.reduce(0) {
+                $0 + $1.activeSequences.count
+            }
+        )
+    }
+
+    fileprivate func admit(
+        _ intent: ActivityOwnershipClaimIntent,
+        for identity: ActivityIdentity
+    ) -> UInt64? {
+        guard intent.consume(by: self) else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        let intentIdentity = intent.identity
+        guard var lane = lanes[intentIdentity],
+              lane.pendingSequences.remove(intent.sequence) != nil else {
+            return nil
+        }
+        pendingIntentCount -= 1
+        guard intentIdentity == identity,
+              lane.latestSequence == intent.sequence else {
+            storeOrPrune(lane, for: intentIdentity)
+            return nil
+        }
+        lane.activeSequences.removeAll(keepingCapacity: true)
+        lane.activeSequences.insert(intent.sequence)
+        lanes[intentIdentity] = lane
+        return intent.sequence
+    }
+
+    fileprivate func release(identity: ActivityIdentity, sequence: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var lane = lanes[identity] else { return }
+        lane.activeSequences.remove(sequence)
+        storeOrPrune(lane, for: identity)
+    }
+
+    fileprivate func invalidateClaims(for identity: ActivityIdentity) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var lane = lanes[identity] else { return }
+        precondition(
+            lane.nextSequence < UInt64.max,
+            "ActivityBroker ownership intent space exhausted"
+        )
+        lane.nextSequence += 1
+        lane.latestSequence = lane.nextSequence
+        lane.activeSequences.removeAll(keepingCapacity: true)
+        storeOrPrune(lane, for: identity)
+    }
+
+    fileprivate func abandon(identity: ActivityIdentity, sequence: UInt64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard var lane = lanes[identity],
+              lane.pendingSequences.remove(sequence) != nil else { return }
+        pendingIntentCount -= 1
+        storeOrPrune(lane, for: identity)
+    }
+
+    private func storeOrPrune(_ lane: Lane, for identity: ActivityIdentity) {
+        if lane.pendingSequences.isEmpty, lane.activeSequences.isEmpty {
+            lanes.removeValue(forKey: identity)
+        } else {
+            lanes[identity] = lane
+        }
+    }
+}
+
+public final class ActivityOwnershipLease: @unchecked Sendable {
+    private enum State: Equatable {
+        case active
+        case retiring
+        case finished
+    }
+
+    public let identity: ActivityIdentity
+    fileprivate let generation: UInt64
+    fileprivate let admissionSequence: UInt64
+    fileprivate let coordinator: ActivityOwnershipCoordinator
+
+    private let lock = NSLock()
+    private var state = State.active
+
+    fileprivate init(
+        identity: ActivityIdentity,
+        generation: UInt64,
+        admissionSequence: UInt64,
+        coordinator: ActivityOwnershipCoordinator
+    ) {
+        self.identity = identity
+        self.generation = generation
+        self.admissionSequence = admissionSequence
+        self.coordinator = coordinator
+    }
+
+    /// Synchronously closes admission for future submissions. Cleanup may still
+    /// conditionally remove this generation until `finishRetirement()` is called.
+    package func beginRetirement() {
+        lock.lock()
+        if state == .active { state = .retiring }
+        lock.unlock()
+    }
+
+    package func finishRetirement() {
+        lock.lock()
+        state = .finished
+        lock.unlock()
+    }
+
+    fileprivate func withSubmissionAdmission(
+        _ operation: () throws(ActivityBrokerError) -> ActivityBrokerSnapshot
+    ) throws(ActivityBrokerError) -> ActivityBrokerSnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state == .active else { return nil }
+        return try operation()
+    }
+
+    fileprivate func withCleanupAdmission<Result>(_ operation: () -> Result) -> Result? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard state != .finished else { return nil }
+        return operation()
     }
 }
 
@@ -92,6 +358,7 @@ public actor ActivityBroker {
     private struct Record: Sendable {
         var presented: PresentedActivity
         var expiryRevision: UInt64?
+        var ownershipGeneration: UInt64?
     }
 
     private struct Subscriber: Sendable {
@@ -100,18 +367,22 @@ public actor ActivityBroker {
     }
 
     private let expirationScheduler: any ActivityExpirationScheduling
+    public nonisolated let ownershipCoordinator: ActivityOwnershipCoordinator
     private var records: [ActivityIdentity: Record] = [:]
     private var expiryTasks: [ActivityIdentity: Task<Void, Never>] = [:]
     private var subscribers: [UUID: Subscriber] = [:]
     private var nextSubmissionSequence: UInt64 = 0
     private var nextActivityRevision: UInt64 = 0
     private var nextSubscriberGeneration: UInt64 = 0
+    private var nextOwnershipGeneration: UInt64 = 0
+    private var ownershipGenerations: [ActivityIdentity: UInt64] = [:]
     private var version: UInt64 = 0
 
     public init(
         expirationScheduler: any ActivityExpirationScheduling = ContinuousActivityExpirationScheduler()
     ) {
         self.expirationScheduler = expirationScheduler
+        ownershipCoordinator = ActivityOwnershipCoordinator()
     }
 
     deinit {
@@ -128,6 +399,90 @@ public actor ActivityBroker {
         } catch {
             throw .invalid(error)
         }
+        if records[activity.identity] == nil,
+           records.count >= ActivityLimits.maximumActivityCount {
+            throw .activityCapacityExceeded(maximum: ActivityLimits.maximumActivityCount)
+        }
+        ownershipCoordinator.invalidateClaims(for: activity.identity)
+        ownershipGenerations.removeValue(forKey: activity.identity)
+        return try submit(activity, ownershipGeneration: nil)
+    }
+
+    /// Claims the next cross-instance generation for one identity. Takeover also
+    /// removes any predecessor presentation in this actor turn, so an unavailable
+    /// successor cannot strand the old generation's record. Unique live claims
+    /// are bounded and must be released when their owner retires.
+    public func claimOwnership(
+        of identity: ActivityIdentity,
+        admitting intent: ActivityOwnershipClaimIntent
+    ) -> ActivityOwnershipLease? {
+        guard let admissionSequence = ownershipCoordinator.admit(
+            intent,
+            for: identity
+        ) else { return nil }
+        precondition(
+            nextOwnershipGeneration < UInt64.max,
+            "ActivityBroker ownership generation space exhausted"
+        )
+        nextOwnershipGeneration += 1
+        ownershipGenerations[identity] = nextOwnershipGeneration
+        if records.removeValue(forKey: identity) != nil {
+            expiryTasks.removeValue(forKey: identity)?.cancel()
+            _ = publishMutation()
+        }
+        return ActivityOwnershipLease(
+            identity: identity,
+            generation: nextOwnershipGeneration,
+            admissionSequence: admissionSequence,
+            coordinator: ownershipCoordinator
+        )
+    }
+
+    /// Releases only the exact current generation. A stale owner can finish its
+    /// local lease but cannot prune a successor's admission state.
+    @discardableResult
+    public func releaseOwnership(_ lease: ActivityOwnershipLease) -> Bool {
+        lease.beginRetirement()
+        defer { lease.finishRetirement() }
+        guard lease.coordinator === ownershipCoordinator else { return false }
+        ownershipCoordinator.release(
+            identity: lease.identity,
+            sequence: lease.admissionSequence
+        )
+        guard ownershipGenerations[lease.identity] == lease.generation else {
+            return false
+        }
+        ownershipGenerations.removeValue(forKey: lease.identity)
+        return true
+    }
+
+    /// Submits only while this lease is active and remains the latest generation.
+    /// Lease admission is held through the mutation, so concurrent retirement
+    /// cannot pass the check and then race the record replacement.
+    public func submit(
+        _ request: ActivityRequest,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) throws(ActivityBrokerError) -> ActivityBrokerSnapshot? {
+        let activity: Activity
+        do {
+            activity = try Activity(validating: request)
+        } catch {
+            throw .invalid(error)
+        }
+        guard activity.identity == lease.identity,
+              ownershipGenerations[lease.identity] == lease.generation else {
+            return nil
+        }
+        return try lease.withSubmissionAdmission {
+            () throws(ActivityBrokerError) -> ActivityBrokerSnapshot in
+            try submit(activity, ownershipGeneration: lease.generation)
+        }
+    }
+
+    private func submit(
+        _ activity: Activity,
+        ownershipGeneration: UInt64?
+    ) throws(ActivityBrokerError) -> ActivityBrokerSnapshot {
         let identity = activity.identity
         let submissionSequence: UInt64
 
@@ -148,7 +503,8 @@ public actor ActivityBroker {
                 submissionSequence: submissionSequence,
                 revision: revision
             ),
-            expiryRevision: nil
+            expiryRevision: nil,
+            ownershipGeneration: ownershipGeneration
         )
 
         if case let .expires(ttl) = activity.lifecycle {
@@ -162,10 +518,35 @@ public actor ActivityBroker {
     /// Removes one identity explicitly. Returns false and publishes nothing when it is absent.
     @discardableResult
     public func cancel(_ identity: ActivityIdentity) -> Bool {
-        guard records.removeValue(forKey: identity) != nil else { return false }
-        expiryTasks.removeValue(forKey: identity)?.cancel()
-        _ = publishMutation()
-        return true
+        ownershipCoordinator.invalidateClaims(for: identity)
+        ownershipGenerations.removeValue(forKey: identity)
+        return removeRecord(identity)
+    }
+
+    /// Removes one identity only when it still has the caller-owned revision.
+    /// The comparison and removal occur in this single actor-isolated operation,
+    /// with no suspension point between them.
+    @discardableResult
+    public func cancel(_ identity: ActivityIdentity, ifRevision revision: UInt64) -> Bool {
+        guard records[identity]?.presented.revision == revision else { return false }
+        ownershipCoordinator.invalidateClaims(for: identity)
+        ownershipGenerations.removeValue(forKey: identity)
+        return removeRecord(identity)
+    }
+
+    /// Removes the identity only while this lease remains the latest generation.
+    /// A retiring lease may clean up its own generation, but a successor claim
+    /// makes the older cleanup fail closed before it can touch shared state.
+    @discardableResult
+    public func cancel(_ identity: ActivityIdentity, ifOwnedBy lease: ActivityOwnershipLease) -> Bool {
+        guard identity == lease.identity,
+              ownershipGenerations[identity] == lease.generation,
+              records[identity]?.ownershipGeneration == lease.generation else {
+            return false
+        }
+        return lease.withCleanupAdmission {
+            removeRecord(identity)
+        } ?? false
     }
 
     /// Atomically rejects an action that no longer belongs to the current broker revision.
@@ -183,6 +564,8 @@ public actor ActivityBroker {
               current.activity.action?.intent == intent else {
             return false
         }
+        ownershipCoordinator.invalidateClaims(for: identity)
+        ownershipGenerations.removeValue(forKey: identity)
         records.removeValue(forKey: identity)
         expiryTasks.removeValue(forKey: identity)?.cancel()
         _ = publishMutation()
@@ -244,9 +627,12 @@ public actor ActivityBroker {
     }
 
     public func workState() -> ActivityBrokerWorkState {
-        ActivityBrokerWorkState(
+        let ownershipWork = ownershipCoordinator.workState()
+        return ActivityBrokerWorkState(
             scheduledExpiryCount: expiryTasks.count,
-            subscriberCount: subscribers.count
+            subscriberCount: subscribers.count,
+            activeOwnershipCount: ownershipWork.retainedIdentityCount,
+            pendingOwnershipIntentCount: ownershipWork.pendingIntentCount
         )
     }
 
@@ -265,9 +651,22 @@ public actor ActivityBroker {
 
     private func expire(_ identity: ActivityIdentity, revision: UInt64) {
         guard records[identity]?.expiryRevision == revision else { return }
+        if let ownershipGeneration = records[identity]?.ownershipGeneration,
+           ownershipGenerations[identity] == ownershipGeneration {
+            ownershipCoordinator.invalidateClaims(for: identity)
+            ownershipGenerations.removeValue(forKey: identity)
+        }
         records.removeValue(forKey: identity)
         expiryTasks.removeValue(forKey: identity)
         _ = publishMutation()
+    }
+
+    @discardableResult
+    private func removeRecord(_ identity: ActivityIdentity) -> Bool {
+        guard records.removeValue(forKey: identity) != nil else { return false }
+        expiryTasks.removeValue(forKey: identity)?.cancel()
+        _ = publishMutation()
+        return true
     }
 
     private func expiryStopped(_ identity: ActivityIdentity, revision: UInt64) {

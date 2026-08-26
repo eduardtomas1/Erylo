@@ -1,0 +1,117 @@
+# Erylo repository ignore policy
+#
+# Keep collaboration inputs visible. In particular, do not add broad rules for
+# Package.resolved, *.xcodeproj, *.xcworkspace, *.entitlements, docs assets, or
+# Tests/Fixtures. Generated output belongs in one of the staging directories
+# below so source-like files are not hidden accidentally.
+
+# macOS filesystem metadata
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+
+# Swift Package Manager and compiler output
+.build/
+.index-build/
+.index-store/
+.sourcekit-lsp/
+.swiftpm/xcode/package.xcworkspace/xcuserdata/
+/.swiftpm/xcode/xcuserdata/
+
+# Xcode user state and generated build/test products
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.xcresult/
+*.xcarchive/
+*.dSYM/
+*.dSYM.zip
+/Build/
+/build/
+/SourcePackages/
+
+# Signing, notarization, and service credentials
+# Public certificates and entitlements may be intentional source; private keys,
+# provisioning profiles, and keychains must be supplied outside Git.
+/.secrets/
+/Secrets/
+/credentials/
+/Credentials/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.p12
+*.pfx
+AuthKey_*.p8
+*.mobileprovision
+*.provisionprofile
+*.keychain
+*.keychain-db
+/*.pem
+/*.key
+
+# Release, Sparkle, and notarization staging
+# Appcast XML and other reviewed release metadata are intentionally not ignored.
+/.release/
+/artifacts/
+/dist/
+/release-output/
+/*.app
+/*.dmg
+/*.pkg
+/*.zip
+/*.delta
+/*.sparkle_signature
+
+# Local diagnostics, crash reports, Instruments captures, and temporary output
+/.diagnostics/
+/Diagnostics/Local/
+/Logs/
+/crash-reports/
+/Instruments/
+/.tmp/
+/tmp/
+/temp/
+*.logarchive/
+/*.crash
+/*.ips
+/*.spin
+/*.hang
+/*.trace
+/core.*
+
+# Editors and developer-tool caches
+.cache/
+.idea/
+.fleet/
+.swiftlint.cache
+.swift-format-cache/
+.vscode/*.local.*
+.vscode/settings.local.json
+*.swp
+*.swo
+*~
+
+# Default macOS capture names at the repository root only. Deliberate screenshots
+# and documentation assets in named source directories remain trackable.
+/Screen Shot *.png
+/Screenshot *.png
+/Screen Recording *.*
+
+# Local Codex/worktree scratch state. Keep repository-level Codex instructions
+# trackable by avoiding a blanket /.codex/ rule.
+/.codex/worktrees/
+/.codex/sessions/
+/.codex/tmp/
+/.codex-scratch/
+/.codex-worktree/
+/.worktrees/

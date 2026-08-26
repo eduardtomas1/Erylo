@@ -1,0 +1,30 @@
+# Normalize collaborative text while leaving Git free to detect unlisted files.
+* text=auto
+
+*.swift         text eol=lf diff=swift
+*.md            text eol=lf diff=markdown
+*.txt           text eol=lf
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.xcconfig      text eol=lf
+*.pbxproj       text eol=lf
+*.entitlements  text eol=lf
+*.strings       text eol=lf
+*.stringsdict   text eol=lf
+*.xcstrings     text eol=lf
+Package.resolved text eol=lf
+
+# Generated and design assets should never receive line-ending conversion.
+*.png     -text -diff
+*.jpg     -text -diff
+*.jpeg    -text -diff
+*.gif     -text -diff
+*.webp    -text -diff
+*.icns    -text -diff
+*.pdf     -text -diff
+*.dmg     -text -diff
+*.pkg     -text -diff
+*.zip     -text -diff
+*.xcarchive -text -diff

@@ -1,0 +1,91 @@
+name: Continuous verification
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verification-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-controls:
+    name: Repository controls
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify repository hygiene
+        run: .github/scripts/check-repository.sh
+
+  build-and-test:
+    name: Build and test (when configured)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Discover the canonical build route
+        id: build-route
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -x Scripts/ci.sh ]]; then
+            echo "route=script" >> "$GITHUB_OUTPUT"
+            echo "Using the repository-owned Scripts/ci.sh entry point."
+          elif [[ -f Package.swift ]]; then
+            echo "route=swiftpm" >> "$GITHUB_OUTPUT"
+            echo "Using Swift Package Manager because Package.swift is present."
+          elif find . -maxdepth 3 \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) -print -quit | grep -q .; then
+            echo "route=xcode-unconfigured" >> "$GITHUB_OUTPUT"
+            echo "An Xcode project exists, but no repository-owned CI entry point defines its scheme and destination."
+          else
+            echo "route=none" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Build/test not run::No Package.swift, Xcode project, or executable Scripts/ci.sh exists yet."
+            {
+              echo "### Build/test status"
+              echo
+              echo "Not run: this revision does not contain a buildable foundation. Repository controls still ran."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Run repository-owned CI entry point
+        if: steps.build-route.outputs.route == 'script'
+        run: Scripts/ci.sh
+
+      - name: Require Swift 6
+        if: steps.build-route.outputs.route == 'swiftpm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift --version
+          swift_major="$(swift --version | sed -nE 's/.*Swift version ([0-9]+).*/\1/p' | head -n 1)"
+          if [[ -z "$swift_major" || "$swift_major" -lt 6 ]]; then
+            echo "::error::Swift 6 or newer is required; select an appropriate Xcode toolchain."
+            exit 1
+          fi
+
+      - name: Build and test Swift package
+        if: steps.build-route.outputs.route == 'swiftpm'
+        run: swift test --parallel
+
+      - name: Require an explicit Xcode CI command
+        if: steps.build-route.outputs.route == 'xcode-unconfigured'
+        shell: bash
+        run: |
+          echo "::error title=CI alignment required::Add an executable Scripts/ci.sh that selects the shared scheme and macOS destination. The workflow will not guess an Xcode build command."
+          exit 1

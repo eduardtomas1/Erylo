@@ -27,6 +27,7 @@ public struct PanelSurfaceView: View {
                     height: layout.surfaceFrame.height,
                     alignment: .top
                 )
+                .offset(y: layout.surfaceTopInset)
                 .contentShape(
                     RoundedRectangle(cornerRadius: layout.cornerRadius, style: .continuous)
                 )
@@ -34,7 +35,7 @@ public struct PanelSurfaceView: View {
                     model.send(.primaryAction)
                 }
                 .onHover { isHovering in
-                    model.send(isHovering ? .hoverBegan : .hoverEnded)
+                    model.setPointerInside(isHovering)
                 }
                 .onDrop(
                     of: [UTType.fileURL.identifier],
@@ -51,6 +52,12 @@ public struct PanelSurfaceView: View {
             alignment: .top
         )
         .animation(animation, value: model.state)
+        .onChange(of: reduceMotion, initial: true) { _, newValue in
+            model.updateReduceMotion(newValue)
+        }
+        .onDisappear {
+            model.cancelPendingInteractions()
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Erylo activity surface")
     }
@@ -64,24 +71,30 @@ public struct PanelSurfaceView: View {
 
     @ViewBuilder
     private var content: some View {
-        switch model.state {
-        case .hidden:
-            EmptyView()
-        case .compact:
-            statusLine(title: "Erylo", detail: nil)
-        case .peek:
-            statusLine(title: "Erylo", detail: "Activity surface spike")
-        case .expanded:
-            VStack(spacing: 10) {
-                statusLine(title: "Foundation", detail: "No providers enabled")
-                Text("Click to collapse")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        Group {
+            switch model.state {
+            case .hidden:
+                EmptyView()
+            case .compact:
+                statusLine(title: "Erylo", detail: nil)
+            case .peek:
+                statusLine(title: "Erylo", detail: "Activity surface spike")
+            case .expanded:
+                VStack(spacing: 10) {
+                    statusLine(title: "Foundation", detail: "No providers enabled")
+                    Text("Click to collapse")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(20)
+            case .dropTarget:
+                statusLine(title: "Drop target", detail: "File transport is not implemented")
             }
-            .padding(20)
-        case .dropTarget:
-            statusLine(title: "Drop target", detail: "File transport is not implemented")
         }
+        .id(model.state)
+        .transition(
+            .opacity.combined(with: .scale(scale: 0.98, anchor: .top))
+        )
     }
 
     private func statusLine(title: String, detail: String?) -> some View {

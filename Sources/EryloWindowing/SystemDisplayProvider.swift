@@ -9,7 +9,8 @@ public final class SystemDisplayProvider: EnabledDisplayProviding {
 
     public func enabledDisplays() -> [DisplaySnapshot] {
         let screens = NSScreen.screens
-        let mainQuartzFrame = CGDisplayBounds(CGMainDisplayID())
+        let mainDisplayID = CGMainDisplayID()
+        let mainQuartzFrame = CGDisplayBounds(mainDisplayID)
 
         return Self.activeDisplayIDs().compactMap { directDisplayID in
             guard CGDisplayMirrorsDisplay(directDisplayID) == kCGNullDirectDisplay else {
@@ -28,7 +29,8 @@ public final class SystemDisplayProvider: EnabledDisplayProviding {
                     visibleFrame: screen?.visibleFrame ?? frame,
                     backingScaleFactor: screen?.backingScaleFactor ?? 1,
                     topEdgeOcclusion: screen.flatMap(Self.topEdgeOcclusion)
-                )
+                ),
+                isMain: directDisplayID == mainDisplayID
             )
         }
     }

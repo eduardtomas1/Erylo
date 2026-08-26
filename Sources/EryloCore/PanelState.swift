@@ -21,9 +21,11 @@ public enum PanelEvent: Equatable, Sendable {
 /// The deliberately small state reducer used by the feasibility surface.
 public struct PanelStateMachine: Equatable, Sendable {
     public private(set) var state: PanelPresentationState
+    private var stateBeforeDropTarget: PanelPresentationState?
 
     public init(initialState: PanelPresentationState = .hidden) {
         state = initialState
+        stateBeforeDropTarget = nil
     }
 
     @discardableResult
@@ -31,6 +33,7 @@ public struct PanelStateMachine: Equatable, Sendable {
         switch (state, event) {
         case (_, .hide):
             state = .hidden
+            stateBeforeDropTarget = nil
         case (.hidden, .show):
             state = .compact
         case (.compact, .hoverBegan):
@@ -42,11 +45,17 @@ public struct PanelStateMachine: Equatable, Sendable {
         case (.expanded, .primaryAction), (.expanded, .dismiss):
             state = .compact
         case (.compact, .dragEntered), (.peek, .dragEntered), (.expanded, .dragEntered):
+            stateBeforeDropTarget = state
             state = .dropTarget
-        case (.dropTarget, .dragExited), (.dropTarget, .dismiss):
+        case (.dropTarget, .dragExited):
+            state = stateBeforeDropTarget ?? .compact
+            stateBeforeDropTarget = nil
+        case (.dropTarget, .dismiss):
             state = .compact
+            stateBeforeDropTarget = nil
         case (.dropTarget, .dropCompleted):
             state = .expanded
+            stateBeforeDropTarget = nil
         default:
             break
         }

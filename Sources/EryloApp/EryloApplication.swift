@@ -30,7 +30,16 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     override init() {
         let activityBroker = ActivityBroker()
         self.activityBroker = activityBroker
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["ERYLO_PREVIEW_SCENARIO"] == "timer",
+           let snapshot = try? ActivitySurfacePreviewCatalog.timer.snapshot() {
+            activityModel = SurfaceActivityModel(previewSnapshot: snapshot)
+        } else {
+            activityModel = SurfaceActivityModel(broker: activityBroker)
+        }
+        #else
         activityModel = SurfaceActivityModel(broker: activityBroker)
+        #endif
         super.init()
     }
     private var updateRuntime: UpdateRuntime?

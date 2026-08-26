@@ -170,9 +170,7 @@ private struct SurfaceHarness {
             panelModel.send(.primaryAction)
             check(panelModel.state == .compact, "primary shortcut reveals an empty hidden surface")
             panelModel.send(.primaryAction)
-            check(panelModel.state == .expanded, "revealed surface can enter deliberate expanded interaction")
-            panelModel.send(.primaryAction)
-            check(panelModel.state == .hidden, "closing an empty deliberate expansion returns to invisible rest")
+            check(panelModel.state == .hidden, "second empty shortcut returns to invisible rest")
 
             let fallback = try await broker.submit(
                 request(id: "fallback", priority: 30, title: "Fallback")

@@ -16,32 +16,44 @@ public struct PanelSurfaceView: View {
         let layout = model.layout
         let content = model.content
         let accessibility = model.accessibility
+        let silhouette = TopEdgeSurfaceShape(
+            attachment: layout.attachment,
+            topCornerRadius: layout.topCornerRadius,
+            lowerCornerRadius: layout.cornerRadius
+        )
+        let contentHeight = max(
+            layout.surfaceFrame.height - layout.surfaceContentTopInset,
+            0
+        )
 
         ZStack(alignment: .top) {
-            RoundedRectangle(cornerRadius: layout.cornerRadius, style: .continuous)
-                .fill(EryloPalette.ink)
-                .contentShape(
-                    RoundedRectangle(cornerRadius: layout.cornerRadius, style: .continuous)
+            silhouette
+                .fill(
+                    layout.attachment == .notchIntegrated
+                        ? Color.black
+                        : EryloPalette.ink
                 )
-                .onTapGesture {
-                    model.send(.primaryAction)
-                }
-                .overlay {
-                    if model.state == .dropTarget {
-                        RoundedRectangle(cornerRadius: layout.cornerRadius - 3, style: .continuous)
-                            .stroke(
-                                EryloPalette.sky,
-                                style: StrokeStyle(lineWidth: 2, dash: [7, 5])
-                            )
-                            .padding(5)
-                            .accessibilityHidden(true)
-                    }
-                }
-                .overlay(alignment: .top) {
+                .accessibilityHidden(true)
+
+            if layout.attachment == .notchIntegrated,
+               model.state == .compact {
+                notchCompactContent(
+                    content,
+                    surfaceWidth: layout.surfaceFrame.width,
+                    surfaceHeight: layout.surfaceFrame.height,
+                    occlusionWidth: model.displayGeometry.topEdgeOcclusion?.frame.width ?? 0
+                )
+                .opacity(model.isPointerInside ? 1 : 0.82)
+                .animation(.easeOut(duration: 0.12), value: model.isPointerInside)
+            } else {
+                VStack(spacing: 0) {
+                    Color.clear
+                        .frame(height: layout.surfaceContentTopInset)
+                        .accessibilityHidden(true)
                     surfaceContent(content)
                         .frame(
                             width: layout.surfaceFrame.width,
-                            height: layout.surfaceFrame.height
+                            height: contentHeight
                         )
                         .clipped()
                 }
@@ -50,19 +62,34 @@ public struct PanelSurfaceView: View {
                     height: layout.surfaceFrame.height,
                     alignment: .top
                 )
-                .offset(y: layout.surfaceTopInset)
-                .onHover { isHovering in
-                    model.setPointerInside(isHovering)
-                }
-                .onDrop(
-                    of: [UTType.fileURL.identifier],
-                    isTargeted: dropTargetBinding,
-                    perform: { _ in
-                        // The state is an honest affordance only; File Hold transport is not wired.
-                        false
-                    }
-                )
+            }
         }
+        .frame(
+            width: layout.surfaceFrame.width,
+            height: layout.surfaceFrame.height,
+            alignment: .top
+        )
+        .clipShape(silhouette)
+        .contentShape(silhouette)
+        .onTapGesture {
+            model.send(.primaryAction)
+        }
+        .overlay {
+            if model.state == .dropTarget {
+                silhouette
+                    .stroke(EryloPalette.sky.opacity(0.72), lineWidth: 1)
+                    .accessibilityHidden(true)
+            }
+        }
+        .offset(y: layout.surfaceTopInset)
+        .onDrop(
+            of: [UTType.fileURL.identifier],
+            isTargeted: dropTargetBinding,
+            perform: { _ in
+                // The state is an honest affordance only; File Hold transport is not wired.
+                false
+            }
+        )
         .frame(
             width: model.metrics.maximumSize.width,
             height: model.metrics.maximumSize.height,
@@ -87,6 +114,77 @@ public struct PanelSurfaceView: View {
             get: { model.state == .dropTarget },
             set: { model.send($0 ? .dragEntered : .dragExited) }
         )
+    }
+
+    private func notchCompactContent(
+        _ content: ActivitySurfaceContent,
+        surfaceWidth: CGFloat,
+        surfaceHeight: CGFloat,
+        occlusionWidth: CGFloat
+    ) -> some View {
+        let resolvedOcclusionWidth = min(max(occlusionWidth, 0), surfaceWidth)
+        let wingWidth = max((surfaceWidth - resolvedOcclusionWidth) / 2, 0)
+        return VStack(spacing: 0) {
+            Spacer(minLength: 0)
+            HStack(spacing: 0) {
+                notchCompactLeading(content)
+                    .frame(width: wingWidth)
+                Color.clear
+                    .frame(width: resolvedOcclusionWidth)
+                    .accessibilityHidden(true)
+                notchCompactTrailing(content)
+                    .frame(width: wingWidth)
+            }
+            .frame(height: 14)
+            Color.clear
+                .frame(height: 2)
+                .accessibilityHidden(true)
+        }
+        .frame(width: surfaceWidth, height: surfaceHeight)
+        .clipped()
+        .accessibilityHidden(true)
+    }
+
+    @ViewBuilder
+    private func notchCompactLeading(_ content: ActivitySurfaceContent) -> some View {
+        switch content.primary {
+        case let .activity(item):
+            Image(systemName: item.symbolName)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(accentColor(item.accent))
+        case .degraded:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(EryloPalette.amber)
+        case .empty:
+            Text(SurfaceStrings.compactQuietTitle)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(EryloPalette.cloud)
+        case .hidden, .dropTarget:
+            EmptyView()
+        }
+    }
+
+    @ViewBuilder
+    private func notchCompactTrailing(_ content: ActivitySurfaceContent) -> some View {
+        switch content.primary {
+        case let .activity(item):
+            Text(item.shortProgressValue ?? item.kindLabel)
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(EryloPalette.mist)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+        case .degraded:
+            Text(SurfaceStrings.compactPaused)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(EryloPalette.mist)
+        case .empty:
+            Text(SurfaceStrings.compactReady)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(EryloPalette.mist)
+        case .hidden, .dropTarget:
+            EmptyView()
+        }
     }
 
     @ViewBuilder
@@ -115,7 +213,7 @@ public struct PanelSurfaceView: View {
             }
         }
         .id(ContentIdentity(content: content))
-        .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: .top)))
+        .transition(.opacity)
     }
 
     private func compactActivity(_ item: ActivitySurfaceItem) -> some View {
@@ -139,32 +237,21 @@ public struct PanelSurfaceView: View {
     }
 
     private func peekActivity(_ item: ActivitySurfaceItem) -> some View {
-        HStack(spacing: 11) {
-            activitySymbol(item, size: 16)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.kindLabel.uppercased())
-                    .font(.system(size: 9, weight: .semibold))
-                    .tracking(0.9)
-                    .foregroundStyle(accentColor(item.accent))
-                Text(item.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(EryloPalette.cloud)
-                    .lineLimit(1)
-                if let detail = item.detail {
-                    Text(detail)
-                        .font(.system(size: 11))
-                        .foregroundStyle(EryloPalette.mist)
-                        .lineLimit(1)
-                }
-            }
+        HStack(spacing: 9) {
+            activitySymbol(item, size: 12)
+            Text(item.title)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(EryloPalette.cloud)
+                .lineLimit(1)
             Spacer(minLength: 0)
-            if let progressValue = item.shortProgressValue {
-                Text(progressValue)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(EryloPalette.cloud)
+            if let value = item.detail ?? item.shortProgressValue {
+                Text(value)
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .foregroundStyle(EryloPalette.mist)
+                    .lineLimit(1)
             }
         }
-        .padding(.horizontal, 17)
+        .padding(.horizontal, 16)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(item.accessibilitySummary)
         .accessibilitySortPriority(3)
@@ -309,24 +396,29 @@ public struct PanelSurfaceView: View {
     }
 
     private func emptyContent(title: String, detail: String?, expanded: Bool) -> some View {
-        HStack(spacing: 10) {
-            Circle()
-                .fill(EryloPalette.mint)
-                .frame(width: 7, height: 7)
-                .accessibilityHidden(true)
+        HStack(spacing: expanded ? 16 : 0) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(title)
-                    .font(.system(size: expanded ? 16 : 13, weight: .semibold))
+                    .font(.system(size: expanded ? 14 : 12, weight: .semibold))
                     .foregroundStyle(EryloPalette.cloud)
                 if let detail {
                     Text(detail)
-                        .font(.system(size: 11))
+                        .font(.system(size: 10))
                         .foregroundStyle(EryloPalette.mist)
                 }
             }
-            Spacer(minLength: 0)
+            if expanded {
+                Text(SurfaceStrings.primaryShortcutKey)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(EryloPalette.mist)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(EryloPalette.graphite, in: Capsule(style: .continuous))
+                    .accessibilityHidden(true)
+            }
         }
-        .padding(.horizontal, expanded ? 20 : 15)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.horizontal, expanded ? 16 : 14)
         .accessibilityElement(children: .combine)
         .accessibilityLabel([title, detail].compactMap { $0 }.joined(separator: ", "))
     }
@@ -397,7 +489,78 @@ public struct PanelSurfaceView: View {
     private var animation: Animation {
         model.motionStyle == .reduced
             ? .easeOut(duration: 0.12)
-            : .spring(response: 0.22, dampingFraction: 0.88)
+            : .spring(response: 0.24, dampingFraction: 0.92)
+    }
+}
+
+/// One continuous top-edge silhouette. On a notched display, small concave
+/// outer curls make the bezel flow into the body; notchless screens use a
+/// conventional rounded capsule/card.
+private struct TopEdgeSurfaceShape: Shape {
+    let attachment: PanelAttachment
+    var topCornerRadius: CGFloat
+    var lowerCornerRadius: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get {
+            AnimatablePair(topCornerRadius, lowerCornerRadius)
+        }
+        set {
+            topCornerRadius = newValue.first
+            lowerCornerRadius = newValue.second
+        }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        guard rect.width > 0, rect.height > 0 else { return Path() }
+        guard attachment == .notchIntegrated else {
+            var rounded = Path()
+            let radius = min(
+                max(lowerCornerRadius, 0),
+                min(rect.width, rect.height) / 2
+            )
+            rounded.addRoundedRect(
+                in: rect,
+                cornerSize: CGSize(width: radius, height: radius),
+                style: .continuous
+            )
+            return rounded
+        }
+
+        let topRadius = min(
+            max(topCornerRadius, 0),
+            min(rect.width / 4, rect.height / 4)
+        )
+        let bottomRadius = min(
+            max(lowerCornerRadius, 0),
+            min((rect.width - topRadius * 2) / 2, rect.height - topRadius)
+        )
+        let leftWall = rect.minX + topRadius
+        let rightWall = rect.maxX - topRadius
+
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addQuadCurve(
+            to: CGPoint(x: leftWall, y: rect.minY + topRadius),
+            control: CGPoint(x: leftWall, y: rect.minY)
+        )
+        path.addLine(to: CGPoint(x: leftWall, y: rect.maxY - bottomRadius))
+        path.addQuadCurve(
+            to: CGPoint(x: leftWall + bottomRadius, y: rect.maxY),
+            control: CGPoint(x: leftWall, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rightWall - bottomRadius, y: rect.maxY))
+        path.addQuadCurve(
+            to: CGPoint(x: rightWall, y: rect.maxY - bottomRadius),
+            control: CGPoint(x: rightWall, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rightWall, y: rect.minY + topRadius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX, y: rect.minY),
+            control: CGPoint(x: rightWall, y: rect.minY)
+        )
+        path.closeSubpath()
+        return path
     }
 }
 
@@ -419,12 +582,20 @@ private struct SurfaceActionButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(EryloPalette.ink)
+            .foregroundStyle(EryloPalette.cloud)
             .padding(.horizontal, 13)
             .padding(.vertical, 7)
             .background(
                 Capsule(style: .continuous)
-                    .fill(configuration.isPressed ? EryloPalette.cloud : EryloPalette.sky)
+                    .fill(
+                        configuration.isPressed
+                            ? EryloPalette.graphite.opacity(0.72)
+                            : EryloPalette.graphite
+                    )
+                    .overlay {
+                        Capsule(style: .continuous)
+                            .stroke(EryloPalette.cloud.opacity(0.12), lineWidth: 0.5)
+                    }
             )
             .scaleEffect(configuration.isPressed ? 0.98 : 1)
     }

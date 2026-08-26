@@ -30,12 +30,12 @@ public struct PanelMetrics: Equatable, Sendable {
 
     public static let feasibility = PanelMetrics(
         maximumSize: CGSize(width: 560, height: 240),
-        compactSize: CGSize(width: 180, height: 38),
-        peekSize: CGSize(width: 260, height: 64),
-        expandedSize: CGSize(width: 440, height: 190),
-        dropTargetSize: CGSize(width: 480, height: 210),
-        notchHorizontalPadding: 24,
-        notchlessTopInset: 6
+        compactSize: CGSize(width: 240, height: 32),
+        peekSize: CGSize(width: 284, height: 64),
+        expandedSize: CGSize(width: 368, height: 156),
+        dropTargetSize: CGSize(width: 392, height: 168),
+        notchHorizontalPadding: 30,
+        notchlessTopInset: 8
     )
 }
 
@@ -164,6 +164,15 @@ public struct PanelLayout: Equatable, Sendable {
     public let hitRegion: HitRegion
     public let attachment: PanelAttachment
     public let surfaceTopInset: CGFloat
+    /// Concave outer curl that visually joins the surface to the top bezel.
+    /// Zero on notchless displays.
+    package let topCornerRadius: CGFloat
+    /// Top inset that keeps rendered content below the physical occlusion and
+    /// its shoulder transition.
+    package let surfaceContentTopInset: CGFloat
+    /// Stable top-edge envelope used to enter and retain hover independently
+    /// from the lower shelf's click geometry.
+    package let hoverAnchorRegion: HitRegion
 
     public init(
         display: DisplayGeometry,
@@ -198,18 +207,86 @@ public struct PanelLayout: Equatable, Sendable {
             height: size.height
         )
 
-        cornerRadius = switch state {
-        case .hidden:
-            0
-        case .compact, .peek:
-            size.height / 2
-        case .expanded, .dropTarget:
-            min(28, size.height / 2)
+        if let occlusion = display.topEdgeOcclusion {
+            topCornerRadius = switch state {
+            case .hidden:
+                0
+            case .compact:
+                6
+            case .peek:
+                12
+            case .expanded:
+                18
+            case .dropTarget:
+                20
+            }
+            surfaceContentTopInset = state == .compact
+                ? 0
+                : min(max(occlusion.frame.height, 0), size.height)
+
+            let compactAnchorWidth = min(
+                max(
+                    metrics.compactSize.width,
+                    occlusion.frame.width + metrics.notchHorizontalPadding * 2
+                ),
+                maximumSize.width
+            )
+            let anchorHeight = min(max(occlusion.frame.height, 0), maximumSize.height)
+            hoverAnchorRegion = anchorHeight == 0
+                ? .empty
+                : .roundedRectangle(
+                    CGRect(
+                        x: (maximumSize.width - compactAnchorWidth) / 2,
+                        y: maximumSize.height - anchorHeight,
+                        width: compactAnchorWidth,
+                        height: anchorHeight
+                    ),
+                    cornerRadius: 0
+                )
+        } else {
+            topCornerRadius = 0
+            surfaceContentTopInset = 0
+            hoverAnchorRegion = .empty
         }
 
-        hitRegion = state == .hidden
-            ? .empty
-            : .roundedRectangle(surfaceFrame, cornerRadius: cornerRadius)
+        cornerRadius = switch (attachment, state) {
+        case (_, .hidden):
+            0
+        case (.notchlessPill, .compact), (.notchlessPill, .peek):
+            size.height / 2
+        case (.notchIntegrated, .compact):
+            min(14, size.height / 2)
+        case (.notchIntegrated, .peek):
+            min(18, size.height / 2)
+        case (_, .expanded), (_, .dropTarget):
+            min(22, size.height / 2)
+        }
+
+        if state == .hidden {
+            hitRegion = .empty
+        } else if attachment == .notchIntegrated {
+            // The concave top corners are transparent. Accept clicks only in an
+            // inscribed visible shelf; the global pointer monitor owns the wider
+            // noninteractive hover envelope.
+            let bodyHeight = state == .compact
+                ? size.height
+                : max(size.height - surfaceContentTopInset, 0)
+            let bodyWidth = max(size.width - topCornerRadius * 2, 0)
+            let bodyFrame = CGRect(
+                x: surfaceFrame.minX + topCornerRadius,
+                y: surfaceFrame.minY,
+                width: bodyWidth,
+                height: bodyHeight
+            )
+            hitRegion = bodyHeight == 0 || bodyWidth == 0
+                ? .empty
+                : .roundedRectangle(
+                    bodyFrame,
+                    cornerRadius: min(cornerRadius, bodyHeight / 2)
+                )
+        } else {
+            hitRegion = .roundedRectangle(surfaceFrame, cornerRadius: cornerRadius)
+        }
     }
 
     private static func requestedSurfaceSize(

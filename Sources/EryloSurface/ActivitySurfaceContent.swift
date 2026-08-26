@@ -270,7 +270,14 @@ public struct PanelSurfaceAccessibility: Equatable, Sendable {
         case .hidden:
             ""
         case .compact, .peek:
-            SurfaceStrings.expandHint
+            switch content.primary {
+            case .activity:
+                SurfaceStrings.expandHint
+            case .empty, .degraded:
+                SurfaceStrings.hideHint
+            case .hidden, .dropTarget:
+                ""
+            }
         case .expanded:
             SurfaceStrings.collapseHint
         case .dropTarget:

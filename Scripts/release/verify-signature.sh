@@ -1,8 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+script_dir="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=Scripts/release/lib.sh
 source "$script_dir/lib.sh"
 
@@ -37,7 +39,7 @@ autoupdate="$framework/Versions/B/Autoupdate"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$app"
 
 temp_dir="$(release_make_temp_dir "$repo_root" verify-signature)"
-trap '/bin/rm -rf -- "$temp_dir"' EXIT
+trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
 /usr/bin/codesign --display --verbose=4 "$app" >"$temp_dir/details.out" 2>"$temp_dir/details.err"
 /usr/bin/grep -Eq '^Authority=Developer ID Application:' "$temp_dir/details.err" \
     || release_die "application is not signed with a Developer ID Application identity"
@@ -57,7 +59,8 @@ fi
 
 if [[ "$mode" == "notarized" ]]; then
     release_require_notary_tools
-    /usr/bin/xcrun stapler validate "$app" >/dev/null
+    release_xcrun stapler validate "$app" >/dev/null
+    release_assert_toolchain
 fi
 
 printf 'Signature verification passed (%s).\n' "$mode"

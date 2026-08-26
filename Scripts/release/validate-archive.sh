@@ -1,8 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+script_dir="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=Scripts/release/lib.sh
 source "$script_dir/lib.sh"
 
@@ -37,7 +39,7 @@ release_require_command zipinfo
 archive="$(release_existing_path "$repo_root" "$archive_input")"
 app="$(release_existing_path "$repo_root" "$app_input")"
 [[ -f "$archive" && "$archive" == *.zip && ! -L "$archive" ]] || release_die "archive input must be a staged ZIP file"
-[[ -d "$app" && "$(basename "$app")" == "Erylo.app" && ! -L "$app" ]] || release_die "app input must be a staged Erylo.app"
+[[ -d "$app" && "$(/usr/bin/basename "$app")" == "Erylo.app" && ! -L "$app" ]] || release_die "app input must be a staged Erylo.app"
 if [[ "$post_staple" == true ]]; then
     "$script_dir/validate-app.sh" --post-staple "$app" >/dev/null
 else
@@ -45,7 +47,7 @@ else
 fi
 
 temp_dir="$(release_make_temp_dir "$repo_root" validate-archive)"
-trap '/bin/rm -rf -- "$temp_dir"' EXIT
+trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
 entries_file="$temp_dir/archive-entries.txt"
 /usr/bin/zipinfo -1 "$archive" > "$entries_file"
 /usr/bin/ruby -e '
@@ -62,7 +64,7 @@ if /usr/bin/zipinfo -v "$archive" | /usr/bin/grep -Eq 'file security status:[[:s
     release_die "encrypted archives are not accepted"
 fi
 
-/bin/mkdir -p "$temp_dir/extracted"
+release_make_directory "$repo_root" "$temp_dir/extracted" >/dev/null
 COPYFILE_DISABLE=1 /usr/bin/ditto -x -k "$archive" "$temp_dir/extracted"
 extracted_app="$temp_dir/extracted/Erylo.app"
 [[ -d "$extracted_app" && ! -L "$extracted_app" ]] || release_die "archive did not extract one Erylo.app"
@@ -92,7 +94,10 @@ fi
           target = File.readlink(path)
           resolved = File.realpath(path)
           abort("symlink escapes app: #{relative}") unless resolved.start_with?(prefix)
-          entries << [relative, "link", mode, target]
+          # macOS does not use symlink permission bits, and archive extraction
+          # can report them through the caller umask. Compare the meaningful
+          # link target while retaining exact modes for files/directories.
+          entries << [relative, "link", 0, target]
         else
           abort("unsupported archive entry type: #{relative}")
         end

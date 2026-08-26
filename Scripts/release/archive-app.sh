@@ -1,8 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+script_dir="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=Scripts/release/lib.sh
 source "$script_dir/lib.sh"
 
@@ -57,14 +59,14 @@ output="$(release_output_path "$repo_root" "$output_input")"
 [[ "$output" == *.zip ]] || release_die "archive output must use the .zip extension"
 
 if [[ -z "$source_date_epoch" ]]; then
-    source_date_epoch="$(git show -s --format=%ct HEAD)"
+    source_date_epoch="$(release_source_epoch "$repo_root")"
 fi
 [[ "$source_date_epoch" =~ ^[0-9]{9,12}$ && "$source_date_epoch" -ge 315532800 ]] \
     || release_die "SOURCE_DATE_EPOCH must be a valid post-1980 Unix timestamp"
 
 temp_dir="$(release_make_temp_dir "$repo_root" archive-app)"
-trap '/bin/rm -rf -- "$temp_dir"' EXIT
-/bin/mkdir -p "$temp_dir/root"
+trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
+release_make_directory "$repo_root" "$temp_dir/root" >/dev/null
 COPYFILE_DISABLE=1 /usr/bin/ditto "$app" "$temp_dir/root/Erylo.app"
 
 /usr/bin/ruby -e '
@@ -94,6 +96,5 @@ if [[ "$post_staple" == true ]]; then
 fi
 "$script_dir/validate-archive.sh" "${validate_archive_arguments[@]}" >/dev/null
 
-release_remove_path "$repo_root" "$output"
-/bin/mv "$archive_temp" "$output"
+release_publish_file "$repo_root" "$archive_temp" "$output"
 printf 'Deterministic ZIP archive created at %s\n' "$output"

@@ -1,8 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+script_dir="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=Scripts/release/lib.sh
 source "$script_dir/lib.sh"
 
@@ -26,12 +28,16 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-release_require_command dwarfdump
-release_require_command lipo
+release_configure_developer_dir 0
+if [[ -n "${ERYLO_RELEASE_TOOLCHAIN_JSON:-}" ]]; then
+    release_assert_toolchain
+fi
+dwarfdump_tool="$(release_developer_tool_path dwarfdump)"
+lipo_tool="$(release_developer_tool_path lipo)"
 binary="$(release_existing_path "$repo_root" "$binary_input")"
 dsym="$(release_existing_path "$repo_root" "$dsym_input")"
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || release_die "symbol binary must be a regular executable"
-[[ -d "$dsym" && "$(basename "$dsym")" == "Erylo.app.dSYM" && ! -L "$dsym" ]] \
+[[ -d "$dsym" && "$(/usr/bin/basename "$dsym")" == "Erylo.app.dSYM" && ! -L "$dsym" ]] \
     || release_die "dSYM input must be a staged Erylo.app.dSYM directory"
 [[ -f "$dsym/Contents/Info.plist" && ! -L "$dsym/Contents/Info.plist" ]] \
     || release_die "dSYM Info.plist is missing or unsafe"
@@ -41,13 +47,13 @@ dwarf="$dsym/Contents/Resources/DWARF/Erylo"
 [[ -f "$dwarf" && ! -L "$dwarf" ]] || release_die "dSYM contains no regular Erylo DWARF image"
 [[ "$(/usr/bin/find "$dsym/Contents/Resources/DWARF" -type f -print | /usr/bin/wc -l | /usr/bin/tr -d ' ')" == "1" ]] \
     || release_die "dSYM must contain exactly one DWARF image"
-[[ "$(/usr/bin/lipo -archs "$binary")" == "arm64" ]] || release_die "symbol binary must be arm64-only"
-[[ "$(/usr/bin/lipo -archs "$dwarf")" == "arm64" ]] || release_die "dSYM DWARF image must be arm64-only"
+[[ "$("$lipo_tool" -archs "$binary")" == "arm64" ]] || release_die "symbol binary must be arm64-only"
+[[ "$("$lipo_tool" -archs "$dwarf")" == "arm64" ]] || release_die "dSYM DWARF image must be arm64-only"
 
 temp_dir="$(release_make_temp_dir "$repo_root" validate-symbols)"
-trap '/bin/rm -rf -- "$temp_dir"' EXIT
-/usr/bin/dwarfdump --uuid "$binary" > "$temp_dir/binary-uuids"
-/usr/bin/dwarfdump --uuid "$dsym" > "$temp_dir/dsym-uuids"
+trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
+"$dwarfdump_tool" --uuid "$binary" > "$temp_dir/binary-uuids"
+"$dwarfdump_tool" --uuid "$dsym" > "$temp_dir/dsym-uuids"
 /usr/bin/ruby -e '
     pattern = /\AUUID: ([0-9A-Fa-f-]{36}) \(([^)]+)\) /
     sets = ARGV.map do |path|
@@ -58,5 +64,8 @@ trap '/bin/rm -rf -- "$temp_dir"' EXIT
     end
     abort("dSYM UUIDs do not exactly match executable UUIDs") unless sets[0] == sets[1]
   ' "$temp_dir/binary-uuids" "$temp_dir/dsym-uuids" || release_die "dSYM UUID validation failed"
+if [[ -n "${ERYLO_RELEASE_TOOLCHAIN_JSON:-}" ]]; then
+    release_assert_toolchain
+fi
 
 printf 'dSYM validation passed: %s\n' "$dsym"

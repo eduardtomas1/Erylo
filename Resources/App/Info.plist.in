@@ -28,8 +28,10 @@
     <string>@TARGET_ARCHITECTURE@</string>
     <key>EryloSourceCommit</key>
     <string>@SOURCE_COMMIT@</string>
-    <key>EryloSparkleVersion</key>
-    <string>@SPARKLE_VERSION@</string>
+	<key>EryloSparkleVersion</key>
+	<string>@SPARKLE_VERSION@</string>
+	<key>EryloToolchainSHA256</key>
+	<string>@TOOLCHAIN_SHA256@</string>
     <key>LSApplicationCategoryType</key>
     <string>public.app-category.utilities</string>
     <key>LSArchitecturePriority</key>
@@ -43,7 +45,7 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>Erylo sends playback commands to supported media apps only when you use media controls.</string>
+    <string>Erylo reads current playback and now-playing details when you refresh media, and sends playback commands only when you use media controls.</string>
     <key>NSCalendarsFullAccessUsageDescription</key>
     <string>Erylo reads upcoming events only when Next Meeting is enabled so it can show your next event.</string>
     <key>NSHighResolutionCapable</key>

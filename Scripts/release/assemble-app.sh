@@ -1,8 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+script_dir="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=Scripts/release/lib.sh
 source "$script_dir/lib.sh"
 
@@ -11,6 +13,7 @@ cd "$repo_root"
 
 binary_input=".release/build/arm64/release/Erylo"
 framework_input=".release/build/arm64/release/Frameworks/Sparkle.framework"
+toolchain_input=".release/build/arm64/release/Toolchain.json"
 output_input=".release/stage/Erylo.app"
 metadata_input="Config/ReleaseVersion.env"
 appcast_input=""
@@ -22,11 +25,12 @@ usage() {
 
 while [[ "$#" -gt 0 ]]; do
     case "$1" in
-        --binary|--framework|--output|--metadata|--appcast-config|--icon)
+        --binary|--framework|--toolchain|--output|--metadata|--appcast-config|--icon)
             [[ "$#" -ge 2 && -n "$2" ]] || release_die "missing value for $1"
             case "$1" in
                 --binary) binary_input="$2" ;;
                 --framework) framework_input="$2" ;;
+                --toolchain) toolchain_input="$2" ;;
                 --output) output_input="$2" ;;
                 --metadata) metadata_input="$2" ;;
                 --appcast-config) appcast_input="$2" ;;
@@ -47,25 +51,37 @@ done
 
 release_require_command git
 release_require_command ditto
-release_require_command install_name_tool
-release_require_command lipo
-release_require_command otool
 release_require_command plutil
+if [[ -z "${ERYLO_RELEASE_TOOLCHAIN_JSON:-}" ]]; then
+    release_capture_toolchain 0
+fi
+release_assert_toolchain
+lipo_tool="$(release_developer_tool_path lipo)"
+otool_tool="$(release_developer_tool_path otool)"
+install_name_tool="$(release_developer_tool_path install_name_tool)"
 
 binary="$(release_existing_path "$repo_root" "$binary_input")"
 framework="$(release_existing_path "$repo_root" "$framework_input")"
+toolchain="$(release_existing_path "$repo_root" "$toolchain_input")"
 output="$(release_output_path "$repo_root" "$output_input")"
 metadata_file="$(release_repo_file "$repo_root" "$metadata_input")"
 template="$(release_repo_file "$repo_root" "Resources/App/Info.plist.in")"
 erylo_license="$(release_repo_file "$repo_root" "LICENSE")"
 third_party_notices="$(release_repo_file "$repo_root" "Resources/App/ThirdPartyNotices.txt")"
 
-[[ "$output" == *.app && "$(basename "$output")" == "Erylo.app" ]] \
+[[ "$output" == *.app && "$(/usr/bin/basename "$output")" == "Erylo.app" ]] \
     || release_die "assembled output must be a release-staged Erylo.app"
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || release_die "binary input must be a regular executable"
 [[ -d "$framework" && ! -L "$framework" ]] || release_die "framework input must be a real directory"
-[[ "$(lipo -archs "$binary")" == "arm64" ]] || release_die "binary input must be arm64-only"
-otool -L "$binary" | /usr/bin/grep -Fq '@rpath/Sparkle.framework/Versions/B/Sparkle' \
+[[ -f "$toolchain" && ! -L "$toolchain" ]] || release_die "toolchain provenance input is missing"
+toolchain_json="$(/bin/cat "$toolchain")"
+[[ "$toolchain_json" == "$ERYLO_RELEASE_TOOLCHAIN_JSON" ]] \
+    || release_die "build toolchain provenance differs from the selected toolchain"
+toolchain_sha256="$(/usr/bin/shasum -a 256 "$toolchain" | /usr/bin/awk '{print $1}')"
+[[ "$toolchain_sha256" == "$ERYLO_RELEASE_TOOLCHAIN_SHA256" ]] \
+    || release_die "build toolchain provenance hash is inconsistent"
+[[ "$("$lipo_tool" -archs "$binary")" == "arm64" ]] || release_die "binary input must be arm64-only"
+"$otool_tool" -L "$binary" | /usr/bin/grep -Fq '@rpath/Sparkle.framework/Versions/B/Sparkle' \
     || release_die "binary input does not link Sparkle through an app-relative rpath"
 
 product_name="$(release_metadata_value "$metadata_file" PRODUCT_NAME)"
@@ -76,7 +92,7 @@ build_version="$(release_metadata_value "$metadata_file" BUILD_VERSION)"
 minimum_system_version="$(release_metadata_value "$metadata_file" MINIMUM_SYSTEM_VERSION)"
 target_architecture="$(release_metadata_value "$metadata_file" TARGET_ARCHITECTURE)"
 sparkle_version="$(release_metadata_value "$metadata_file" SPARKLE_VERSION)"
-source_commit="$(git rev-parse --verify HEAD)"
+source_commit="$(release_source_commit "$repo_root")"
 
 [[ "$product_name" =~ ^[A-Za-z][A-Za-z0-9._-]{0,63}$ ]] || release_die "invalid product name metadata"
 [[ "$executable_name" =~ ^[A-Za-z][A-Za-z0-9._-]{0,63}$ ]] || release_die "invalid executable name metadata"
@@ -96,33 +112,37 @@ resolved_sparkle_version="$(release_plist_value "$framework_plist" CFBundleShort
 [[ "$resolved_sparkle_version" == "$sparkle_version" ]] || release_die "Sparkle framework version does not match release metadata"
 
 temp_dir="$(release_make_temp_dir "$repo_root" assemble-app)"
-trap '/bin/rm -rf -- "$temp_dir"' EXIT
+trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
 temp_app="$temp_dir/Erylo.app"
-/bin/mkdir -p "$temp_app/Contents/MacOS" "$temp_app/Contents/Resources" "$temp_app/Contents/Frameworks"
+release_make_directory "$repo_root" "$temp_app/Contents/MacOS" >/dev/null
+release_make_directory "$repo_root" "$temp_app/Contents/Resources" >/dev/null
+release_make_directory "$repo_root" "$temp_app/Contents/Frameworks" >/dev/null
 
 /usr/bin/ditto "$binary" "$temp_app/Contents/MacOS/$executable_name"
 /bin/chmod 0755 "$temp_app/Contents/MacOS/$executable_name"
 /usr/bin/ditto "$framework" "$temp_app/Contents/Frameworks/Sparkle.framework"
 /usr/bin/ditto "$erylo_license" "$temp_app/Contents/Resources/Erylo-License.txt"
 /usr/bin/ditto "$third_party_notices" "$temp_app/Contents/Resources/ThirdPartyNotices.txt"
+/usr/bin/ditto "$toolchain" "$temp_app/Contents/Resources/Toolchain.json"
 /bin/chmod 0644 \
     "$temp_app/Contents/Resources/Erylo-License.txt" \
-    "$temp_app/Contents/Resources/ThirdPartyNotices.txt"
+    "$temp_app/Contents/Resources/ThirdPartyNotices.txt" \
+    "$temp_app/Contents/Resources/Toolchain.json"
 
 sparkle_destination="$temp_app/Contents/Frameworks/Sparkle.framework"
 if [[ -L "$sparkle_destination/XPCServices" ]]; then
-    /bin/rm -f -- "$sparkle_destination/XPCServices"
+    release_remove_path "$repo_root" "$sparkle_destination/XPCServices" file
 fi
 if [[ -d "$sparkle_destination/Versions/B/XPCServices" ]]; then
-    /bin/rm -rf -- "$sparkle_destination/Versions/B/XPCServices"
+    release_remove_path "$repo_root" "$sparkle_destination/Versions/B/XPCServices"
 fi
 if [[ -d "$sparkle_destination/Versions/B/_CodeSignature" ]]; then
-    /bin/rm -rf -- "$sparkle_destination/Versions/B/_CodeSignature"
+    release_remove_path "$repo_root" "$sparkle_destination/Versions/B/_CodeSignature"
 fi
 
 app_binary="$temp_app/Contents/MacOS/$executable_name"
-if ! otool -l "$app_binary" | /usr/bin/grep -Fq '@executable_path/../Frameworks'; then
-    install_name_tool -add_rpath '@executable_path/../Frameworks' "$app_binary"
+if ! "$otool_tool" -l "$app_binary" | /usr/bin/grep -Fq '@executable_path/../Frameworks'; then
+    "$install_name_tool" -add_rpath '@executable_path/../Frameworks' "$app_binary"
 fi
 
 /bin/cp "$template" "$temp_app/Contents/Info.plist"
@@ -136,6 +156,7 @@ plist="$temp_app/Contents/Info.plist"
 /usr/bin/plutil -replace EryloReleaseArchitecture -string "$target_architecture" "$plist"
 /usr/bin/plutil -replace EryloSourceCommit -string "$source_commit" "$plist"
 /usr/bin/plutil -replace EryloSparkleVersion -string "$sparkle_version" "$plist"
+/usr/bin/plutil -replace EryloToolchainSHA256 -string "$toolchain_sha256" "$plist"
 /usr/bin/plutil -replace LSMinimumSystemVersion -string "$minimum_system_version" "$plist"
 
 if [[ -n "$appcast_input" ]]; then
@@ -149,16 +170,18 @@ if [[ -n "$appcast_input" ]]; then
     [[ "$signed_feed" == "true" && "$verify_before_extraction" == "true" ]] \
         || release_die "appcast config must require a signed feed and pre-extraction verification"
     release_validate_feed_url "$feed_url" || release_die "invalid appcast feed URL"
-    /usr/bin/ruby -rbase64 -e '
-        key = ARGV.fetch(1)
-        abort("public key is a placeholder") if key.match?(/replace|placeholder|todo/i)
-        decoded = Base64.strict_decode64(key)
-        abort("public EdDSA key must decode to 32 bytes") unless decoded.bytesize == 32
-    ' ignored "$public_key" || release_die "invalid signed appcast public key"
+    release_validate_public_key "$public_key" || release_die "invalid signed appcast public key"
+    appcast_config_sha256="$(/usr/bin/shasum -a 256 "$appcast_file" | /usr/bin/awk '{print $1}')"
+    [[ "$appcast_config_sha256" =~ ^[0-9a-f]{64}$ ]] || release_die "could not hash signed appcast configuration"
+    if [[ -n "${ERYLO_RELEASE_APPCAST_SHA256:-}" ]]; then
+        [[ "$appcast_config_sha256" == "$ERYLO_RELEASE_APPCAST_SHA256" ]] \
+            || release_die "appcast configuration differs from the pinned release snapshot"
+    fi
     /usr/bin/plutil -insert SUFeedURL -string "$feed_url" "$plist"
     /usr/bin/plutil -insert SUPublicEDKey -string "$public_key" "$plist"
     /usr/bin/plutil -insert SURequireSignedFeed -bool true "$plist"
     /usr/bin/plutil -insert SUVerifyUpdateBeforeExtraction -bool true "$plist"
+    /usr/bin/plutil -insert EryloReleaseConfigSHA256 -string "$appcast_config_sha256" "$plist"
 fi
 
 if [[ -n "$icon_input" ]]; then
@@ -172,7 +195,7 @@ fi
 /usr/bin/plutil -lint "$plist" >/dev/null || release_die "assembled Info.plist is invalid"
 printf 'APPL????' > "$temp_app/Contents/PkgInfo"
 
-release_remove_path "$repo_root" "$output"
-/bin/mv "$temp_app" "$output"
+release_publish_directory "$repo_root" "$temp_app" "$output"
+release_assert_toolchain full
 
 printf 'Application bundle assembled at %s\n' "$output"

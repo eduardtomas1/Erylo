@@ -1,0 +1,31 @@
+# expected	name	url
+ready	canonical	https://updates.erylo.test/appcast.xml
+ready	uppercase-host	https://UPDATES.ERYLO.TEST/appcast.xml
+invalid	punycode-host	https://xn--updat-9ra.erylo.test/appcast.xml
+ready	encoded-path	https://updates.erylo.test/releases/Erylo%20Stable/appcast.xml
+ready	path-at-and-colon	https://updates.erylo.test/releases/%40stable%3Aarm64/appcast.xml
+invalid	lowercase-percent-path	https://updates.erylo.test/releases/%3aarm64/appcast.xml
+invalid	raw-space-path	https://updates.erylo.test/app cast.xml
+invalid	raw-unicode-path	https://updates.erylo.test/ü.xml
+invalid	encoded-host-letter	https://%75pdates.erylo.test/appcast.xml
+invalid	encoded-host-dot	https://updates%2Eerylo.test/appcast.xml
+invalid	encoded-authority-at	https://user%40updates.erylo.test/appcast.xml
+invalid	encoded-authority-colon	https://updates%3A443.erylo.test/appcast.xml
+invalid	raw-unicode-host	https://updatés.erylo.test/appcast.xml
+invalid	unicode-dot-host	https://updates。erylo。test/appcast.xml
+invalid	uppercase-scheme	HTTPS://updates.erylo.test/appcast.xml
+invalid	trailing-host-dot	https://updates.erylo.test./appcast.xml
+invalid	explicit-default-port	https://updates.erylo.test:443/appcast.xml
+invalid	explicit-custom-port	https://updates.erylo.test:8443/appcast.xml
+invalid	empty-userinfo	https://@updates.erylo.test/appcast.xml
+invalid	credentials	https://user:password@updates.erylo.test/appcast.xml
+invalid	query	https://updates.erylo.test/appcast.xml?channel=stable
+invalid	fragment	https://updates.erylo.test/appcast.xml#latest
+invalid	underscore-host	https://updates_feed.erylo.test/appcast.xml
+invalid	placeholder-host	https://updates.example.invalid/appcast.xml
+invalid	single-label-localhost	https://localhost/appcast.xml
+invalid	local-tld	https://updates.erylo.local/appcast.xml
+invalid	integer-ip	https://2130706433/appcast.xml
+invalid	legacy-hex-ip	https://0x7f.1/appcast.xml
+invalid	ipv4-literal	https://127.0.0.1/appcast.xml
+invalid	invalid-numeric-ip	https://999.999.999.999/appcast.xml

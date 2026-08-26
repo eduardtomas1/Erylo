@@ -1,8 +1,10 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+script_dir="$(cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=Scripts/release/lib.sh
 source "$script_dir/lib.sh"
 
@@ -39,24 +41,29 @@ release_require_notary_tools
 archive="$(release_existing_path "$repo_root" "$archive_input")"
 app="$(release_existing_path "$repo_root" "$app_input")"
 [[ -f "$archive" && "$archive" == *.zip && ! -L "$archive" ]] || release_die "notarization input must be a staged ZIP archive"
+archive_identity="$(release_file_identity "$repo_root" "$archive")"
 "$script_dir/verify-signature.sh" --pre-notarization "$app" >/dev/null
 "$script_dir/validate-archive.sh" --archive "$archive" --app "$app" >/dev/null
+release_assert_file_identity "$repo_root" "$archive" "$archive_identity"
 
 temp_dir="$(release_make_temp_dir "$repo_root" notarize)"
-trap '/bin/rm -rf -- "$temp_dir"' EXIT
-if ! /usr/bin/xcrun notarytool history --keychain-profile "$keychain_profile" --output-format json \
+trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
+if ! release_xcrun notarytool history --keychain-profile "$keychain_profile" --output-format json \
     >"$temp_dir/profile-check.json" 2>"$temp_dir/profile-check.err"; then
     release_die "notarytool Keychain profile is unavailable or cannot authenticate noninteractively"
 fi
 
-result_path=".release/notarization/$(basename "$archive").submission.json"
-if ! /usr/bin/xcrun notarytool submit "$archive" --keychain-profile "$keychain_profile" \
+result_path=".release/notarization/$(/usr/bin/basename "$archive").submission.json"
+release_assert_file_identity "$repo_root" "$archive" "$archive_identity"
+if ! release_xcrun notarytool submit "$archive" --keychain-profile "$keychain_profile" \
     --wait --timeout 30m --output-format json >"$temp_dir/submission.json" 2>"$temp_dir/submission.err"; then
     if [[ -s "$temp_dir/submission.json" ]]; then
         release_publish_file "$repo_root" "$temp_dir/submission.json" "$result_path"
     fi
     release_die "notary submission failed; no notarization is claimed"
 fi
+release_assert_file_identity "$repo_root" "$archive" "$archive_identity"
+release_assert_toolchain full
 
 status="$(/usr/bin/ruby -rjson -e 'puts JSON.parse(File.read(ARGV.fetch(0))).fetch("status", "")' "$temp_dir/submission.json")"
 release_publish_file "$repo_root" "$temp_dir/submission.json" "$result_path"

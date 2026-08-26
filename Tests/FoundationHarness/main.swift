@@ -1,5 +1,6 @@
 import CoreGraphics
 import Darwin
+import EryloActivity
 import EryloCore
 import EryloIntegrations
 import EryloSurface
@@ -14,7 +15,7 @@ enum FoundationHarnessMain {
         harness.verifyPanelGeometry()
         harness.verifyDisplayPolicy()
         harness.verifyHoverHysteresisAndMotionInterruption()
-        harness.verifyCoordinatorLifecycle()
+        await harness.verifyCoordinatorLifecycle()
         await harness.verifyDisabledProvider()
         harness.finish()
     }
@@ -34,8 +35,17 @@ private struct FoundationHarness {
 
         var hidden = PanelStateMachine()
         check(hidden.send(.hoverBegan) == .hidden, "hidden state ignores hover")
-        check(hidden.send(.primaryAction) == .hidden, "hidden state ignores primary action")
-        check(hidden.send(.dragEntered) == .hidden, "hidden state ignores drag entry")
+        check(hidden.send(.primaryAction) == .compact, "primary shortcut reveals a hidden surface")
+
+        var hiddenDrop = PanelStateMachine()
+        check(hiddenDrop.send(.dragEntered) == .dropTarget, "delivered hidden drag entry reveals the honest drop target")
+        check(hiddenDrop.send(.dragExited) == .hidden, "hidden drag exit restores invisible rest")
+
+        var activityVisibility = PanelStateMachine()
+        check(activityVisibility.updateActivityAvailability(true) == .compact, "first activity reveals compact state")
+        check(activityVisibility.updateActivityAvailability(false) == .hidden, "empty compact state returns to hidden")
+        var expandedActivity = PanelStateMachine(initialState: .expanded)
+        check(expandedActivity.updateActivityAvailability(false) == .expanded, "empty snapshot does not collapse deliberate expansion")
 
         var dropTarget = PanelStateMachine(initialState: .expanded)
         check(dropTarget.send(.dragEntered) == .dropTarget, "drag enters drop-target state")
@@ -183,7 +193,12 @@ private struct FoundationHarness {
     mutating func verifyHoverHysteresisAndMotionInterruption() {
         let display = makeSnapshot(identity: 10, isMain: true).geometry
         let scheduler = ManualOneShotScheduler()
-        let model = PanelSurfaceModel(displayGeometry: display, scheduler: scheduler)
+        let model = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: scheduler,
+            activityModel: makeActiveActivityModel()
+        )
 
         model.setPointerInside(true)
         model.setPointerInside(false)
@@ -201,7 +216,12 @@ private struct FoundationHarness {
         check(model.state == .expanded, "click interrupts a pending hover exit")
 
         let motionScheduler = ManualOneShotScheduler()
-        let motionModel = PanelSurfaceModel(displayGeometry: display, scheduler: motionScheduler)
+        let motionModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: motionScheduler,
+            activityModel: makeActiveActivityModel()
+        )
         let expandedLayout = PanelLayout(display: display, state: .expanded)
         let destinationOnlyPoint = expandedLayout.surfaceFrame.center
         motionModel.send(.primaryAction)
@@ -223,7 +243,9 @@ private struct FoundationHarness {
         let interruptionScheduler = ManualOneShotScheduler()
         let interruptionModel = PanelSurfaceModel(
             displayGeometry: display,
-            scheduler: interruptionScheduler
+            initialState: .compact,
+            scheduler: interruptionScheduler,
+            activityModel: makeActiveActivityModel()
         )
         interruptionModel.send(.primaryAction)
         interruptionModel.send(.primaryAction)
@@ -235,7 +257,12 @@ private struct FoundationHarness {
         )
 
         let stressScheduler = ManualOneShotScheduler()
-        let stressModel = PanelSurfaceModel(displayGeometry: display, scheduler: stressScheduler)
+        let stressModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: stressScheduler,
+            activityModel: makeActiveActivityModel()
+        )
         for _ in 0..<500 {
             stressModel.send(.primaryAction)
             stressModel.send(.primaryAction)
@@ -254,7 +281,9 @@ private struct FoundationHarness {
         let reduceMotionScheduler = ManualOneShotScheduler()
         let reduceMotionModel = PanelSurfaceModel(
             displayGeometry: display,
-            scheduler: reduceMotionScheduler
+            initialState: .compact,
+            scheduler: reduceMotionScheduler,
+            activityModel: makeActiveActivityModel()
         )
         reduceMotionModel.updateReduceMotion(true)
         reduceMotionModel.send(.primaryAction)
@@ -264,22 +293,24 @@ private struct FoundationHarness {
         )
     }
 
-    mutating func verifyCoordinatorLifecycle() {
+    mutating func verifyCoordinatorLifecycle() async {
         let main = makeSnapshot(identity: 10, isMain: true)
         let external = makeSnapshot(identity: 20, originX: 1_440)
         let mirrored = makeSnapshot(identity: 30, originX: 3_360, isMirrored: true)
         let provider = FakeDisplayProvider(displays: [main, external, external, mirrored])
         let eventSource = FakeLifecycleEventSource()
         let registry = FakePanelRegistry()
+        let activityModel = SurfaceActivityModel(broker: ActivityBroker())
         let coordinator = PanelCoordinator(
             displayProvider: provider,
             policy: DisplayPolicy(selectedDisplayIdentity: external.identity),
             lifecycleEventSource: eventSource,
-            panelFactory: { registry.makePanel(snapshot: $0) }
+            activityModel: activityModel,
+            panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
         )
 
-        coordinator.start()
-        coordinator.start()
+        await coordinator.startAndWait()
+        await coordinator.startAndWait()
         check(eventSource.startCount == 1, "repeated coordinator start owns one event source")
         check(registry.creationCount == 2, "repeated start creates exactly one panel per display ID")
         check(
@@ -315,7 +346,7 @@ private struct FoundationHarness {
         eventSource.emit(.workspaceDidWake)
         check(registry.latestPanel(for: main.identity)?.showCount == 4, "wake reconciles and reveals retained panel")
 
-        coordinator.update(policy: DisplayPolicy(isEnabled: false))
+        await coordinator.updateAndWait(policy: DisplayPolicy(isEnabled: false))
         check(eventSource.stopCount == 1, "disabled policy removes observers, monitors, and shortcut")
         check(coordinator.activeDisplayIdentities.isEmpty, "disabled policy closes all panels")
         let requestsWhileDisabled = provider.requestCount
@@ -325,19 +356,19 @@ private struct FoundationHarness {
             "disabled policy performs no display reconciliation work"
         )
 
-        coordinator.update(policy: .safeDefault)
+        await coordinator.updateAndWait(policy: .safeDefault)
         check(eventSource.startCount == 2, "re-enabled policy installs one fresh event source")
         check(registry.creationCount == 5, "re-enabled policy recreates one panel per available display")
 
-        coordinator.stop()
-        coordinator.stop()
+        await coordinator.stopAndWait()
+        await coordinator.stopAndWait()
         check(eventSource.stopCount == 2, "repeated coordinator stop removes event source once")
         check(coordinator.activeDisplayIdentities.isEmpty, "stop releases all active panel ownership")
 
-        coordinator.start()
+        await coordinator.startAndWait()
         check(eventSource.startCount == 3, "coordinator can restart after stop")
         check(registry.creationCount == 7, "restart recreates exactly one panel per display")
-        coordinator.stop()
+        await coordinator.stopAndWait()
         check(eventSource.stopCount == 3, "restart lifecycle remains symmetrically removable")
     }
 
@@ -375,6 +406,14 @@ private extension CGRect {
     var center: CGPoint {
         CGPoint(x: midX, y: midY)
     }
+}
+
+@MainActor
+private func makeActiveActivityModel() -> SurfaceActivityModel {
+    guard let snapshot = try? ActivitySurfacePreviewCatalog.generic.snapshot() else {
+        preconditionFailure("bounded active surface fixture must validate")
+    }
+    return SurfaceActivityModel(previewSnapshot: snapshot)
 }
 
 private func makeSnapshot(

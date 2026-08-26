@@ -11,10 +11,10 @@ This Swift Package is the first technical feasibility slice, not an application 
 - `EryloIntegrations`: narrow display, activity-provider, and public desktop-media abstractions. Apple Music and Spotify use fixed, validated `osascript` routes on explicit refresh or command only; disabled adapters finish their streams and perform no work.
 - `EryloLocalIntegrations`: the versioned strict schema, URL and command-line parsers, broker controller, and opt-in per-user Unix-domain-socket service for declarative submit/cancel/status requests.
 - `EryloAppIntents`: public-SDK App Intent adapters for the same operations. It is an app-bundle wiring seam and is not linked into the current SwiftPM executable.
-- `EryloSurface`: one morphing SwiftUI surface hosted inside the fixed maximum frame, with cancellable hover hysteresis and Reduce Motion crossfade/scale behavior.
+- `EryloSurface`: one broker-driven SwiftUI silhouette hosted inside the fixed maximum frame, with a shared observable activity model, latest-request lifecycle reconciliation, bounded serialized action-task ownership, bounded queue/action presentation, cancellable hover hysteresis, and Reduce Motion crossfade/scale behavior.
 - `EryloTrust`: bounded versioned preferences, serialized provider lifecycle, public launch-at-login capability state, and privacy-preserving diagnostics export.
 - `EryloSettingsUI`: a contained native SwiftUI onboarding/settings surface that performs no provider or permission work while browsing.
-- `EryloWindowing`: public-API AppKit display discovery, non-activating panels, event-driven pointer hit testing, removable workspace/display observers, and one controller keyed by `CGDirectDisplayID` per enabled non-mirrored display.
+- `EryloWindowing`: public-API AppKit display discovery, non-activating panels, leased event callbacks, event-driven pointer hit testing, removable workspace/display observers, and one controller keyed by `CGDirectDisplayID` per enabled non-mirrored display. Coordinators borrow the app-owned activity model; only an explicit final-owner shutdown is terminal. Executor-neutral coordinator release transfers its owned event source and panels to an explicit MainActor cleanup task without capturing or shutting down the shared model.
 - `EryloApp`: the minimal accessory-process entry point.
 
 The dependency direction remains one-way: app -> windowing -> surface/integrations -> core/activity; File Hold is an independent native boundary, Glance depends only on Activity, Trust only on Core, SettingsUI on Core/Trust, and AppIntents on LocalIntegrations on Activity. Platform types stay behind injectable seams, routes see only the narrow handling protocol, and no transport exposes the broker actor directly.
@@ -30,15 +30,18 @@ swift run EryloGlanceTests
 swift run EryloMediaTests
 swift run EryloTrustTests
 swift run EryloIntegrationTests
+swift run EryloSurfaceTests
 Scripts/ci.sh
 swift run Erylo
 ```
 
 `swift run Erylo` launches one feasibility panel for each display reported by AppKit. Quit the process from the invoking terminal.
 
+Panels start with a zero-size hidden surface. The first current broker activity reveals compact state; an empty snapshot returns compact or peek to hidden, while an intentionally expanded surface remains available until the user closes it. The global shortcut can reveal a hidden surface without activating the app.
+
 The safe default enables every available non-mirrored display and selects the main display for one-at-a-time interactions. The policy also supports an in-memory enabled-display allowlist and selected display; persistence and its UI remain later work. Displays without a top-edge occlusion use a compact pill inset from the screen edge. `Control-Option-Command-E` toggles the selected panel through public hot-key registration, without a global key-event monitor or Accessibility permission.
 
-The foundation, activity, File Hold, glance, media, trust, and integration harnesses intentionally use only the standard Swift toolchain. The current standalone Command Line Tools distribution does not expose `XCTest` or Swift Testing through SwiftPM, so `Scripts/ci.sh` builds every product and runs all dependency-free harnesses. A later Xcode project can add XCTest/XCUITest without changing the pure test seams.
+The foundation, activity, File Hold, glance, media, trust, integration, and surface harnesses intentionally use only the standard Swift toolchain. The current standalone Command Line Tools distribution does not expose `XCTest` or Swift Testing through SwiftPM, so `Scripts/ci.sh` builds every product and runs all dependency-free harnesses. A later Xcode project can add XCTest/XCUITest without changing the pure test seams.
 
 Local verification uses the installed Swift 6 Command Line Tools. GitHub build/test verification uses the public `macos-15` runner because the `macos-14` runner defaults to Swift 5.10; `Scripts/ci.sh` retains a hard Swift 6 gate, while `Package.swift` keeps the deployment target at macOS 14.
 
@@ -63,7 +66,8 @@ The Integration harness deterministically covers strict schema and duplicate-key
 ## Deliberate limitations
 
 - The foundation drop target still rejects transport until File Hold is mounted into the application. The File Hold library now owns and tests copy/reference semantics, expiry, cleanup/recovery, and coordinated public drag decoding; app wiring and cross-Space round trips remain later integration work.
-- Glance providers are not connected to the feasibility UI or settings yet. They remain disabled until explicitly enabled; calendar permission is requested only from that explicit enable path. Persistence, updater, signing, and diagnostics pipelines are not claimed here.
+- The reducer can preserve hidden state across a delivered drag enter/exit sequence, but a zero-size hidden AppKit hit region cannot discover a new drag by itself. Real edge drag discovery belongs with File Hold transport and must not be inferred from this temporary affordance.
+- Glance providers are not connected to the app-owned broker or settings yet, so the app enables none of them. Calendar permission is requested only from an explicit provider-enable path. The app creates one shared activity broker and injects one observable subscriber model across display panels; the model starts only while the coordinator is enabled and running. Settings mounting, updater, signing, and application diagnostics wiring are not claimed here.
 - Battery, default-output volume/mute, and EventKit permission behavior compile against public macOS APIs but still require real-hardware, real-calendar-account, sleep/wake, device-switch, and Instruments energy validation.
 - Apple Music and Spotify expose no reliable documented desktop change-notification surface to this package, so media refresh is on demand and adapter streams finish immediately rather than polling. Automation permission is requested only when the user first invokes a refresh or command. Artwork caching is opt-in, memory-bounded, purgeable, and retains no durable playback history.
 - Trust persistence, contextual permission/lifecycle seams, and local diagnostics export now exist as unmounted library foundations. A settings-window host, updater, signing, and panel preference integration remain later work.
@@ -71,4 +75,4 @@ The Integration harness deterministically covers strict schema and duplicate-key
 - The socket has no settings/UI activation path and remains disabled. URL/App Intent bundle registration and a bundled `eryloctl` remain explicit wiring gaps rather than claimed working product features.
 - Screen-parameter, active-Space, sleep/wake, pointer, and hot-key events drive reconciliation and interaction. Hover and motion completion use cancellable one-shot tasks; there are no repeating timers or display links at idle. Public APIs do not expose every phase of another application's fullscreen transition, so active-Space and screen-parameter notifications are the observable reconciliation boundaries.
 - AppKit hit testing uses the intersection of source and destination regions while a morph is in flight, then installs the exact destination region at the scheduled animation completion. This is intentionally conservative: destination-only pixels cannot steal clicks before they are visible. SwiftUI does not expose the spring's presentation geometry to the hosting `NSPanel`, so the region is not a frame-by-frame mathematical match during the animation and spring settling may outlast the nominal completion by a small amount.
-- The fixed-frame, policy, lifecycle ownership, hover cancellation, reducer interruption, and hit-region behavior have deterministic harness coverage. Fullscreen, Spaces, Stage Manager, hot-plug, mirroring, clamshell, sleep/wake, shortcut conflicts, 120 Hz motion, CPU usage, signing, and energy targets still require hardware, multi-display, and Instruments validation.
+- The fixed-frame, policy, borrowed coordinator ownership, overlapping lifecycle arbitration, awaited stop/shutdown overlap barriers, detached last-release cleanup for surface/coordinator/system event-source ownership, retired event-callback rejection, terminal shutdown, broker subscriber cleanup, cancelled action-task settlement, newest snapshot handoff, action freshness, accessibility copy, Reduce Motion selection, hover cancellation, reducer interruption, and hit-region behavior have deterministic harness coverage. VoiceOver traversal, fullscreen, Spaces, Stage Manager, hot-plug, mirroring, clamshell, sleep/wake, shortcut conflicts, 120 Hz motion, CPU usage, signing, and energy targets still require hardware, multi-display, and Instruments validation.

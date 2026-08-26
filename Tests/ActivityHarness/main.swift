@@ -17,6 +17,7 @@ enum ActivityHarnessMain {
         await harness.verifyActivityCapacity()
         await harness.verifySnapshotBackpressureAndLifecycle()
         await harness.verifySubscriberCapacity()
+        await harness.verifySubscriberIdentityIsolation()
         await harness.verifyZeroRepeatingIdleWork()
         harness.finish()
     }
@@ -362,6 +363,48 @@ private struct ActivityHarness {
             check(await waitUntil { await broker.workState().subscriberCount == 0 }, "all cancelled subscribers are removed")
         } catch {
             recordUnexpected(error, context: "subscriber capacity")
+        }
+    }
+
+    mutating func verifySubscriberIdentityIsolation() async {
+        let broker = ActivityBroker()
+        let subscriberID = UUID()
+        do {
+            let first = try await broker.snapshotSubscription(subscriberID: subscriberID)
+            var firstIterator = first.stream.makeAsyncIterator()
+            check(await firstIterator.next()?.version == 0, "explicit package subscription receives the initial snapshot")
+
+            do {
+                _ = try await broker.snapshotSubscription(subscriberID: subscriberID)
+                check(false, "duplicate package subscriber identity is rejected")
+            } catch let error {
+                check(
+                    error == ActivityBrokerSubscriptionError.duplicateSubscriberIdentifier,
+                    "duplicate package subscriber identity returns its typed error"
+                )
+            }
+            check(await broker.workState().subscriberCount == 1, "duplicate rejection preserves the original registration")
+
+            await broker.cancelSnapshotSubscription(first.token)
+            check(await broker.workState().subscriberCount == 0, "first registration token unregisters only its own stream")
+
+            let second = try await broker.snapshotSubscription(subscriberID: subscriberID)
+            var secondIterator = second.stream.makeAsyncIterator()
+            check(await secondIterator.next()?.version == 0, "retired logical identity can register a new generation")
+            check(first.token != second.token, "reused subscriber identity receives an immutable fresh generation")
+
+            await broker.cancelSnapshotSubscription(first.token)
+            check(
+                await broker.workState().subscriberCount == 1,
+                "delayed retired-token cancellation cannot remove its replacement"
+            )
+            let submitted = try await broker.submit(request(id: "subscriber-generation", priority: 50))
+            check(await secondIterator.next() == submitted, "replacement stream remains live after stale first-generation termination")
+
+            await broker.cancelSnapshotSubscription(second.token)
+            check(await broker.workState().subscriberCount == 0, "current generation still unregisters exactly once")
+        } catch {
+            recordUnexpected(error, context: "subscriber identity isolation")
         }
     }
 

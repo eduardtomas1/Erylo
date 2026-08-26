@@ -379,7 +379,7 @@ public struct Activity: Equatable, Sendable {
     public let action: ActivityAction?
     public let lifecycle: ActivityLifecycle
 
-    init(validating request: ActivityRequest) throws(ActivityValidationError) {
+    public init(validating request: ActivityRequest) throws(ActivityValidationError) {
         let source = try ActivitySource(validating: request.source)
         identity = ActivityIdentity(
             source: source,

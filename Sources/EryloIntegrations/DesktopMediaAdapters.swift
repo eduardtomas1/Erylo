@@ -6,6 +6,14 @@ public protocol MediaApplicationStatusChecking: Sendable {
     func isRunning(bundleIdentifier: String) async -> Bool
 }
 
+@_spi(Testing)
+public protocol MediaAdapterAdmissionObserving: Sendable {
+    func willAttemptAdmission(
+        source: MediaSource,
+        operationID: MediaOperationID
+    ) async
+}
+
 public struct SystemMediaApplicationStatus: MediaApplicationStatusChecking {
     public init() {}
 
@@ -49,84 +57,81 @@ public struct MediaScriptRequest: Equatable, Sendable {
 public enum MediaScriptExecutionError: Error, Equatable, Sendable {
     case permissionDenied
     case applicationUnavailable
+    case timedOut
+    case responseTooLarge
     case failed(exitCode: Int32?)
     case cancelled
 }
 
 public protocol MediaScriptExecuting: Sendable {
-    func execute(_ request: MediaScriptRequest) async throws -> String
-    func cancelAll() async
+    func execute(
+        _ request: MediaScriptRequest,
+        operationID: MediaOperationID
+    ) async throws -> String
+    func cancel(_ operationID: MediaOperationID) async
+}
+
+public extension MediaScriptExecuting {
+    func execute(_ request: MediaScriptRequest) async throws -> String {
+        let operationID = MediaOperationID()
+        return try await withTaskCancellationHandler {
+            try await execute(request, operationID: operationID)
+        } onCancel: {
+            Task { await cancel(operationID) }
+        }
+    }
 }
 
 /// A killable, no-shell subprocess boundary around the documented `osascript` tool.
 public actor ProcessMediaScriptExecutor: MediaScriptExecuting {
-    private struct CompletedProcess: Sendable {
-        let status: Int32
-        let standardOutput: Data
-        let standardError: Data
+    private let processRunner: any MediaScriptProcessRunning
+    private let limits: MediaScriptProcessLimits
+
+    public init(
+        processRunner: any MediaScriptProcessRunning = FoundationMediaScriptProcessRunner(),
+        limits: MediaScriptProcessLimits = MediaScriptProcessLimits()
+    ) {
+        self.processRunner = processRunner
+        self.limits = limits
     }
 
-    private var processes: [UUID: Process] = [:]
-    private var cancelledProcesses: Set<UUID> = []
-
-    public init() {}
-
-    public func execute(_ request: MediaScriptRequest) async throws -> String {
-        try Task.checkCancellation()
-
-        let identifier = UUID()
-        let process = Process()
-        let standardOutput = Pipe()
-        let standardError = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", MediaAppleScripts.source(for: request.route), "--"]
-            + request.arguments
-        process.standardOutput = standardOutput
-        process.standardError = standardError
-
-        let completed: CompletedProcess
+    public func execute(
+        _ request: MediaScriptRequest,
+        operationID: MediaOperationID
+    ) async throws -> String {
+        guard !Task.isCancelled else {
+            throw MediaScriptExecutionError.cancelled
+        }
+        let validatedArguments = try Self.validatedArguments(for: request)
+        let arguments = ["-e", MediaAppleScripts.source(for: request.route), "--"]
+            + validatedArguments
+        let completed: MediaScriptProcessResult
         do {
             completed = try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    process.terminationHandler = { completedProcess in
-                        continuation.resume(
-                            returning: CompletedProcess(
-                                status: completedProcess.terminationStatus,
-                                standardOutput: standardOutput.fileHandleForReading.readDataToEndOfFile(),
-                                standardError: standardError.fileHandleForReading.readDataToEndOfFile()
-                            )
-                        )
-                    }
-
-                    do {
-                        try process.run()
-                        processes[identifier] = process
-                    } catch {
-                        process.terminationHandler = nil
-                        continuation.resume(throwing: error)
-                    }
-                }
+                try await processRunner.run(
+                    arguments: arguments,
+                    operationID: operationID,
+                    limits: limits
+                )
             } onCancel: {
-                Task { [weak self] in
-                    await self?.cancel(identifier)
-                }
+                Task { await processRunner.cancel(operationID) }
             }
-        } catch is CancellationError {
-            processes.removeValue(forKey: identifier)
-            cancelledProcesses.remove(identifier)
+        } catch MediaScriptProcessError.cancelled {
             throw MediaScriptExecutionError.cancelled
+        } catch MediaScriptProcessError.timedOut {
+            throw MediaScriptExecutionError.timedOut
+        } catch MediaScriptProcessError.standardOutputLimitExceeded,
+                MediaScriptProcessError.standardErrorLimitExceeded {
+            throw MediaScriptExecutionError.responseTooLarge
         } catch {
-            processes.removeValue(forKey: identifier)
-            cancelledProcesses.remove(identifier)
             throw MediaScriptExecutionError.failed(exitCode: nil)
         }
 
-        processes.removeValue(forKey: identifier)
-        if cancelledProcesses.remove(identifier) != nil || Task.isCancelled {
+        if Task.isCancelled {
             throw MediaScriptExecutionError.cancelled
         }
 
-        guard completed.status == 0 else {
+        guard completed.exitCode == 0 else {
             let errorText = String(decoding: completed.standardError, as: UTF8.self)
             if errorText.contains("-1743")
                 || errorText.localizedCaseInsensitiveContains("not authorized to send apple events") {
@@ -136,26 +141,44 @@ public actor ProcessMediaScriptExecutor: MediaScriptExecuting {
                 || errorText.localizedCaseInsensitiveContains("isn't running") {
                 throw MediaScriptExecutionError.applicationUnavailable
             }
-            throw MediaScriptExecutionError.failed(exitCode: completed.status)
+            throw MediaScriptExecutionError.failed(exitCode: completed.exitCode)
         }
 
         return String(decoding: completed.standardOutput, as: UTF8.self)
             .trimmingCharacters(in: .newlines)
     }
 
-    public func cancelAll() {
-        for identifier in processes.keys {
-            cancelledProcesses.insert(identifier)
-        }
-        for process in processes.values where process.isRunning {
-            process.terminate()
-        }
+    public func cancel(_ operationID: MediaOperationID) async {
+        await processRunner.cancel(operationID)
     }
 
-    private func cancel(_ identifier: UUID) {
-        cancelledProcesses.insert(identifier)
-        if let process = processes[identifier], process.isRunning {
-            process.terminate()
+    private static func validatedArguments(
+        for request: MediaScriptRequest
+    ) throws -> [String] {
+        switch request.route {
+        case .appleMusicSnapshot, .appleMusicPlay, .appleMusicPause,
+             .appleMusicNext, .appleMusicPrevious,
+             .spotifySnapshot, .spotifyPlay, .spotifyPause,
+             .spotifyNext, .spotifyPrevious:
+            guard request.arguments.isEmpty else {
+                throw MediaScriptExecutionError.failed(exitCode: nil)
+            }
+            return []
+
+        case .appleMusicSeek, .spotifySeek, .appleMusicVolume, .spotifyVolume:
+            guard request.arguments.count == 1,
+                  request.arguments[0].utf8.count <= 64,
+                  let value = Double(request.arguments[0]),
+                  value.isFinite,
+                  value >= 0 else {
+                throw MediaScriptExecutionError.failed(exitCode: nil)
+            }
+            if request.route == .appleMusicVolume || request.route == .spotifyVolume {
+                guard value <= 100 else {
+                    throw MediaScriptExecutionError.failed(exitCode: nil)
+                }
+            }
+            return [String(value)]
         }
     }
 }
@@ -166,21 +189,47 @@ public actor AppleMusicDesktopAdapter: MediaAdapter {
 
     public init(
         applicationStatus: any MediaApplicationStatusChecking = SystemMediaApplicationStatus(),
-        scriptExecutor: any MediaScriptExecuting = ProcessMediaScriptExecutor()
+        scriptExecutor: any MediaScriptExecuting = ProcessMediaScriptExecutor(),
+        maximumPendingOperations: Int = 16
     ) {
         implementation = ScriptedDesktopMediaAdapter(
             source: .appleMusic,
             applicationStatus: applicationStatus,
-            scriptExecutor: scriptExecutor
+            scriptExecutor: scriptExecutor,
+            maximumPendingOperations: maximumPendingOperations,
+            admissionObserver: nil
+        )
+    }
+
+    @_spi(Testing)
+    public init(
+        applicationStatus: any MediaApplicationStatusChecking,
+        scriptExecutor: any MediaScriptExecuting,
+        maximumPendingOperations: Int,
+        admissionObserver: any MediaAdapterAdmissionObserving
+    ) {
+        implementation = ScriptedDesktopMediaAdapter(
+            source: .appleMusic,
+            applicationStatus: applicationStatus,
+            scriptExecutor: scriptExecutor,
+            maximumPendingOperations: maximumPendingOperations,
+            admissionObserver: admissionObserver
         )
     }
 
     public func activate() async { await implementation.activate() }
     public func deactivate() async { await implementation.deactivate() }
     public func updates() async -> AsyncStream<MediaAdapterUpdate> { await implementation.updates() }
-    public func refresh() async throws -> MediaAdapterUpdate { try await implementation.refresh() }
-    public func perform(_ command: MediaCommand) async throws { try await implementation.perform(command) }
-    public func cancelPendingWork() async { await implementation.cancelPendingWork() }
+    public func refresh(operationID: MediaOperationID) async throws -> MediaAdapterUpdate {
+        try await implementation.refresh(operationID: operationID)
+    }
+    public func perform(_ command: MediaCommand, operationID: MediaOperationID) async throws {
+        try await implementation.perform(command, operationID: operationID)
+    }
+    public func cancel(_ operationID: MediaOperationID) async {
+        await implementation.cancel(operationID)
+    }
+    public func cancelAllPendingWork() async { await implementation.cancelAllPendingWork() }
 }
 
 public actor SpotifyDesktopAdapter: MediaAdapter {
@@ -189,49 +238,106 @@ public actor SpotifyDesktopAdapter: MediaAdapter {
 
     public init(
         applicationStatus: any MediaApplicationStatusChecking = SystemMediaApplicationStatus(),
-        scriptExecutor: any MediaScriptExecuting = ProcessMediaScriptExecutor()
+        scriptExecutor: any MediaScriptExecuting = ProcessMediaScriptExecutor(),
+        maximumPendingOperations: Int = 16
     ) {
         implementation = ScriptedDesktopMediaAdapter(
             source: .spotify,
             applicationStatus: applicationStatus,
-            scriptExecutor: scriptExecutor
+            scriptExecutor: scriptExecutor,
+            maximumPendingOperations: maximumPendingOperations,
+            admissionObserver: nil
         )
     }
 
     public func activate() async { await implementation.activate() }
     public func deactivate() async { await implementation.deactivate() }
     public func updates() async -> AsyncStream<MediaAdapterUpdate> { await implementation.updates() }
-    public func refresh() async throws -> MediaAdapterUpdate { try await implementation.refresh() }
-    public func perform(_ command: MediaCommand) async throws { try await implementation.perform(command) }
-    public func cancelPendingWork() async { await implementation.cancelPendingWork() }
+    public func refresh(operationID: MediaOperationID) async throws -> MediaAdapterUpdate {
+        try await implementation.refresh(operationID: operationID)
+    }
+    public func perform(_ command: MediaCommand, operationID: MediaOperationID) async throws {
+        try await implementation.perform(command, operationID: operationID)
+    }
+    public func cancel(_ operationID: MediaOperationID) async {
+        await implementation.cancel(operationID)
+    }
+    public func cancelAllPendingWork() async { await implementation.cancelAllPendingWork() }
 }
 
 private actor ScriptedDesktopMediaAdapter {
+    private enum ActiveWorkResult: Sendable {
+        case refresh(MediaAdapterUpdate)
+        case command
+    }
+
+    private enum WorkItem {
+        case refresh(
+            operationID: MediaOperationID,
+            generation: UInt64,
+            continuation: CheckedContinuation<MediaAdapterUpdate, Error>
+        )
+        case command(
+            operationID: MediaOperationID,
+            generation: UInt64,
+            command: MediaCommand,
+            continuation: CheckedContinuation<Void, Error>
+        )
+
+        var operationID: MediaOperationID {
+            switch self {
+            case let .refresh(operationID, _, _), let .command(operationID, _, _, _):
+                operationID
+            }
+        }
+
+        var generation: UInt64 {
+            switch self {
+            case let .refresh(_, generation, _), let .command(_, generation, _, _):
+                generation
+            }
+        }
+    }
+
     let source: MediaSource
     private let applicationStatus: any MediaApplicationStatusChecking
     private let scriptExecutor: any MediaScriptExecuting
+    private let maximumPendingOperations: Int
+    private let admissionObserver: (any MediaAdapterAdmissionObserving)?
     private var isActive = false
+    private var activationGeneration: UInt64 = 0
     private var sequence: UInt64 = 0
     private var latestSnapshot: NowPlayingSnapshot?
+    private var workQueue: [WorkItem] = []
+    private var workTask: Task<Void, Never>?
+    private var activeWorkTask: Task<ActiveWorkResult, Error>?
+    private var activeOperationID: MediaOperationID?
+    private var cancelledOperationIDs: Set<MediaOperationID> = []
 
     init(
         source: MediaSource,
         applicationStatus: any MediaApplicationStatusChecking,
-        scriptExecutor: any MediaScriptExecuting
+        scriptExecutor: any MediaScriptExecuting,
+        maximumPendingOperations: Int,
+        admissionObserver: (any MediaAdapterAdmissionObserving)?
     ) {
         self.source = source
         self.applicationStatus = applicationStatus
         self.scriptExecutor = scriptExecutor
+        self.maximumPendingOperations = min(max(1, maximumPendingOperations), 64)
+        self.admissionObserver = admissionObserver
     }
 
     func activate() {
+        activationGeneration &+= 1
         isActive = true
     }
 
     func deactivate() async {
+        activationGeneration &+= 1
         isActive = false
         latestSnapshot = nil
-        await scriptExecutor.cancelAll()
+        await cancelAllPendingWork()
     }
 
     /// The public desktop scripting dictionaries expose no reliable change notification seam.
@@ -241,15 +347,195 @@ private actor ScriptedDesktopMediaAdapter {
         }
     }
 
-    func refresh() async throws -> MediaAdapterUpdate {
+    func refresh(operationID: MediaOperationID) async throws -> MediaAdapterUpdate {
+        guard !Task.isCancelled else { throw MediaError.cancelled(source: source) }
         guard isActive else { throw MediaError.disabled(source: source) }
-        guard await applicationStatus.isRunning(bundleIdentifier: source.bundleIdentifier) else {
+        guard !containsOperation(operationID) else {
+            throw MediaError.automationFailed(source: source, exitCode: nil)
+        }
+        let generation = activationGeneration
+        await admissionObserver?.willAttemptAdmission(
+            source: source,
+            operationID: operationID
+        )
+        guard !Task.isCancelled, isActive, activationGeneration == generation else {
+            throw MediaError.cancelled(source: source)
+        }
+        guard !containsOperation(operationID) else {
+            throw MediaError.automationFailed(source: source, exitCode: nil)
+        }
+        guard admittedOperationCount < maximumPendingOperations else {
+            throw MediaError.operationQueueFull(
+                source: source,
+                limit: maximumPendingOperations
+            )
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            workQueue.append(
+                .refresh(
+                    operationID: operationID,
+                    generation: generation,
+                    continuation: continuation
+                )
+            )
+            startWorkerIfNeeded()
+        }
+    }
+
+    func perform(_ command: MediaCommand, operationID: MediaOperationID) async throws {
+        guard !Task.isCancelled else { throw MediaError.cancelled(source: source) }
+        guard isActive else { throw MediaError.disabled(source: source) }
+        guard !containsOperation(operationID) else {
+            throw MediaError.automationFailed(source: source, exitCode: nil)
+        }
+        let generation = activationGeneration
+        await admissionObserver?.willAttemptAdmission(
+            source: source,
+            operationID: operationID
+        )
+        guard !Task.isCancelled, isActive, activationGeneration == generation else {
+            throw MediaError.cancelled(source: source)
+        }
+        guard !containsOperation(operationID) else {
+            throw MediaError.automationFailed(source: source, exitCode: nil)
+        }
+        guard admittedOperationCount < maximumPendingOperations else {
+            throw MediaError.operationQueueFull(
+                source: source,
+                limit: maximumPendingOperations
+            )
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            workQueue.append(
+                .command(
+                    operationID: operationID,
+                    generation: generation,
+                    command: command,
+                    continuation: continuation
+                )
+            )
+            startWorkerIfNeeded()
+        }
+    }
+
+    func cancel(_ operationID: MediaOperationID) async {
+        if let index = workQueue.firstIndex(where: { $0.operationID == operationID }) {
+            let work = workQueue.remove(at: index)
+            resume(work, throwing: MediaError.cancelled(source: source))
+            return
+        }
+
+        guard activeOperationID == operationID else {
+            // A late cancellation is a no-op and leaves no tombstone.
+            return
+        }
+        cancelledOperationIDs.insert(operationID)
+        activeWorkTask?.cancel()
+        await scriptExecutor.cancel(operationID)
+    }
+
+    func cancelAllPendingWork() async {
+        let queued = workQueue
+        workQueue.removeAll(keepingCapacity: false)
+        for work in queued {
+            resume(work, throwing: MediaError.cancelled(source: source))
+        }
+        let operationToCancel = activeOperationID
+        if let operationToCancel {
+            cancelledOperationIDs.insert(operationToCancel)
+        }
+        activeWorkTask?.cancel()
+        if let operationToCancel {
+            await scriptExecutor.cancel(operationToCancel)
+        }
+    }
+
+    private func startWorkerIfNeeded() {
+        guard workTask == nil else { return }
+        workTask = Task { [weak self] in
+            await self?.drainWorkQueue()
+        }
+    }
+
+    private func drainWorkQueue() async {
+        while !Task.isCancelled, !workQueue.isEmpty {
+            let work = workQueue.removeFirst()
+            let operationID = work.operationID
+            activeOperationID = operationID
+
+            let task = Task<ActiveWorkResult, Error> { [weak self] in
+                guard let self else { throw CancellationError() }
+                switch work {
+                case let .refresh(_, generation, _):
+                    let update = try await self.loadSnapshot(
+                        operationID: operationID,
+                        generation: generation
+                    )
+                    return .refresh(update)
+                case let .command(_, generation, command, _):
+                    try await self.runCommand(
+                        command,
+                        operationID: operationID,
+                        generation: generation
+                    )
+                    return .command
+                }
+            }
+            activeWorkTask = task
+            let result = await task.result
+            activeWorkTask = nil
+
+            switch (work, result) {
+            case let (.refresh(_, generation, continuation), .success(.refresh(update))):
+                if consumeCancellation(for: operationID, generation: generation) {
+                    continuation.resume(throwing: MediaError.cancelled(source: source))
+                } else {
+                    continuation.resume(returning: update)
+                }
+            case let (.command(_, generation, _, continuation), .success(.command)):
+                if consumeCancellation(for: operationID, generation: generation) {
+                    continuation.resume(throwing: MediaError.cancelled(source: source))
+                } else {
+                    continuation.resume()
+                }
+            case let (.refresh(_, _, continuation), .failure(error)):
+                cancelledOperationIDs.remove(operationID)
+                continuation.resume(throwing: map(error))
+            case let (.command(_, _, _, continuation), .failure(error)):
+                cancelledOperationIDs.remove(operationID)
+                continuation.resume(throwing: map(error))
+            default:
+                resume(work, throwing: MediaError.automationFailed(source: source, exitCode: nil))
+            }
+            activeOperationID = nil
+        }
+
+        workTask = nil
+        if !workQueue.isEmpty {
+            startWorkerIfNeeded()
+        }
+    }
+
+    private func loadSnapshot(
+        operationID: MediaOperationID,
+        generation: UInt64
+    ) async throws -> MediaAdapterUpdate {
+        try ensureCurrent(operationID: operationID, generation: generation)
+        let applicationIsRunning = await applicationStatus.isRunning(
+            bundleIdentifier: source.bundleIdentifier
+        )
+        try ensureCurrent(operationID: operationID, generation: generation)
+        guard applicationIsRunning else {
             latestSnapshot = nil
             return .sourceDisappeared(source: source, stamp: nextStamp())
         }
 
         do {
-            let output = try await scriptExecutor.execute(snapshotRequest)
+            let output = try await scriptExecutor.execute(
+                snapshotRequest,
+                operationID: operationID
+            )
+            try ensureCurrent(operationID: operationID, generation: generation)
             let snapshot = try MediaSnapshotParser.parse(
                 output,
                 source: source,
@@ -258,6 +544,7 @@ private actor ScriptedDesktopMediaAdapter {
             latestSnapshot = snapshot
             return .snapshot(snapshot)
         } catch MediaScriptExecutionError.applicationUnavailable {
+            try ensureCurrent(operationID: operationID, generation: generation)
             latestSnapshot = nil
             return .sourceDisappeared(source: source, stamp: nextStamp())
         } catch {
@@ -265,35 +552,82 @@ private actor ScriptedDesktopMediaAdapter {
         }
     }
 
-    func perform(_ command: MediaCommand) async throws {
-        guard isActive else { throw MediaError.disabled(source: source) }
-
-        let snapshot: NowPlayingSnapshot
-        if let latestSnapshot {
-            snapshot = latestSnapshot
-        } else {
-            let update = try await refresh()
-            guard case let .snapshot(refreshedSnapshot) = update else {
+    private func runCommand(
+        _ command: MediaCommand,
+        operationID: MediaOperationID,
+        generation: UInt64
+    ) async throws {
+        try ensureCurrent(operationID: operationID, generation: generation)
+        if latestSnapshot == nil {
+            let update = try await loadSnapshot(
+                operationID: operationID,
+                generation: generation
+            )
+            guard case .snapshot = update else {
                 throw MediaError.sourceUnavailable(source: source)
             }
-            snapshot = refreshedSnapshot
         }
 
-        let normalized = try command.normalized(for: snapshot)
-        guard await applicationStatus.isRunning(bundleIdentifier: source.bundleIdentifier) else {
+        let applicationIsRunning = await applicationStatus.isRunning(
+            bundleIdentifier: source.bundleIdentifier
+        )
+        try ensureCurrent(operationID: operationID, generation: generation)
+        guard applicationIsRunning else {
             latestSnapshot = nil
             throw MediaError.sourceUnavailable(source: source)
         }
 
-        do {
-            _ = try await scriptExecutor.execute(commandRequest(for: normalized))
-        } catch {
-            throw map(error)
+        // There is no await between this latest-state validation and the fixed-route launch call.
+        guard let latestSnapshot else {
+            throw MediaError.sourceUnavailable(source: source)
+        }
+        let revalidated = try command.normalized(for: latestSnapshot)
+        try ensureCurrent(operationID: operationID, generation: generation)
+        _ = try await scriptExecutor.execute(
+            commandRequest(for: revalidated),
+            operationID: operationID
+        )
+        try ensureCurrent(operationID: operationID, generation: generation)
+    }
+
+    private func ensureCurrent(
+        operationID: MediaOperationID,
+        generation: UInt64
+    ) throws {
+        guard !Task.isCancelled,
+              isActive,
+              activationGeneration == generation,
+              activeOperationID == operationID,
+              !cancelledOperationIDs.contains(operationID) else {
+            throw MediaError.cancelled(source: source)
         }
     }
 
-    func cancelPendingWork() async {
-        await scriptExecutor.cancelAll()
+    private func consumeCancellation(
+        for operationID: MediaOperationID,
+        generation: UInt64
+    ) -> Bool {
+        let wasCancelled = cancelledOperationIDs.remove(operationID) != nil
+        return wasCancelled || !isActive || activationGeneration != generation
+    }
+
+    private func containsOperation(_ operationID: MediaOperationID) -> Bool {
+        activeOperationID == operationID
+            || workQueue.contains { $0.operationID == operationID }
+    }
+
+    private var admittedOperationCount: Int {
+        workQueue.count + (activeOperationID == nil ? 0 : 1)
+    }
+
+    private func resume(_ work: WorkItem, throwing error: Error) {
+        cancelledOperationIDs.remove(work.operationID)
+        switch work {
+        case let .refresh(_, _, continuation):
+            continuation.resume(throwing: error)
+        case let .command(_, _, _, continuation):
+            continuation.resume(throwing: error)
+        }
     }
 
     private var snapshotRequest: MediaScriptRequest {
@@ -357,6 +691,9 @@ private actor ScriptedDesktopMediaAdapter {
         if let mediaError = error as? MediaError {
             return mediaError
         }
+        if error is CancellationError {
+            return .cancelled(source: source)
+        }
         guard let scriptError = error as? MediaScriptExecutionError else {
             return .automationFailed(source: source, exitCode: nil)
         }
@@ -366,6 +703,10 @@ private actor ScriptedDesktopMediaAdapter {
             .permissionDenied(source: source)
         case .applicationUnavailable:
             .sourceUnavailable(source: source)
+        case .timedOut:
+            .automationTimedOut(source: source)
+        case .responseTooLarge:
+            .responseTooLarge(source: source)
         case let .failed(exitCode):
             .automationFailed(source: source, exitCode: exitCode)
         case .cancelled:
@@ -509,76 +850,111 @@ private enum MediaAppleScripts {
         case .spotifySnapshot:
             spotifySnapshot
         case .appleMusicPlay:
-            guardedCommand(applicationID: "com.apple.Music", command: "play")
+            appleMusicPlay
         case .appleMusicPause:
-            guardedCommand(applicationID: "com.apple.Music", command: "pause")
+            appleMusicPause
         case .appleMusicNext:
-            guardedCommand(applicationID: "com.apple.Music", command: "next track")
+            appleMusicNext
         case .appleMusicPrevious:
-            guardedCommand(applicationID: "com.apple.Music", command: "previous track")
+            appleMusicPrevious
         case .spotifyPlay:
-            guardedCommand(applicationID: "com.spotify.client", command: "play")
+            spotifyPlay
         case .spotifyPause:
-            guardedCommand(applicationID: "com.spotify.client", command: "pause")
+            spotifyPause
         case .spotifyNext:
-            guardedCommand(applicationID: "com.spotify.client", command: "next track")
+            spotifyNext
         case .spotifyPrevious:
-            guardedCommand(applicationID: "com.spotify.client", command: "previous track")
+            spotifyPrevious
         case .appleMusicSeek:
-            guardedNumericCommand(
-                applicationID: "com.apple.Music",
-                variable: "player position",
-                maximum: nil
-            )
+            appleMusicSeek
         case .spotifySeek:
-            guardedNumericCommand(
-                applicationID: "com.spotify.client",
-                variable: "player position",
-                maximum: nil
-            )
+            spotifySeek
         case .appleMusicVolume:
-            guardedNumericCommand(
-                applicationID: "com.apple.Music",
-                variable: "sound volume",
-                maximum: 100
-            )
+            appleMusicVolume
         case .spotifyVolume:
-            guardedNumericCommand(
-                applicationID: "com.spotify.client",
-                variable: "sound volume",
-                maximum: 100
-            )
+            spotifyVolume
         }
     }
 
-    private static func guardedCommand(applicationID: String, command: String) -> String {
-        // Both values come exclusively from the closed route switch above.
-        """
-        if application id "\(applicationID)" is not running then error number -600
-        tell application id "\(applicationID)" to \(command)
-        """
-    }
+    private static let appleMusicPlay = #"""
+    if application id "com.apple.Music" is not running then error number -600
+    tell application id "com.apple.Music" to play
+    """#
 
-    private static func guardedNumericCommand(
-        applicationID: String,
-        variable: String,
-        maximum: Int?
-    ) -> String {
-        let upperBound = maximum.map {
-            "if requestedValue > \($0) then error number -1700"
-        } ?? ""
-        // Dynamic media values remain in argv and are parsed as numbers by AppleScript.
-        return """
-        on run argv
-            if (count of argv) is not 1 then error number -1700
-            set requestedValue to item 1 of argv as real
-            if requestedValue < 0 then error number -1700
-            \(upperBound)
-            if application id "\(applicationID)" is not running then error number -600
-            tell application id "\(applicationID)" to set \(variable) to requestedValue
-        end run
-        """
-    }
+    private static let appleMusicPause = #"""
+    if application id "com.apple.Music" is not running then error number -600
+    tell application id "com.apple.Music" to pause
+    """#
+
+    private static let appleMusicNext = #"""
+    if application id "com.apple.Music" is not running then error number -600
+    tell application id "com.apple.Music" to next track
+    """#
+
+    private static let appleMusicPrevious = #"""
+    if application id "com.apple.Music" is not running then error number -600
+    tell application id "com.apple.Music" to previous track
+    """#
+
+    private static let spotifyPlay = #"""
+    if application id "com.spotify.client" is not running then error number -600
+    tell application id "com.spotify.client" to play
+    """#
+
+    private static let spotifyPause = #"""
+    if application id "com.spotify.client" is not running then error number -600
+    tell application id "com.spotify.client" to pause
+    """#
+
+    private static let spotifyNext = #"""
+    if application id "com.spotify.client" is not running then error number -600
+    tell application id "com.spotify.client" to next track
+    """#
+
+    private static let spotifyPrevious = #"""
+    if application id "com.spotify.client" is not running then error number -600
+    tell application id "com.spotify.client" to previous track
+    """#
+
+    private static let appleMusicSeek = #"""
+    on run argv
+        if (count of argv) is not 1 then error number -1700
+        set requestedValue to item 1 of argv as real
+        if requestedValue < 0 then error number -1700
+        if application id "com.apple.Music" is not running then error number -600
+        tell application id "com.apple.Music" to set player position to requestedValue
+    end run
+    """#
+
+    private static let spotifySeek = #"""
+    on run argv
+        if (count of argv) is not 1 then error number -1700
+        set requestedValue to item 1 of argv as real
+        if requestedValue < 0 then error number -1700
+        if application id "com.spotify.client" is not running then error number -600
+        tell application id "com.spotify.client" to set player position to requestedValue
+    end run
+    """#
+
+    private static let appleMusicVolume = #"""
+    on run argv
+        if (count of argv) is not 1 then error number -1700
+        set requestedValue to item 1 of argv as real
+        if requestedValue < 0 or requestedValue > 100 then error number -1700
+        if application id "com.apple.Music" is not running then error number -600
+        tell application id "com.apple.Music" to set sound volume to requestedValue
+    end run
+    """#
+
+    private static let spotifyVolume = #"""
+    on run argv
+        if (count of argv) is not 1 then error number -1700
+        set requestedValue to item 1 of argv as real
+        if requestedValue < 0 or requestedValue > 100 then error number -1700
+        if application id "com.spotify.client" is not running then error number -600
+        tell application id "com.spotify.client" to set sound volume to requestedValue
+    end run
+    """#
 
     private static let handlers = #"""
     on replaceText(findText, replacementText, sourceText)

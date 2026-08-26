@@ -214,7 +214,10 @@ public enum MediaError: Error, Equatable, Sendable {
     case invalidSnapshot(source: MediaSource)
     case malformedResponse(source: MediaSource)
     case automationFailed(source: MediaSource, exitCode: Int32?)
+    case automationTimedOut(source: MediaSource)
+    case responseTooLarge(source: MediaSource)
     case cancelled(source: MediaSource)
+    case operationQueueFull(source: MediaSource, limit: Int)
     case commandQueueFull(source: MediaSource, limit: Int)
     case subscriberLimitReached(limit: Int)
 }

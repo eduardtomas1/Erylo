@@ -1,6 +1,14 @@
 import EryloCore
 import Foundation
 
+public struct MediaOperationID: Hashable, Sendable {
+    public let rawValue: UUID
+
+    public init(rawValue: UUID = UUID()) {
+        self.rawValue = rawValue
+    }
+}
+
 public enum MediaAdapterUpdate: Equatable, Sendable {
     case snapshot(NowPlayingSnapshot)
     case sourceDisappeared(source: MediaSource, stamp: MediaUpdateStamp)
@@ -32,9 +40,30 @@ public protocol MediaAdapter: Sendable {
     func activate() async
     func deactivate() async
     func updates() async -> AsyncStream<MediaAdapterUpdate>
-    func refresh() async throws -> MediaAdapterUpdate
-    func perform(_ command: MediaCommand) async throws
-    func cancelPendingWork() async
+    func refresh(operationID: MediaOperationID) async throws -> MediaAdapterUpdate
+    func perform(_ command: MediaCommand, operationID: MediaOperationID) async throws
+    func cancel(_ operationID: MediaOperationID) async
+    func cancelAllPendingWork() async
+}
+
+public extension MediaAdapter {
+    func refresh() async throws -> MediaAdapterUpdate {
+        let operationID = MediaOperationID()
+        return try await withTaskCancellationHandler {
+            try await refresh(operationID: operationID)
+        } onCancel: {
+            Task { await cancel(operationID) }
+        }
+    }
+
+    func perform(_ command: MediaCommand) async throws {
+        let operationID = MediaOperationID()
+        try await withTaskCancellationHandler {
+            try await perform(command, operationID: operationID)
+        } onCancel: {
+            Task { await cancel(operationID) }
+        }
+    }
 }
 
 /// An explicit disabled adapter. Every entry point is zero-work and no stream remains open.
@@ -54,15 +83,16 @@ public struct DisabledMediaAdapter: MediaAdapter {
         }
     }
 
-    public func refresh() async throws -> MediaAdapterUpdate {
+    public func refresh(operationID: MediaOperationID) async throws -> MediaAdapterUpdate {
         throw MediaError.disabled(source: source)
     }
 
-    public func perform(_ command: MediaCommand) async throws {
+    public func perform(_ command: MediaCommand, operationID: MediaOperationID) async throws {
         throw MediaError.disabled(source: source)
     }
 
-    public func cancelPendingWork() async {}
+    public func cancel(_ operationID: MediaOperationID) async {}
+    public func cancelAllPendingWork() async {}
 }
 
 public enum MediaCoordinatorEvent: Equatable, Sendable {
@@ -81,16 +111,16 @@ public struct MediaCoordinatorPolicy: Equatable, Sendable {
         maximumSubscribers: Int = 16,
         subscriberBufferSize: Int = 32
     ) {
-        self.maximumPendingCommands = max(1, maximumPendingCommands)
-        self.maximumSubscribers = max(1, maximumSubscribers)
-        self.subscriberBufferSize = max(1, subscriberBufferSize)
+        self.maximumPendingCommands = min(max(1, maximumPendingCommands), 128)
+        self.maximumSubscribers = min(max(1, maximumSubscribers), 64)
+        self.subscriberBufferSize = min(max(1, subscriberBufferSize), 256)
     }
 }
 
 /// Owns enabled-state, stale-update rejection, snapshot dedupe, subscriptions, and command ordering.
 public actor MediaCoordinator {
     private struct QueuedCommand {
-        let identifier: UUID
+        let identifier: MediaOperationID
         let source: MediaSource
         let generation: UInt64
         let command: MediaCommand
@@ -111,7 +141,7 @@ public actor MediaCoordinator {
     private var commandQueue: [QueuedCommand] = []
     private var commandWorker: Task<Void, Never>?
     private var activeCommand: QueuedCommand?
-    private var cancelledCommandIdentifiers: Set<UUID> = []
+    private var cancelledCommandIdentifiers: Set<MediaOperationID> = []
 
     public init(
         adapters: [any MediaAdapter],
@@ -167,7 +197,12 @@ public actor MediaCoordinator {
         }
 
         do {
-            let update = try await adapter.refresh()
+            let operationID = MediaOperationID()
+            let update = try await withTaskCancellationHandler {
+                try await adapter.refresh(operationID: operationID)
+            } onCancel: {
+                Task { await adapter.cancel(operationID) }
+            }
             guard activeGenerations[source] == generation,
                   requestedEnabledSources.contains(source) else {
                 throw MediaError.cancelled(source: source)
@@ -216,7 +251,7 @@ public actor MediaCoordinator {
             )
         }
 
-        let identifier = UUID()
+        let identifier = MediaOperationID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 commandQueue.append(
@@ -318,7 +353,7 @@ public actor MediaCoordinator {
                 }
             }
         } else {
-            await adapter.cancelPendingWork()
+            await adapter.cancelAllPendingWork()
             await adapter.deactivate()
             guard sourceGenerations[source] == generation,
                   !requestedEnabledSources.contains(source) else { return }
@@ -461,7 +496,10 @@ public actor MediaCoordinator {
                       let latestSnapshot = snapshots[queued.source] {
                 do {
                     let revalidated = try queued.command.normalized(for: latestSnapshot)
-                    try await adapter.perform(revalidated)
+                    try await adapter.perform(
+                        revalidated,
+                        operationID: queued.identifier
+                    )
                     if activeGenerations[queued.source] != queued.generation
                         || cancelledCommandIdentifiers.contains(queued.identifier) {
                         result = .failure(MediaError.cancelled(source: queued.source))
@@ -496,7 +534,7 @@ public actor MediaCoordinator {
         }
     }
 
-    private func cancelCommand(_ identifier: UUID, source: MediaSource) async {
+    private func cancelCommand(_ identifier: MediaOperationID, source: MediaSource) async {
         if let index = commandQueue.firstIndex(where: { $0.identifier == identifier }) {
             let queued = commandQueue.remove(at: index)
             cancelledCommandIdentifiers.remove(identifier)
@@ -510,7 +548,7 @@ public actor MediaCoordinator {
             return
         }
         cancelledCommandIdentifiers.insert(identifier)
-        await adapters[source]?.cancelPendingWork()
+        await adapters[source]?.cancel(identifier)
     }
 
     private func cancelQueuedCommands(for source: MediaSource, error: MediaError) {

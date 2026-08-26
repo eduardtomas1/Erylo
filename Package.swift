@@ -10,10 +10,12 @@ let package = Package(
     products: [
         .executable(name: "Erylo", targets: ["EryloApp"]),
         .library(name: "EryloActivity", targets: ["EryloActivity"]),
+        .library(name: "EryloAppIntents", targets: ["EryloAppIntents"]),
         .library(name: "EryloCore", targets: ["EryloCore"]),
         .library(name: "EryloGlance", targets: ["EryloGlance"]),
         .library(name: "EryloIntegrations", targets: ["EryloIntegrations"]),
         .library(name: "EryloSettingsUI", targets: ["EryloSettingsUI"]),
+        .library(name: "EryloLocalIntegrations", targets: ["EryloLocalIntegrations"]),
         .library(name: "EryloSurface", targets: ["EryloSurface"]),
         .library(name: "EryloTrust", targets: ["EryloTrust"]),
         .library(name: "EryloWindowing", targets: ["EryloWindowing"]),
@@ -22,9 +24,14 @@ let package = Package(
         .executable(name: "EryloGlanceTests", targets: ["EryloGlanceTests"]),
         .executable(name: "EryloMediaTests", targets: ["EryloMediaTests"]),
         .executable(name: "EryloTrustTests", targets: ["EryloTrustTests"]),
+        .executable(name: "EryloIntegrationTests", targets: ["EryloIntegrationTests"]),
     ],
     targets: [
         .target(name: "EryloActivity"),
+        .target(
+            name: "EryloAppIntents",
+            dependencies: ["EryloLocalIntegrations"]
+        ),
         .target(name: "EryloCore"),
         .target(
             name: "EryloGlance",
@@ -51,6 +58,10 @@ let package = Package(
                 "EryloCore",
                 "EryloTrust",
             ]
+        ),
+        .target(
+            name: "EryloLocalIntegrations",
+            dependencies: ["EryloActivity"]
         ),
         .target(
             name: "EryloWindowing",
@@ -103,6 +114,14 @@ let package = Package(
                 "EryloTrust",
             ],
             path: "Tests/TrustHarness"
+        ),
+        .executableTarget(
+            name: "EryloIntegrationTests",
+            dependencies: [
+                "EryloActivity",
+                "EryloLocalIntegrations",
+            ],
+            path: "Tests/IntegrationHarness"
         ),
     ],
     swiftLanguageModes: [.v6]

@@ -20,3 +20,4 @@ swift run EryloFoundationTests
 swift run EryloGlanceTests
 swift run EryloMediaTests
 swift run EryloTrustTests
+swift run EryloIntegrationTests

@@ -14,7 +14,9 @@ if [[ -z "$swift_major" || "$swift_major" -lt 6 ]]; then
 fi
 
 swift build
+Scripts/check-media-api-surface.sh
 swift run EryloActivityTests
 swift run EryloFoundationTests
 swift run EryloGlanceTests
+swift run EryloMediaTests
 swift run EryloTrustTests

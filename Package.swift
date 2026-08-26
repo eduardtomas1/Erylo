@@ -20,6 +20,7 @@ let package = Package(
         .executable(name: "EryloActivityTests", targets: ["EryloActivityTests"]),
         .executable(name: "EryloFoundationTests", targets: ["EryloFoundationTests"]),
         .executable(name: "EryloGlanceTests", targets: ["EryloGlanceTests"]),
+        .executable(name: "EryloMediaTests", targets: ["EryloMediaTests"]),
         .executable(name: "EryloTrustTests", targets: ["EryloTrustTests"]),
     ],
     targets: [
@@ -85,6 +86,14 @@ let package = Package(
                 "EryloGlance",
             ],
             path: "Tests/GlanceHarness"
+        ),
+        .executableTarget(
+            name: "EryloMediaTests",
+            dependencies: [
+                "EryloCore",
+                "EryloIntegrations",
+            ],
+            path: "Tests/MediaHarness"
         ),
         .executableTarget(
             name: "EryloTrustTests",

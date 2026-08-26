@@ -1,0 +1,318 @@
+import AppKit
+import EryloCore
+import EryloTrust
+import Foundation
+import Observation
+import UniformTypeIdentifiers
+
+public enum DisplayChoiceLimits {
+    public static let maximumChoices = SettingsLimits.maximumEnabledDisplayIDs
+    public static let maximumNameBytes = 80
+    public static let maximumInjectedChoicesScanned = 256
+}
+
+public struct DisplayChoice: Identifiable, Equatable, Sendable {
+    public let identity: DisplayIdentity
+    public let name: String
+
+    public var id: DisplayIdentity { identity }
+
+    public init(identity: DisplayIdentity, name: String) {
+        self.identity = identity
+        self.name = Self.safeName(name)
+    }
+
+    private static func safeName(_ value: String) -> String {
+        var result = ""
+        var byteCount = 0
+        for scalar in value.unicodeScalars.prefix(DisplayChoiceLimits.maximumNameBytes * 2) {
+            guard !CharacterSet.controlCharacters.contains(scalar) else { continue }
+            let fragment = String(scalar)
+            let fragmentBytes = fragment.utf8.count
+            guard byteCount + fragmentBytes <= DisplayChoiceLimits.maximumNameBytes else { break }
+            result.unicodeScalars.append(scalar)
+            byteCount += fragmentBytes
+        }
+        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Unnamed display" : trimmed
+    }
+}
+
+@MainActor
+public protocol DiagnosticsDestinationChoosing: AnyObject {
+    func chooseDestination() async -> URL?
+}
+
+@MainActor
+public final class SystemDiagnosticsDestinationChooser: DiagnosticsDestinationChoosing {
+    public init() {}
+
+    public func chooseDestination() async -> URL? {
+        let panel = NSSavePanel()
+        panel.title = "Export Erylo Diagnostics"
+        panel.nameFieldStringValue = "Erylo-Diagnostics.json"
+        panel.canCreateDirectories = true
+        panel.isExtensionHidden = false
+        panel.allowedContentTypes = [.json]
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+}
+
+@MainActor
+@Observable
+public final class TrustSettingsViewModel {
+    public private(set) var settings: EryloSettings
+    public private(set) var launchAtLogin: LaunchAtLoginSnapshot
+    public private(set) var statusMessage: String?
+    public private(set) var isWorking = false
+    public private(set) var displayChoices: [DisplayChoice]
+
+    @ObservationIgnored
+    private let coordinator: any TrustSettingsCoordinating
+
+    @ObservationIgnored
+    private let diagnosticsExporter: DiagnosticsExporter
+
+    @ObservationIgnored
+    private var operationCount = 0
+
+    @ObservationIgnored
+    private var hasLoaded = false
+
+    @ObservationIgnored
+    private var nextOperationSequence: UInt64 = 0
+
+    @ObservationIgnored
+    private var latestAppliedSequence: UInt64 = 0
+
+    public init(
+        coordinator: any TrustSettingsCoordinating,
+        diagnosticsExporter: DiagnosticsExporter,
+        initialSettings: EryloSettings = .safeDefaults,
+        displayChoices: [DisplayChoice] = []
+    ) {
+        self.coordinator = coordinator
+        self.diagnosticsExporter = diagnosticsExporter
+        settings = initialSettings
+        launchAtLogin = .unavailable
+        self.displayChoices = Self.normalizedDisplayChoices(displayChoices)
+    }
+
+    /// Browsing settings performs reads only. It does not construct providers, start work, or
+    /// request a permission.
+    public func load() async {
+        guard !hasLoaded else { return }
+        hasLoaded = true
+        let sequence = allocateSequence()
+        let loadedSettings = await coordinator.currentSettings()
+        let loadedLaunchAtLogin = await coordinator.launchAtLoginSnapshot()
+        guard accept(sequence) else { return }
+        settings = loadedSettings
+        launchAtLogin = loadedLaunchAtLogin
+    }
+
+    public func setModuleEnabled(_ module: EryloModule, enabled: Bool) async {
+        let sequence = beginOperation()
+        let result = await coordinator.setModuleEnabled(
+            module,
+            enabled: enabled,
+            permissionPolicy: module.permissionRequirement == nil ? .doNotRequest : .requestIfNeeded
+        )
+        apply(result, sequence: sequence)
+        endOperation()
+    }
+
+    public func setDisplaySurfaceEnabled(_ enabled: Bool) async {
+        var displays = settings.displays
+        displays.isEnabled = enabled
+        await applySettingChange(.displays(displays))
+    }
+
+    public func setDisplayEnabled(_ identity: DisplayIdentity, enabled: Bool) async {
+        var displays = settings.displays
+        var enabledIDs = displays.enabledDisplayIDs
+            ?? displayChoices.map { $0.identity.rawValue }
+        if enabled {
+            enabledIDs.append(identity.rawValue)
+        } else {
+            enabledIDs.removeAll { $0 == identity.rawValue }
+        }
+        displays = DisplayPreferences(
+            isEnabled: displays.isEnabled,
+            enabledDisplayIDs: enabledIDs,
+            selectedDisplayID: displays.selectedDisplayID
+        )
+        if displays.selectedDisplayID == identity.rawValue, !enabled {
+            displays.selectedDisplayID = nil
+        }
+        await applySettingChange(.displays(displays))
+    }
+
+    public func setUseAllAvailableDisplays(_ useAll: Bool) async {
+        var displays = settings.displays
+        displays.enabledDisplayIDs = useAll
+            ? nil
+            : displayChoices.map { $0.identity.rawValue }
+        await applySettingChange(.displays(displays))
+    }
+
+    public func useAllAvailableDisplays() async {
+        await setUseAllAvailableDisplays(true)
+    }
+
+    public func updateDisplayChoices(_ choices: [DisplayChoice]) {
+        displayChoices = Self.normalizedDisplayChoices(choices)
+    }
+
+    public func selectDisplay(_ identity: DisplayIdentity?) async {
+        var displays = settings.displays
+        displays.selectedDisplayID = identity?.rawValue
+        await applySettingChange(.displays(displays))
+    }
+
+    public func setMotion(_ motion: MotionPreference) async {
+        await applySettingChange(.motion(motion))
+    }
+
+    public func setFullscreen(_ fullscreen: FullscreenBehavior) async {
+        await applySettingChange(.fullscreen(fullscreen))
+    }
+
+    public func setLaunchAtLoginEnabled(_ enabled: Bool) async {
+        let sequence = beginOperation()
+        let result = await coordinator.setLaunchAtLoginEnabled(enabled)
+        apply(result, sequence: sequence)
+        endOperation()
+    }
+
+    public func setCrashAndDiagnosticSharingConsent(_ consent: Bool) async {
+        await applySettingChange(.crashAndDiagnosticSharingConsent(consent))
+    }
+
+    public func completeOnboarding() async {
+        await applySettingChange(.onboardingCompleted(true))
+    }
+
+    public func resetToSafeDefaults() async {
+        let sequence = beginOperation()
+        let result = await coordinator.resetToSafeDefaults()
+        let didApply = apply(result, sequence: sequence)
+        if didApply, result.outcome == .applied {
+            statusMessage = "Safe defaults restored. All activity modules are off."
+        }
+        endOperation()
+    }
+
+    public func exportDiagnostics(to destination: URL) async {
+        let sequence = beginOperation()
+        let context = await coordinator.diagnosticsContext()
+        do {
+            _ = try await diagnosticsExporter.export(
+                settings: context.settings,
+                providerHealth: context.providerHealth,
+                to: destination
+            )
+            if accept(sequence) {
+                statusMessage = "Diagnostics saved. Nothing was uploaded."
+            }
+        } catch {
+            if accept(sequence) {
+                statusMessage = "Diagnostics could not be saved. No data was uploaded."
+            }
+        }
+        endOperation()
+    }
+
+    public func isDisplayEnabled(_ identity: DisplayIdentity) -> Bool {
+        settings.displays.enabledDisplayIDs?.contains(identity.rawValue) ?? true
+    }
+
+    private func applySettingChange(_ change: TrustSettingsChange) async {
+        applyLocally(change)
+        let sequence = beginOperation()
+        let result = await coordinator.apply(change)
+        apply(result, sequence: sequence)
+        endOperation()
+    }
+
+    private func applyLocally(_ change: TrustSettingsChange) {
+        switch change {
+        case let .displays(displays):
+            settings.displays = displays
+        case let .motion(motion):
+            settings.motion = motion
+        case let .fullscreen(fullscreen):
+            settings.fullscreenBehavior = fullscreen
+        case let .crashAndDiagnosticSharingConsent(consent):
+            settings.crashAndDiagnosticSharingConsent = consent
+        case let .onboardingCompleted(completed):
+            settings.onboardingCompleted = completed
+        }
+    }
+
+    @discardableResult
+    private func apply(_ result: TrustSettingsUpdateResult, sequence: UInt64) -> Bool {
+        guard accept(sequence) else { return false }
+        settings = result.settings
+        if let launchAtLogin = result.launchAtLogin {
+            self.launchAtLogin = launchAtLogin
+        }
+        switch result.failure {
+        case .none:
+            statusMessage = nil
+        case .permissionDenied:
+            statusMessage = "Access was not granted. The module remains off."
+        case .providerFactoryFailed, .providerStartFailed:
+            statusMessage = "The module could not start and remains off."
+        case .persistenceFailed:
+            statusMessage = "The change could not be saved and was rolled back."
+        case .rollbackFailed:
+            statusMessage = "The change failed and cleanup needs attention. Check diagnostics."
+        case .launchAtLoginFailed:
+            statusMessage = "macOS could not change the Login Item. The saved preference was not changed."
+        case .operationCancelled:
+            statusMessage = "The cancelled change did not run."
+        case .operationSuperseded:
+            statusMessage = "A newer change replaced this one."
+        case .queueCapacityExceeded:
+            statusMessage = "Too many changes are pending. Please try again in a moment."
+        case .coordinatorShutDown:
+            statusMessage = "Erylo is shutting down. No further changes can run."
+        }
+        return true
+    }
+
+    private func beginOperation() -> UInt64 {
+        operationCount += 1
+        isWorking = true
+        return allocateSequence()
+    }
+
+    private func endOperation() {
+        operationCount = max(operationCount - 1, 0)
+        isWorking = operationCount > 0
+    }
+
+    private func allocateSequence() -> UInt64 {
+        precondition(nextOperationSequence < UInt64.max, "settings UI operation sequence exhausted")
+        nextOperationSequence += 1
+        return nextOperationSequence
+    }
+
+    private func accept(_ sequence: UInt64) -> Bool {
+        guard sequence >= latestAppliedSequence else { return false }
+        latestAppliedSequence = sequence
+        return true
+    }
+
+    private static func normalizedDisplayChoices(_ choices: [DisplayChoice]) -> [DisplayChoice] {
+        var seen: Set<DisplayIdentity> = []
+        var result: [DisplayChoice] = []
+        for choice in choices.prefix(DisplayChoiceLimits.maximumInjectedChoicesScanned)
+            where seen.insert(choice.identity).inserted {
+            result.append(DisplayChoice(identity: choice.identity, name: choice.name))
+            if result.count == DisplayChoiceLimits.maximumChoices { break }
+        }
+        return result
+    }
+}

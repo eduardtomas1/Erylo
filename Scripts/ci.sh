@@ -14,4 +14,5 @@ if [[ -z "$swift_major" || "$swift_major" -lt 6 ]]; then
 fi
 
 swift build
+swift run EryloActivityTests
 swift run EryloFoundationTests

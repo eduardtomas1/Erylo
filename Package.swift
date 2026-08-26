@@ -9,17 +9,23 @@ let package = Package(
     ],
     products: [
         .executable(name: "Erylo", targets: ["EryloApp"]),
+        .library(name: "EryloActivity", targets: ["EryloActivity"]),
         .library(name: "EryloCore", targets: ["EryloCore"]),
         .library(name: "EryloIntegrations", targets: ["EryloIntegrations"]),
         .library(name: "EryloSurface", targets: ["EryloSurface"]),
         .library(name: "EryloWindowing", targets: ["EryloWindowing"]),
+        .executable(name: "EryloActivityTests", targets: ["EryloActivityTests"]),
         .executable(name: "EryloFoundationTests", targets: ["EryloFoundationTests"]),
     ],
     targets: [
+        .target(name: "EryloActivity"),
         .target(name: "EryloCore"),
         .target(
             name: "EryloIntegrations",
-            dependencies: ["EryloCore"]
+            dependencies: [
+                "EryloActivity",
+                "EryloCore",
+            ]
         ),
         .target(
             name: "EryloSurface",
@@ -36,6 +42,11 @@ let package = Package(
         .executableTarget(
             name: "EryloApp",
             dependencies: ["EryloWindowing"]
+        ),
+        .executableTarget(
+            name: "EryloActivityTests",
+            dependencies: ["EryloActivity"],
+            path: "Tests/ActivityHarness"
         ),
         .executableTarget(
             name: "EryloFoundationTests",

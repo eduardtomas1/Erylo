@@ -1,14 +1,42 @@
 import CoreGraphics
 import EryloCore
+import Foundation
 import Observation
 
 @MainActor
+private final class PanelSurfaceOwnedResources {
+    let activityModel: SurfaceActivityModel
+    var activityObserverID: UUID?
+    var pendingHoverOperation: (any ScheduledOperation)?
+    var pendingMotionOperation: (any ScheduledOperation)?
+
+    init(activityModel: SurfaceActivityModel) {
+        self.activityModel = activityModel
+    }
+
+    func cleanup() {
+        pendingHoverOperation?.cancel()
+        pendingHoverOperation = nil
+        pendingMotionOperation?.cancel()
+        pendingMotionOperation = nil
+        if let activityObserverID {
+            activityModel.removeObserver(activityObserverID)
+            self.activityObserverID = nil
+        }
+    }
+}
+
+@MainActor
 @Observable
+/// Borrows the shared activity model and owns only its observer registration and
+/// one-shot interaction tokens. Detached release transfers those resources to
+/// MainActor cleanup without capturing `self`.
 public final class PanelSurfaceModel {
     public private(set) var stateMachine: PanelStateMachine
     public private(set) var displayGeometry: DisplayGeometry
     public private(set) var interactionHitRegion: HitRegion
     public let metrics: PanelMetrics
+    public let activityModel: SurfaceActivityModel
 
     @ObservationIgnored
     public var didChange: (@MainActor @Sendable () -> Void)?
@@ -20,10 +48,17 @@ public final class PanelSurfaceModel {
     private let timing: PanelInteractionTiming
 
     @ObservationIgnored
-    private var pendingHoverOperation: (any ScheduledOperation)?
+    private let ownedResources: PanelSurfaceOwnedResources
 
-    @ObservationIgnored
-    private var pendingMotionOperation: (any ScheduledOperation)?
+    private var pendingHoverOperation: (any ScheduledOperation)? {
+        get { ownedResources.pendingHoverOperation }
+        set { ownedResources.pendingHoverOperation = newValue }
+    }
+
+    private var pendingMotionOperation: (any ScheduledOperation)? {
+        get { ownedResources.pendingMotionOperation }
+        set { ownedResources.pendingMotionOperation = newValue }
+    }
 
     @ObservationIgnored
     private var isPointerInside = false
@@ -39,30 +74,91 @@ public final class PanelSurfaceModel {
         PanelLayout(display: displayGeometry, state: state, metrics: metrics)
     }
 
-    public init(
+    public var content: ActivitySurfaceContent {
+        ActivitySurfaceContent(
+            state: state,
+            phase: activityModel.phase,
+            current: activityModel.current,
+            queueContext: activityModel.queueContext,
+            action: activityModel.currentAction,
+            actionDispatchState: activityModel.actionDispatchState
+        )
+    }
+
+    public var accessibility: PanelSurfaceAccessibility {
+        PanelSurfaceAccessibility(content: content)
+    }
+
+    public var motionStyle: PanelMotionStyle {
+        reduceMotion ? .reduced : .standard
+    }
+
+    /// Preserves the original technical-spike construction API with a fully inert activity model.
+    public convenience init(
         displayGeometry: DisplayGeometry,
         initialState: PanelPresentationState = .compact,
         metrics: PanelMetrics = .feasibility,
         scheduler: any OneShotScheduling = TaskOneShotScheduler(),
         timing: PanelInteractionTiming = .standard
     ) {
+        self.init(
+            displayGeometry: displayGeometry,
+            initialState: initialState,
+            metrics: metrics,
+            scheduler: scheduler,
+            timing: timing,
+            activityModel: SurfaceActivityModel(inert: ())
+        )
+    }
+
+    public init(
+        displayGeometry: DisplayGeometry,
+        initialState: PanelPresentationState = .hidden,
+        metrics: PanelMetrics = .feasibility,
+        scheduler: any OneShotScheduling = TaskOneShotScheduler(),
+        timing: PanelInteractionTiming = .standard,
+        activityModel: SurfaceActivityModel
+    ) {
         self.displayGeometry = displayGeometry
         self.metrics = metrics
         self.scheduler = scheduler
         self.timing = timing
-        stateMachine = PanelStateMachine(initialState: initialState)
+        self.activityModel = activityModel
+        ownedResources = PanelSurfaceOwnedResources(activityModel: activityModel)
+        var initialStateMachine = PanelStateMachine(initialState: initialState)
+        if initialState == .hidden, activityModel.current != nil {
+            initialStateMachine.updateActivityAvailability(true)
+        }
+        stateMachine = initialStateMachine
         interactionHitRegion = PanelLayout(
             display: displayGeometry,
-            state: initialState,
+            state: initialStateMachine.state,
             metrics: metrics
         ).hitRegion
+        ownedResources.activityObserverID = activityModel.addObserver { [weak self] in
+            self?.activityDidChange()
+        }
+    }
+
+    deinit {
+        let ownedResources = ownedResources
+        Task { @MainActor in
+            ownedResources.cleanup()
+        }
     }
 
     public func send(_ event: PanelEvent) {
         if event != .hoverBegan, event != .hoverEnded {
             cancelPendingHover()
         }
+        let stateBeforeEvent = state
         transition(event)
+        if event == .primaryAction,
+           stateBeforeEvent == .expanded,
+           state == .compact,
+           activityModel.current == nil {
+            updateActivityAvailability(false)
+        }
     }
 
     public func setPointerInside(_ isInside: Bool) {
@@ -140,6 +236,20 @@ public final class PanelSurfaceModel {
         pendingHoverOperation = nil
     }
 
+    private func activityDidChange() {
+        updateActivityAvailability(activityModel.current != nil)
+    }
+
+    private func updateActivityAvailability(_ hasActivity: Bool) {
+        cancelPendingHover()
+        let oldState = state
+        stateMachine.updateActivityAvailability(hasActivity)
+        if state != oldState {
+            beginHitRegionTransition(to: layout.hitRegion)
+            didChange?()
+        }
+    }
+
     public func update(displayGeometry: DisplayGeometry) {
         guard self.displayGeometry != displayGeometry else { return }
         self.displayGeometry = displayGeometry
@@ -148,6 +258,11 @@ public final class PanelSurfaceModel {
         interactionHitRegion = layout.hitRegion
         didChange?()
     }
+}
+
+public enum PanelMotionStyle: Equatable, Sendable {
+    case standard
+    case reduced
 }
 
 public struct PanelPointerDisposition: Equatable, Sendable {

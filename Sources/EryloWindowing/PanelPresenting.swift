@@ -1,5 +1,6 @@
 import CoreGraphics
 import EryloCore
+import EryloSurface
 
 @MainActor
 public protocol PanelPresenting: AnyObject {
@@ -14,4 +15,11 @@ public protocol PanelPresenting: AnyObject {
     func cancelPendingInteractions()
 }
 
-public typealias PanelPresentationFactory = @MainActor (DisplaySnapshot) -> any PanelPresenting
+public typealias PanelPresentationFactory = @MainActor (
+    DisplaySnapshot
+) -> any PanelPresenting
+
+public typealias ActivityPanelPresentationFactory = @MainActor (
+    DisplaySnapshot,
+    SurfaceActivityModel
+) -> any PanelPresenting

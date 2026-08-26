@@ -2,8 +2,27 @@ import AppKit
 import CoreGraphics
 import EryloCore
 import EryloIntegrations
+import EryloSurface
 
 @MainActor
+private final class PanelCoordinatorOwnedResources {
+    let lifecycleEventSource: any PanelLifecycleEventSourcing
+    var panels: [CGDirectDisplayID: any PanelPresenting] = [:]
+
+    init(lifecycleEventSource: any PanelLifecycleEventSourcing) {
+        self.lifecycleEventSource = lifecycleEventSource
+    }
+
+    func cleanup() {
+        lifecycleEventSource.stop()
+        panels.values.forEach { $0.close() }
+        panels.removeAll()
+    }
+}
+
+@MainActor
+/// Borrows the injected activity model. Releasing a coordinator retires only the
+/// event source and panels it owns; the final model owner must call `shutdown()`.
 public final class PanelCoordinator {
     public private(set) var isRunning = false
     public private(set) var policy: DisplayPolicy
@@ -13,14 +32,43 @@ public final class PanelCoordinator {
     }
 
     private let displayProvider: any EnabledDisplayProviding
-    private let lifecycleEventSource: any PanelLifecycleEventSourcing
-    private let panelFactory: PanelPresentationFactory
+    private let panelFactory: ActivityPanelPresentationFactory
+    private let activityModel: SurfaceActivityModel
+    private let ownedResources: PanelCoordinatorOwnedResources
     /// Enforces the product invariant directly at the platform boundary.
-    private var panels: [CGDirectDisplayID: any PanelPresenting] = [:]
+    private var panels: [CGDirectDisplayID: any PanelPresenting] {
+        get { ownedResources.panels }
+        set { ownedResources.panels = newValue }
+    }
+
+    private var lifecycleEventSource: any PanelLifecycleEventSourcing {
+        ownedResources.lifecycleEventSource
+    }
     private var selectedDisplayIdentity: DisplayIdentity?
     private var isWorkspaceSleeping = false
+    private var isShutdown = false
+    private var activeEventLease: UUID?
+    private var isTerminalCleanupInProgress = false
+    private var terminalCleanupWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Preserves the original coordinator entry point with a stopped, zero-work activity model.
+    public convenience init(
+        displayProvider: any EnabledDisplayProviding = SystemDisplayProvider(),
+        policy: DisplayPolicy = .safeDefault,
+        lifecycleEventSource: any PanelLifecycleEventSourcing = SystemPanelLifecycleEventSource()
+    ) {
+        let activityModel = SurfaceActivityModel(inert: ())
+        self.init(
+            displayProvider: displayProvider,
+            policy: policy,
+            lifecycleEventSource: lifecycleEventSource,
+            activityModel: activityModel,
+            panelFactory: { PanelController(snapshot: $0, activityModel: $1) }
+        )
+    }
 
     public convenience init(
+        activityModel: SurfaceActivityModel,
         displayProvider: any EnabledDisplayProviding = SystemDisplayProvider(),
         policy: DisplayPolicy = .safeDefault,
         lifecycleEventSource: any PanelLifecycleEventSourcing = SystemPanelLifecycleEventSource()
@@ -29,7 +77,24 @@ public final class PanelCoordinator {
             displayProvider: displayProvider,
             policy: policy,
             lifecycleEventSource: lifecycleEventSource,
-            panelFactory: { PanelController(snapshot: $0) }
+            activityModel: activityModel,
+            panelFactory: { PanelController(snapshot: $0, activityModel: $1) }
+        )
+    }
+
+    /// Preserves the original injectable one-argument panel factory.
+    public convenience init(
+        displayProvider: any EnabledDisplayProviding,
+        policy: DisplayPolicy,
+        lifecycleEventSource: any PanelLifecycleEventSourcing,
+        panelFactory: @escaping PanelPresentationFactory
+    ) {
+        self.init(
+            displayProvider: displayProvider,
+            policy: policy,
+            lifecycleEventSource: lifecycleEventSource,
+            activityModel: SurfaceActivityModel(inert: ()),
+            panelFactory: { snapshot, _ in panelFactory(snapshot) }
         )
     }
 
@@ -37,61 +102,102 @@ public final class PanelCoordinator {
         displayProvider: any EnabledDisplayProviding,
         policy: DisplayPolicy,
         lifecycleEventSource: any PanelLifecycleEventSourcing,
-        panelFactory: @escaping PanelPresentationFactory
+        activityModel: SurfaceActivityModel,
+        panelFactory: @escaping ActivityPanelPresentationFactory
     ) {
         self.displayProvider = displayProvider
         self.policy = policy
-        self.lifecycleEventSource = lifecycleEventSource
+        self.activityModel = activityModel
         self.panelFactory = panelFactory
+        ownedResources = PanelCoordinatorOwnedResources(
+            lifecycleEventSource: lifecycleEventSource
+        )
     }
 
     deinit {
-        MainActor.assumeIsolated {
-            stop()
+        let ownedResources = ownedResources
+        Task { @MainActor in
+            ownedResources.cleanup()
         }
     }
 
+    /// Source-compatible immediate request. Use `startAndWait()` when a physical
+    /// model-lifecycle settlement barrier is required.
     public func start() {
-        guard !isRunning else { return }
-
+        guard !isShutdown, !isRunning else { return }
         isRunning = true
         isWorkspaceSleeping = false
-        if policy.isEnabled {
-            startLifecycleEventSource()
-            reconcileDisplays()
-        }
-    }
-
-    public func stop() {
-        guard isRunning || !panels.isEmpty else { return }
-        isRunning = false
-        isWorkspaceSleeping = false
-        lifecycleEventSource.stop()
-
-        panels.values.forEach { $0.close() }
-        panels.removeAll()
-        selectedDisplayIdentity = nil
-    }
-
-    public func update(policy: DisplayPolicy) {
-        guard self.policy != policy else { return }
-        let wasEnabled = self.policy.isEnabled
-        self.policy = policy
-        guard isRunning else { return }
-
-        if !policy.isEnabled {
-            lifecycleEventSource.stop()
-            panels.values.forEach { $0.close() }
-            panels.removeAll()
-            selectedDisplayIdentity = nil
+        guard policy.isEnabled else {
+            retireLifecycleEventSource()
+            closeAllPanels()
+            activityModel.requestStop()
             return
         }
-
-        if !wasEnabled {
-            startLifecycleEventSource()
-        }
-        guard !isWorkspaceSleeping else { return }
+        activityModel.start()
+        startLifecycleEventSource()
         reconcileDisplays()
+    }
+
+    public func startAndWait() async {
+        start()
+        await waitForLifecycleSettlement()
+    }
+
+    /// Source-compatible immediate request. The shared model owns the resulting
+    /// generation-safe drain until it physically settles.
+    public func stop() {
+        guard !isShutdown else { return }
+        isRunning = false
+        isWorkspaceSleeping = false
+        retireLifecycleEventSource()
+        closeAllPanels()
+        activityModel.requestStop()
+    }
+
+    public func stopAndWait() async {
+        stop()
+        await waitForLifecycleSettlement()
+    }
+
+    /// Final process shutdown cannot be superseded by a later start or policy request.
+    /// Call only from the final owner of the injected shared activity model.
+    public func shutdown() async {
+        if isTerminalCleanupInProgress {
+            await waitForTerminalCleanup()
+            return
+        }
+        guard !isShutdown else { return }
+        isShutdown = true
+        isTerminalCleanupInProgress = true
+        isRunning = false
+        isWorkspaceSleeping = false
+        retireLifecycleEventSource()
+        await activityModel.shutdown()
+        closeAllPanels()
+        finishTerminalCleanup()
+    }
+
+    /// Source-compatible immediate policy request. Use `updateAndWait(policy:)`
+    /// when disabling must also be a physical activity-model drain barrier.
+    public func update(policy: DisplayPolicy) {
+        guard !isShutdown, self.policy != policy else { return }
+        self.policy = policy
+        guard isRunning else { return }
+        if policy.isEnabled {
+            activityModel.start()
+            startLifecycleEventSource()
+            guard !isWorkspaceSleeping else { return }
+            reconcileDisplays()
+        } else {
+            retireLifecycleEventSource()
+            closeAllPanels()
+            activityModel.requestStop()
+        }
+    }
+
+    public func updateAndWait(policy: DisplayPolicy) async {
+        update(policy: policy)
+        await waitForLifecycleSettlement()
     }
 
     public func reconcileDisplays() {
@@ -115,7 +221,7 @@ public final class PanelCoordinator {
                     controller.show()
                 }
             } else {
-                let controller = panelFactory(snapshot)
+                let controller = panelFactory(snapshot, activityModel)
                 panels[directDisplayID] = controller
                 if !isWorkspaceSleeping {
                     controller.show()
@@ -126,8 +232,14 @@ public final class PanelCoordinator {
         updatePointer(NSEvent.mouseLocation)
     }
 
-    private func handle(_ event: PanelLifecycleEvent) {
-        guard isRunning else { return }
+    private func handle(_ event: PanelLifecycleEvent, lease: UUID) {
+        guard activeEventLease == lease,
+              lifecycleEventSource.isRunning,
+              isRunning,
+              policy.isEnabled,
+              !isShutdown else {
+            return
+        }
 
         switch event {
         case .displayConfigurationChanged, .activeSpaceChanged:
@@ -158,8 +270,46 @@ public final class PanelCoordinator {
     }
 
     private func startLifecycleEventSource() {
+        if lifecycleEventSource.isRunning, activeEventLease != nil { return }
+        if lifecycleEventSource.isRunning {
+            lifecycleEventSource.stop()
+        }
+        let lease = UUID()
+        activeEventLease = lease
         lifecycleEventSource.start { [weak self] event in
-            self?.handle(event)
+            self?.handle(event, lease: lease)
+        }
+    }
+
+    private func retireLifecycleEventSource() {
+        activeEventLease = nil
+        lifecycleEventSource.stop()
+    }
+
+    private func closeAllPanels() {
+        panels.values.forEach { $0.close() }
+        panels.removeAll()
+        selectedDisplayIdentity = nil
+    }
+
+    private func waitForTerminalCleanup() async {
+        guard isTerminalCleanupInProgress else { return }
+        await withCheckedContinuation { continuation in
+            terminalCleanupWaiters.append(continuation)
+        }
+    }
+
+    private func finishTerminalCleanup() {
+        isTerminalCleanupInProgress = false
+        let waiters = terminalCleanupWaiters
+        terminalCleanupWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func waitForLifecycleSettlement() async {
+        await activityModel.waitForRequestedLifecycleSettlement()
+        if isTerminalCleanupInProgress {
+            await waitForTerminalCleanup()
         }
     }
 }

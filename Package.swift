@@ -27,6 +27,7 @@ let package = Package(
         .executable(name: "EryloMediaTests", targets: ["EryloMediaTests"]),
         .executable(name: "EryloTrustTests", targets: ["EryloTrustTests"]),
         .executable(name: "EryloIntegrationTests", targets: ["EryloIntegrationTests"]),
+        .executable(name: "EryloSurfaceTests", targets: ["EryloSurfaceTests"]),
     ],
     targets: [
         .target(name: "EryloActivity"),
@@ -49,7 +50,10 @@ let package = Package(
         ),
         .target(
             name: "EryloSurface",
-            dependencies: ["EryloCore"]
+            dependencies: [
+                "EryloActivity",
+                "EryloCore",
+            ]
         ),
         .target(
             name: "EryloTrust",
@@ -76,7 +80,11 @@ let package = Package(
         ),
         .executableTarget(
             name: "EryloApp",
-            dependencies: ["EryloWindowing"]
+            dependencies: [
+                "EryloActivity",
+                "EryloSurface",
+                "EryloWindowing",
+            ]
         ),
         .executableTarget(
             name: "EryloActivityTests",
@@ -86,6 +94,7 @@ let package = Package(
         .executableTarget(
             name: "EryloFoundationTests",
             dependencies: [
+                "EryloActivity",
                 "EryloCore",
                 "EryloIntegrations",
                 "EryloSurface",
@@ -130,6 +139,16 @@ let package = Package(
                 "EryloLocalIntegrations",
             ],
             path: "Tests/IntegrationHarness"
+        ),
+        .executableTarget(
+            name: "EryloSurfaceTests",
+            dependencies: [
+                "EryloActivity",
+                "EryloCore",
+                "EryloSurface",
+                "EryloWindowing",
+            ],
+            path: "Tests/SurfaceHarness"
         ),
     ],
     swiftLanguageModes: [.v6]

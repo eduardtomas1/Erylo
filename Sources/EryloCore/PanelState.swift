@@ -36,6 +36,11 @@ public struct PanelStateMachine: Equatable, Sendable {
             stateBeforeDropTarget = nil
         case (.hidden, .show):
             state = .compact
+        case (.hidden, .primaryAction):
+            state = .compact
+        case (.hidden, .dragEntered):
+            stateBeforeDropTarget = .hidden
+            state = .dropTarget
         case (.compact, .hoverBegan):
             state = .peek
         case (.peek, .hoverEnded):
@@ -56,6 +61,30 @@ public struct PanelStateMachine: Equatable, Sendable {
         case (.dropTarget, .dropCompleted):
             state = .expanded
             stateBeforeDropTarget = nil
+        default:
+            break
+        }
+
+        return state
+    }
+
+    /// Broker availability is a package implementation detail, not a new public input case.
+    /// This keeps exhaustive switches over the original `PanelEvent` source-compatible.
+    @discardableResult
+    package mutating func updateActivityAvailability(
+        _ hasActivity: Bool
+    ) -> PanelPresentationState {
+        switch (state, hasActivity) {
+        case (.hidden, true):
+            state = .compact
+        case (.compact, false), (.peek, false):
+            state = .hidden
+        case (.dropTarget, false):
+            stateBeforeDropTarget = .hidden
+        case (.dropTarget, true):
+            if stateBeforeDropTarget == .hidden {
+                stateBeforeDropTarget = .compact
+            }
         default:
             break
         }

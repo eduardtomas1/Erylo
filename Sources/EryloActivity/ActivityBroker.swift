@@ -51,6 +51,36 @@ public struct ActivityBrokerWorkState: Equatable, Sendable {
     }
 }
 
+/// Package-scoped ownership token for a single snapshot-stream registration.
+/// The generation prevents a retired stream from removing a later reuse of the same identifier.
+package struct ActivityBrokerSubscriptionToken: Equatable, Hashable, Sendable {
+    package let subscriberID: UUID
+    package let generation: UInt64
+
+    package init(subscriberID: UUID, generation: UInt64) {
+        self.subscriberID = subscriberID
+        self.generation = generation
+    }
+}
+
+package struct ActivityBrokerSnapshotSubscription: Sendable {
+    package let token: ActivityBrokerSubscriptionToken
+    package let stream: AsyncStream<ActivityBrokerSnapshot>
+
+    package init(
+        token: ActivityBrokerSubscriptionToken,
+        stream: AsyncStream<ActivityBrokerSnapshot>
+    ) {
+        self.token = token
+        self.stream = stream
+    }
+}
+
+package enum ActivityBrokerSubscriptionError: Error, Equatable, Sendable {
+    case duplicateSubscriberIdentifier
+    case capacityExceeded(maximum: Int)
+}
+
 /// Owns validation, identity-based dedupe, ordering, preemption, expiry, and cancellation.
 ///
 /// Ordering is deterministic: higher priority first, then original submission sequence (FIFO),
@@ -64,12 +94,18 @@ public actor ActivityBroker {
         var expiryRevision: UInt64?
     }
 
+    private struct Subscriber: Sendable {
+        let token: ActivityBrokerSubscriptionToken
+        let continuation: AsyncStream<ActivityBrokerSnapshot>.Continuation
+    }
+
     private let expirationScheduler: any ActivityExpirationScheduling
     private var records: [ActivityIdentity: Record] = [:]
     private var expiryTasks: [ActivityIdentity: Task<Void, Never>] = [:]
-    private var subscribers: [UUID: AsyncStream<ActivityBrokerSnapshot>.Continuation] = [:]
+    private var subscribers: [UUID: Subscriber] = [:]
     private var nextSubmissionSequence: UInt64 = 0
     private var nextActivityRevision: UInt64 = 0
+    private var nextSubscriberGeneration: UInt64 = 0
     private var version: UInt64 = 0
 
     public init(
@@ -80,7 +116,7 @@ public actor ActivityBroker {
 
     deinit {
         expiryTasks.values.forEach { $0.cancel() }
-        subscribers.values.forEach { $0.finish() }
+        subscribers.values.forEach { $0.continuation.finish() }
     }
 
     /// Validates and atomically inserts or replaces a request. Identity is the dedupe key.
@@ -132,6 +168,27 @@ public actor ActivityBroker {
         return true
     }
 
+    /// Atomically rejects an action that no longer belongs to the current broker revision.
+    @discardableResult
+    public func cancelCurrentAction(
+        identity: ActivityIdentity,
+        revision: UInt64,
+        actionIdentifier: String,
+        intent: ActivityActionIntent
+    ) -> Bool {
+        guard let current = makeSnapshot().current,
+              current.activity.identity == identity,
+              current.revision == revision,
+              current.activity.action?.identifier == actionIdentifier,
+              current.activity.action?.intent == intent else {
+            return false
+        }
+        records.removeValue(forKey: identity)
+        expiryTasks.removeValue(forKey: identity)?.cancel()
+        _ = publishMutation()
+        return true
+    }
+
     public func snapshot() -> ActivityBrokerSnapshot {
         makeSnapshot()
     }
@@ -141,17 +198,49 @@ public actor ActivityBroker {
         guard subscribers.count < ActivityLimits.maximumSubscriberCount else {
             throw .subscriberCapacityExceeded(maximum: ActivityLimits.maximumSubscriberCount)
         }
-        let subscriberID = UUID()
+        var subscriberID = UUID()
+        while subscribers[subscriberID] != nil {
+            subscriberID = UUID()
+        }
+        return registerSnapshotSubscription(subscriberID: subscriberID).stream
+    }
+
+    /// Package owners receive an immutable token so cancellation and stream termination cannot
+    /// affect a later registration that reuses the same logical identifier.
+    package func snapshotSubscription(
+        subscriberID: UUID
+    ) throws(ActivityBrokerSubscriptionError) -> ActivityBrokerSnapshotSubscription {
+        guard subscribers[subscriberID] == nil else {
+            throw .duplicateSubscriberIdentifier
+        }
+        guard subscribers.count < ActivityLimits.maximumSubscriberCount else {
+            throw .capacityExceeded(maximum: ActivityLimits.maximumSubscriberCount)
+        }
+        return registerSnapshotSubscription(subscriberID: subscriberID)
+    }
+
+    private func registerSnapshotSubscription(
+        subscriberID: UUID
+    ) -> ActivityBrokerSnapshotSubscription {
+        let token = ActivityBrokerSubscriptionToken(
+            subscriberID: subscriberID,
+            generation: allocateSubscriberGeneration()
+        )
         let (stream, continuation) = AsyncStream.makeStream(
             of: ActivityBrokerSnapshot.self,
             bufferingPolicy: .bufferingNewest(1)
         )
         continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeSubscriber(subscriberID) }
+            Task { await self?.removeSubscriber(token) }
         }
-        subscribers[subscriberID] = continuation
+        subscribers[subscriberID] = Subscriber(token: token, continuation: continuation)
         continuation.yield(makeSnapshot())
-        return stream
+        return ActivityBrokerSnapshotSubscription(token: token, stream: stream)
+    }
+
+    package func cancelSnapshotSubscription(_ token: ActivityBrokerSubscriptionToken) {
+        guard subscribers[token.subscriberID]?.token == token else { return }
+        subscribers.removeValue(forKey: token.subscriberID)?.continuation.finish()
     }
 
     public func workState() -> ActivityBrokerWorkState {
@@ -191,13 +280,13 @@ public actor ActivityBroker {
         precondition(version < UInt64.max, "ActivityBroker snapshot version space exhausted")
         version += 1
         let snapshot = makeSnapshot()
-        var terminatedSubscribers: [UUID] = []
-        for (identifier, continuation) in subscribers {
-            if case .terminated = continuation.yield(snapshot) {
-                terminatedSubscribers.append(identifier)
+        var terminatedSubscribers: [ActivityBrokerSubscriptionToken] = []
+        for subscriber in subscribers.values {
+            if case .terminated = subscriber.continuation.yield(snapshot) {
+                terminatedSubscribers.append(subscriber.token)
             }
         }
-        terminatedSubscribers.forEach { subscribers.removeValue(forKey: $0) }
+        terminatedSubscribers.forEach { removeSubscriber($0) }
         return snapshot
     }
 
@@ -222,8 +311,9 @@ public actor ActivityBroker {
         return lhsKey < rhsKey
     }
 
-    private func removeSubscriber(_ identifier: UUID) {
-        subscribers.removeValue(forKey: identifier)
+    private func removeSubscriber(_ token: ActivityBrokerSubscriptionToken) {
+        guard subscribers[token.subscriberID]?.token == token else { return }
+        subscribers.removeValue(forKey: token.subscriberID)
     }
 
     private func allocateSubmissionSequence() -> UInt64 {
@@ -236,5 +326,11 @@ public actor ActivityBroker {
         precondition(nextActivityRevision < UInt64.max, "ActivityBroker revision space exhausted")
         nextActivityRevision += 1
         return nextActivityRevision
+    }
+
+    private func allocateSubscriberGeneration() -> UInt64 {
+        precondition(nextSubscriberGeneration < UInt64.max, "ActivityBroker subscriber generation space exhausted")
+        nextSubscriberGeneration += 1
+        return nextSubscriberGeneration
     }
 }

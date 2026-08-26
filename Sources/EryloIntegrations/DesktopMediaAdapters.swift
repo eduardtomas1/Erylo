@@ -286,7 +286,7 @@ private actor ScriptedDesktopMediaAdapter {
         }
 
         do {
-            try await scriptExecutor.execute(commandRequest(for: normalized))
+            _ = try await scriptExecutor.execute(commandRequest(for: normalized))
         } catch {
             throw map(error)
         }
@@ -382,6 +382,9 @@ private enum MediaSnapshotParser {
         source: MediaSource,
         stamp: MediaUpdateStamp
     ) throws -> NowPlayingSnapshot {
+        guard output.utf8.count <= 48 * 1_024 else {
+            throw MediaError.malformedResponse(source: source)
+        }
         let rawFields = output.split(separator: "\t", omittingEmptySubsequences: false)
         guard rawFields.count == expectedFieldCount else {
             throw MediaError.malformedResponse(source: source)

@@ -319,9 +319,9 @@ public actor MediaCoordinator {
             }
         } else {
             await adapter.cancelPendingWork()
+            await adapter.deactivate()
             guard sourceGenerations[source] == generation,
                   !requestedEnabledSources.contains(source) else { return }
-            await adapter.deactivate()
         }
     }
 

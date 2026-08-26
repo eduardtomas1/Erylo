@@ -60,7 +60,8 @@ AuthKey_*.p8
 /*.key
 
 # Release, Sparkle, and notarization staging
-# Appcast XML and other reviewed release metadata are intentionally not ignored.
+# Public appcast XML/plists, Package.resolved, assets, fixtures, Info.plist
+# templates, and entitlements are intentionally not ignored.
 /.release/
 /artifacts/
 /dist/

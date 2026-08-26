@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>@PRODUCT_NAME@</string>
+    <key>CFBundleExecutable</key>
+    <string>@EXECUTABLE_NAME@</string>
+    <key>CFBundleIdentifier</key>
+    <string>@BUNDLE_IDENTIFIER@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>@PRODUCT_NAME@</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@MARKETING_VERSION@</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
+    <key>CFBundleVersion</key>
+    <string>@BUILD_VERSION@</string>
+    <key>EryloReleaseArchitecture</key>
+    <string>@TARGET_ARCHITECTURE@</string>
+    <key>EryloSourceCommit</key>
+    <string>@SOURCE_COMMIT@</string>
+    <key>EryloSparkleVersion</key>
+    <string>@SPARKLE_VERSION@</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>LSMinimumSystemVersion</key>
+    <string>@MINIMUM_SYSTEM_VERSION@</string>
+    <key>LSMultipleInstancesProhibited</key>
+    <true/>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Erylo sends playback commands to supported media apps only when you use media controls.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Erylo reads upcoming events only when Next Meeting is enabled so it can show your next event.</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>SUAllowsAutomaticUpdates</key>
+    <false/>
+    <key>SUAutomaticallyUpdate</key>
+    <false/>
+    <key>SUEnableAutomaticChecks</key>
+    <false/>
+    <key>SUEnableDownloaderService</key>
+    <false/>
+    <key>SUEnableInstallerLauncherService</key>
+    <false/>
+    <key>SUEnableSystemProfiling</key>
+    <false/>
+</dict>
+</plist>

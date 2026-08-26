@@ -1,6 +1,7 @@
 import AppKit
 import EryloActivity
 import EryloSurface
+import EryloUpdates
 import EryloWindowing
 
 @main
@@ -32,10 +33,14 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
         activityModel = SurfaceActivityModel(broker: activityBroker)
         super.init()
     }
+    private var updateRuntime: UpdateRuntime?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let panelCoordinator = PanelCoordinator(activityModel: activityModel)
         self.panelCoordinator = panelCoordinator
+        let updateRuntime = UpdateRuntime(configuration: .mainBundle)
+        self.updateRuntime = updateRuntime
+        updateRuntime.startIfConfigured()
         Task { @MainActor in
             await panelCoordinator.startAndWait()
         }

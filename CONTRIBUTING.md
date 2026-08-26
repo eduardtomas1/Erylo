@@ -12,7 +12,7 @@ Erylo is a native macOS 14+ utility whose quality bar is defined by reliability 
    - An Xcode project must provide `Scripts/ci.sh`; CI deliberately will not guess a shared scheme or destination.
 4. Describe exact verification, untested hardware/lifecycle cases, permissions, background work, and rollback impact in the pull request.
 
-The repository is currently pre-foundation. On revisions without a package, project, or CI script, the workflow reports that build/tests were not run; only repository controls are verified.
+The repository currently uses a Swift 6 package and executable `Scripts/ci.sh`; both build and harness verification are required. On older or future revisions without a package, project, or CI script, the workflow reports that build/tests were not run and verifies repository controls only.
 
 ## Engineering expectations
 

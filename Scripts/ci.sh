@@ -13,7 +13,7 @@ if [[ -z "$swift_major" || "$swift_major" -lt 6 ]]; then
     exit 1
 fi
 
-swift build
+swift build -Xswiftc -warnings-as-errors
 Scripts/check-activity-api-surface.sh
 Scripts/check-media-api-surface.sh
 swift run EryloActivityTests
@@ -24,3 +24,12 @@ swift run EryloMediaTests
 swift run EryloTrustTests
 swift run EryloIntegrationTests
 swift run EryloSurfaceTests
+swift run EryloUpdateTests
+bash Tests/ReleaseHarness/run.sh
+
+if command -v shellcheck >/dev/null 2>&1; then
+    # shellcheck disable=SC2046
+    shellcheck $(git ls-files '*.sh')
+else
+    printf 'shellcheck is unavailable; bash -n validation remains enforced by repository controls.\n'
+fi

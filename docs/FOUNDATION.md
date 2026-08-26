@@ -6,6 +6,7 @@ This Swift Package is the first technical feasibility slice, not an application 
 
 - `EryloCore`: display identity and selection policy, notch-aware geometry, conservative morph hit regions, cancellable one-shot scheduling, and the panel state reducer. It has no AppKit dependency.
 - `EryloActivity`: validated declarative activity values and the actor-isolated priority, dedupe, expiry, cancellation, and snapshot broker. It has no UI or platform-framework dependency.
+- `EryloFileHold`: bounded copy/reference ownership, app-owned storage, expiry, cleanup/recovery, coordinated public drag decoding, and narrow presentation-resource seams. It owns no application UI or panel lifecycle.
 - `EryloGlance`: opt-in, event-driven battery, countdown, calendar, and volume providers. Public macOS adapters sit behind injectable `Sendable` seams; construction is inert and `disableAll()` awaits complete observer/task cleanup.
 - `EryloIntegrations`: narrow display, activity-provider, and public desktop-media abstractions. Apple Music and Spotify use fixed, validated `osascript` routes on explicit refresh or command only; disabled adapters finish their streams and perform no work.
 - `EryloLocalIntegrations`: the versioned strict schema, URL and command-line parsers, broker controller, and opt-in per-user Unix-domain-socket service for declarative submit/cancel/status requests.
@@ -16,13 +17,14 @@ This Swift Package is the first technical feasibility slice, not an application 
 - `EryloWindowing`: public-API AppKit display discovery, non-activating panels, event-driven pointer hit testing, removable workspace/display observers, and one controller keyed by `CGDirectDisplayID` per enabled non-mirrored display.
 - `EryloApp`: the minimal accessory-process entry point.
 
-The dependency direction remains one-way: app -> windowing -> surface/integrations -> core/activity; Glance depends only on Activity, Trust only on Core, SettingsUI on Core/Trust, and AppIntents on LocalIntegrations on Activity. Platform types stay behind injectable seams, routes see only the narrow handling protocol, and no transport exposes the broker actor directly.
+The dependency direction remains one-way: app -> windowing -> surface/integrations -> core/activity; File Hold is an independent native boundary, Glance depends only on Activity, Trust only on Core, SettingsUI on Core/Trust, and AppIntents on LocalIntegrations on Activity. Platform types stay behind injectable seams, routes see only the narrow handling protocol, and no transport exposes the broker actor directly.
 
 ## Command Line Tools workflow
 
 ```sh
 swift build
 swift run EryloActivityTests
+swift run EryloFileHoldTests
 swift run EryloFoundationTests
 swift run EryloGlanceTests
 swift run EryloMediaTests
@@ -36,7 +38,7 @@ swift run Erylo
 
 The safe default enables every available non-mirrored display and selects the main display for one-at-a-time interactions. The policy also supports an in-memory enabled-display allowlist and selected display; persistence and its UI remain later work. Displays without a top-edge occlusion use a compact pill inset from the screen edge. `Control-Option-Command-E` toggles the selected panel through public hot-key registration, without a global key-event monitor or Accessibility permission.
 
-The foundation, activity, glance, media, trust, and integration harnesses intentionally use only the standard Swift toolchain. The current standalone Command Line Tools distribution does not expose `XCTest` or Swift Testing through SwiftPM, so `Scripts/ci.sh` builds every product and runs all dependency-free harnesses. A later Xcode project can add XCTest/XCUITest without changing the pure test seams.
+The foundation, activity, File Hold, glance, media, trust, and integration harnesses intentionally use only the standard Swift toolchain. The current standalone Command Line Tools distribution does not expose `XCTest` or Swift Testing through SwiftPM, so `Scripts/ci.sh` builds every product and runs all dependency-free harnesses. A later Xcode project can add XCTest/XCUITest without changing the pure test seams.
 
 Local verification uses the installed Swift 6 Command Line Tools. GitHub build/test verification uses the public `macos-15` runner because the `macos-14` runner defaults to Swift 5.10; `Scripts/ci.sh` retains a hard Swift 6 gate, while `Package.swift` keeps the deployment target at macOS 14.
 
@@ -60,7 +62,7 @@ The Integration harness deterministically covers strict schema and duplicate-key
 
 ## Deliberate limitations
 
-- File drops expose and test the drop-target state, but intentionally reject transport. File ownership, copy/reference semantics, expiry, cleanup, and cross-Space round trips belong to a later feature branch.
+- The foundation drop target still rejects transport until File Hold is mounted into the application. The File Hold library now owns and tests copy/reference semantics, expiry, cleanup/recovery, and coordinated public drag decoding; app wiring and cross-Space round trips remain later integration work.
 - Glance providers are not connected to the feasibility UI or settings yet. They remain disabled until explicitly enabled; calendar permission is requested only from that explicit enable path. Persistence, updater, signing, and diagnostics pipelines are not claimed here.
 - Battery, default-output volume/mute, and EventKit permission behavior compile against public macOS APIs but still require real-hardware, real-calendar-account, sleep/wake, device-switch, and Instruments energy validation.
 - Apple Music and Spotify expose no reliable documented desktop change-notification surface to this package, so media refresh is on demand and adapter streams finish immediately rather than polling. Automation permission is requested only when the user first invokes a refresh or command. Artwork caching is opt-in, memory-bounded, purgeable, and retains no durable playback history.

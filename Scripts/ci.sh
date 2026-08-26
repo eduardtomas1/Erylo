@@ -17,6 +17,7 @@ swift build
 Scripts/check-media-api-surface.sh
 swift run EryloActivityTests
 swift run EryloFoundationTests
+swift run EryloFileHoldTests
 swift run EryloGlanceTests
 swift run EryloMediaTests
 swift run EryloTrustTests

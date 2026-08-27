@@ -84,6 +84,10 @@ final class PanelController: PanelPresenting {
         model.send(.primaryAction)
     }
 
+    func performVisibilityToggle() {
+        model.send(model.state == .hidden ? .show : .hide)
+    }
+
     func cancelPendingInteractions() {
         model.cancelPendingInteractions()
     }

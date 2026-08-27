@@ -30,26 +30,35 @@ package final class ApplicationRuntime {
     private let activityModel: SurfaceActivityModel
     private let panelCoordinator: PanelCoordinator
     private let updateRuntime: UpdateRuntime
+    private let controlPlane: (any ApplicationControlPlaneOwning)?
+    private let requestApplicationTermination: @MainActor () -> Void
     private var registeredServices: [any ApplicationRuntimeService] = []
     private var startedServices: [any ApplicationRuntimeService] = []
     private var admitsRegistrations = true
     private var startupTask: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
+    private var canCheckForUpdates = false
+    private var isQuitRequested = false
 
     package init(
         activityBroker: ActivityBroker,
         activityModel: SurfaceActivityModel,
         panelCoordinator: PanelCoordinator,
-        updateRuntime: UpdateRuntime
+        updateRuntime: UpdateRuntime,
+        controlPlane: (any ApplicationControlPlaneOwning)? = nil,
+        requestApplicationTermination: @escaping @MainActor () -> Void = {}
     ) {
         self.activityBroker = activityBroker
         self.activityModel = activityModel
         self.panelCoordinator = panelCoordinator
         self.updateRuntime = updateRuntime
+        self.controlPlane = controlPlane
+        self.requestApplicationTermination = requestApplicationTermination
     }
 
     package static func production(
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        requestApplicationTermination: @escaping @MainActor () -> Void
     ) -> ApplicationRuntime {
         let activityBroker = ActivityBroker()
         let activityModel: SurfaceActivityModel
@@ -77,7 +86,9 @@ package final class ApplicationRuntime {
             activityBroker: activityBroker,
             activityModel: activityModel,
             panelCoordinator: panelCoordinator,
-            updateRuntime: UpdateRuntime(configuration: .mainBundle)
+            updateRuntime: UpdateRuntime(configuration: .mainBundle),
+            controlPlane: ApplicationControlPlane.production(),
+            requestApplicationTermination: requestApplicationTermination
         )
     }
 
@@ -137,9 +148,38 @@ package final class ApplicationRuntime {
         _ = await task.value
     }
 
+    /// Routes deliberate menu commands through the one lifecycle owner.
+    /// Commands fail closed before startup and after shutdown begins.
+    @discardableResult
+    package func handle(_ command: ApplicationControlCommand) -> Bool {
+        guard phase == .running else { return false }
+        switch command {
+        case .toggleSurface:
+            return panelCoordinator.toggleSelectedPanelVisibility()
+        case .showSettings:
+            guard let controlPlane else { return false }
+            controlPlane.presentSettings()
+            return true
+        case .checkForUpdates:
+            guard canCheckForUpdates else { return false }
+            return updateRuntime.checkForUpdates()
+        case .quit:
+            guard !isQuitRequested else { return true }
+            isQuitRequested = true
+            requestApplicationTermination()
+            return true
+        }
+    }
+
     private func performStartup() async {
         guard phase == .starting, !Task.isCancelled else { return }
-        _ = updateRuntime.startIfConfigured()
+        let initialDisplayPolicy = await controlPlane?.prepareForStartup()
+
+        guard phase == .starting, !Task.isCancelled else { return }
+        if let initialDisplayPolicy {
+            panelCoordinator.update(policy: initialDisplayPolicy)
+        }
+        canCheckForUpdates = updateRuntime.startIfConfigured()
 
         guard phase == .starting, !Task.isCancelled else { return }
         await panelCoordinator.startAndWait()
@@ -150,6 +190,19 @@ package final class ApplicationRuntime {
             startedServices.append(service)
             guard phase == .starting, !Task.isCancelled else { return }
         }
+
+        if let controlPlane {
+            await controlPlane.start(
+                canCheckForUpdates: canCheckForUpdates,
+                commandHandler: { [weak self] command in
+                    _ = self?.handle(command)
+                },
+                displayPolicyHandler: { [weak panelCoordinator] policy in
+                    panelCoordinator?.update(policy: policy)
+                }
+            )
+        }
+        guard phase == .starting, !Task.isCancelled else { return }
         phase = .running
     }
 
@@ -160,9 +213,11 @@ package final class ApplicationRuntime {
         startedServices.removeAll()
         registeredServices.removeAll()
 
+        await controlPlane?.shutdown()
         await panelCoordinator.shutdown()
         await activityBroker.shutdown()
         updateRuntime.shutdown()
+        canCheckForUpdates = false
         phase = .stopped
     }
 }

@@ -99,6 +99,20 @@ private final class TrustHarness {
         check(report.disposition == .migrated && report.migrationWasPersisted, "migration persistence is reported")
         check(storage.successfulReplacementCount == 1, "migration uses one whole-value replacement")
 
+        let readOnlyMigrationStorage = TestAtomicSettingsStorage(initialData: Data(legacyJSON.utf8))
+        let readOnlyMigrationRepository = SettingsRepository(
+            storage: readOnlyMigrationStorage,
+            automaticallyPersistsMigrations: false
+        )
+        check(
+            await readOnlyMigrationRepository.current().schemaVersion == EryloSettings.currentSchemaVersion,
+            "read-only loading still exposes the migrated settings value"
+        )
+        check(
+            readOnlyMigrationStorage.successfulReplacementCount == 0,
+            "read-only loading performs no migration write"
+        )
+
         let corruptStorage = TestAtomicSettingsStorage(initialData: Data("not-json".utf8))
         let corruptRepository = SettingsRepository(storage: corruptStorage)
         check(await corruptRepository.current() == .safeDefaults, "corruption falls back to safe defaults")
@@ -195,6 +209,28 @@ private final class TrustHarness {
         check(await provider.startCount == 0, "disabled module has zero starts")
         check(await permissions.requestCount == 0, "disabled module has zero permission requests")
         check(await fixture.coordinator.activeModules().isEmpty, "disabled state retains no provider")
+
+        let unavailableModel = TrustSettingsViewModel(
+            coordinator: fixture.coordinator,
+            diagnosticsExporter: DiagnosticsExporter(
+                collector: PrivacyPreservingDiagnosticsCollector(
+                    metadata: SafeMetadataProvider(),
+                    eventSource: fixture.events,
+                    clock: FixedClock()
+                ),
+                writer: writer
+            ),
+            availableModules: [],
+            supportsMotionPreference: false,
+            supportsFullscreenPreference: false
+        )
+        await unavailableModel.setModuleEnabled(.calendar, enabled: true)
+        check(await fixture.factory.makeCount == 0, "unavailable UI module cannot construct a provider")
+        check(await permissions.requestCount == 0, "unavailable UI module cannot request permission")
+        await unavailableModel.setMotion(.reduce)
+        await unavailableModel.setFullscreen(.remainAvailable)
+        check(await fixture.repository.current().motion == .systemDefault, "unavailable motion control cannot persist")
+        check(await fixture.repository.current().fullscreenBehavior == .hide, "unavailable fullscreen control cannot persist")
     }
 
     private func verifyConcurrentToggleSerialization() async {
@@ -789,15 +825,25 @@ private final class TrustHarness {
             + EryloModule.allCases.map(TrustAccessibilityCopy.moduleLabel)
         let hints = [
             TrustAccessibilityCopy.productPromiseHint,
+            TrustAccessibilityCopy.onboardingHint,
             TrustAccessibilityCopy.launchAtLoginHint,
             TrustAccessibilityCopy.diagnosticsConsentHint,
             TrustAccessibilityCopy.diagnosticsExportHint,
             TrustAccessibilityCopy.resetHint,
+            TrustAccessibilityCopy.unavailableMotionHint,
+            TrustAccessibilityCopy.unavailableFullscreenHint,
         ] + EryloModule.allCases.map(TrustAccessibilityCopy.moduleHint)
+            + EryloModule.allCases.map(TrustAccessibilityCopy.unavailableModuleHint)
         check(labels.allSatisfy { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }, "accessibility labels are non-empty")
         check(Set(labels).count == labels.count, "accessibility labels are distinct")
         check(hints.allSatisfy { $0.count >= 12 }, "accessibility hints explain controls")
         check(EryloModule.allCases.allSatisfy { TrustAccessibilityCopy.moduleLabel($0).hasPrefix("Enable ") }, "module labels expose action")
+        check(
+            EryloModule.allCases.allSatisfy {
+                TrustAccessibilityCopy.unavailableModuleLabel($0).hasSuffix(" unavailable")
+            },
+            "unavailable module labels do not claim an enabled action"
+        )
     }
 
     private func makeFixture(

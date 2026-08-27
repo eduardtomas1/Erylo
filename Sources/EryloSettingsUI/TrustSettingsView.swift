@@ -60,10 +60,23 @@ public struct TrustSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Glance. Act. Disappear.")
                         .font(.system(.title2, design: .rounded, weight: .semibold))
-                    Text("Erylo is a quiet, local-first activity layer. It stays useful without permissions and starts a module only after you turn it on.")
+                    Text("Erylo is a quiet, local-first activity layer. Utility modules stay off unless a build connects them and you explicitly enable them.")
                         .foregroundStyle(EryloPalette.mist)
                         .fixedSize(horizontal: false, vertical: true)
                     if !model.settings.onboardingCompleted {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(TrustAccessibilityCopy.onboardingSurfaceExplanation)
+                            Text(TrustAccessibilityCopy.onboardingInteractionExplanation)
+                            Text(TrustAccessibilityCopy.onboardingSafetyExplanation)
+                            Text(TrustAccessibilityCopy.onboardingControlExplanation)
+                        }
+                        .font(.callout)
+                        .foregroundStyle(EryloPalette.mist)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel(TrustAccessibilityCopy.onboardingLabel)
+                        .accessibilityHint(TrustAccessibilityCopy.onboardingHint)
+
                         Button("Continue with safe defaults") {
                             Task { await model.completeOnboarding() }
                         }
@@ -80,7 +93,12 @@ public struct TrustSettingsView: View {
     }
 
     private var moduleSection: some View {
-        sectionCard(title: "Modules", subtitle: "Off means stopped: no permission-dependent work, timers, or network activity.") {
+        sectionCard(
+            title: "Modules",
+            subtitle: model.availableModules.isEmpty
+                ? "Utilities are not connected in this build. These controls are visible for transparency, but cannot start providers, permission requests, sockets, timers, media automation, or network work."
+                : "Off means stopped: no permission-dependent work, timers, or network activity."
+        ) {
             VStack(spacing: 0) {
                 ForEach(EryloModule.allCases, id: \.self) { module in
                     moduleRow(module)
@@ -117,13 +135,28 @@ public struct TrustSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(EryloPalette.mist)
                     .fixedSize(horizontal: false, vertical: true)
+                if !model.isModuleAvailable(module) {
+                    Text("Not connected in this build; this utility is not running.")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(EryloPalette.amber)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .toggleStyle(.switch)
         .tint(EryloPalette.mint)
+        .disabled(!model.isModuleAvailable(module))
         .padding(.vertical, 10)
-        .accessibilityLabel(TrustAccessibilityCopy.moduleLabel(module))
-        .accessibilityHint(TrustAccessibilityCopy.moduleHint(module))
+        .accessibilityLabel(
+            model.isModuleAvailable(module)
+                ? TrustAccessibilityCopy.moduleLabel(module)
+                : TrustAccessibilityCopy.unavailableModuleLabel(module)
+        )
+        .accessibilityHint(
+            model.isModuleAvailable(module)
+                ? TrustAccessibilityCopy.moduleHint(module)
+                : TrustAccessibilityCopy.unavailableModuleHint(module)
+        )
     }
 
     private var displaySection: some View {
@@ -192,7 +225,12 @@ public struct TrustSettingsView: View {
     }
 
     private var behaviorSection: some View {
-        sectionCard(title: "Behavior") {
+        sectionCard(
+            title: "Behavior",
+            subtitle: model.supportsMotionPreference && model.supportsFullscreenPreference
+                ? nil
+                : "Unavailable controls are not connected to the current surface and do not claim to change it."
+        ) {
             VStack(alignment: .leading, spacing: 14) {
                 Picker(
                     TrustAccessibilityCopy.motionPickerLabel,
@@ -205,7 +243,12 @@ public struct TrustSettingsView: View {
                     Text("Reduce motion").tag(MotionPreference.reduce)
                 }
                 .pickerStyle(.segmented)
-                .accessibilityHint("System default follows the macOS Reduce Motion setting.")
+                .disabled(!model.supportsMotionPreference)
+                .accessibilityHint(
+                    model.supportsMotionPreference
+                        ? "System default follows the macOS Reduce Motion setting."
+                        : TrustAccessibilityCopy.unavailableMotionHint
+                )
 
                 Picker(
                     TrustAccessibilityCopy.fullscreenPickerLabel,
@@ -218,7 +261,12 @@ public struct TrustSettingsView: View {
                     Text("Remain available").tag(FullscreenBehavior.remainAvailable)
                 }
                 .pickerStyle(.segmented)
-                .accessibilityHint("Controls whether the activity surface remains available with a fullscreen app.")
+                .disabled(!model.supportsFullscreenPreference)
+                .accessibilityHint(
+                    model.supportsFullscreenPreference
+                        ? "Controls whether the activity surface remains available with a fullscreen app."
+                        : TrustAccessibilityCopy.unavailableFullscreenHint
+                )
             }
         }
     }
@@ -306,6 +354,7 @@ public struct TrustSettingsView: View {
     }
 
     private func moduleBadge(_ module: EryloModule) -> String? {
+        if !model.isModuleAvailable(module) { return "NOT AVAILABLE" }
         if module.permissionRequirement != nil { return "ASKS WHEN ENABLED" }
         switch module {
         case .fileHold: return "ACCESS ON USE"

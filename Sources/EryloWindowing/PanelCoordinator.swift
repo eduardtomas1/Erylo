@@ -262,6 +262,38 @@ public final class PanelCoordinator {
         updatePointer(NSEvent.mouseLocation, forceAll: true)
     }
 
+    /// Deliberate keyboard/menu action for the currently selected display.
+    /// The passive panel remains nonactivating; unavailable or disabled surfaces fail closed.
+    @discardableResult
+    package func performPrimaryActionOnSelectedDisplay() -> Bool {
+        guard isRunning,
+              policy.isEnabled,
+              !isWorkspaceSleeping,
+              !isShutdown,
+              let selectedDisplayIdentity,
+              let panel = panels[CGDirectDisplayID(selectedDisplayIdentity.rawValue)] else {
+            return false
+        }
+        panel.performPrimaryAction()
+        return true
+    }
+
+    /// Menu-specific visibility toggle. Unlike the primary surface interaction,
+    /// this always moves between hidden and a visible compact surface.
+    @discardableResult
+    package func toggleSelectedPanelVisibility() -> Bool {
+        guard isRunning,
+              policy.isEnabled,
+              !isWorkspaceSleeping,
+              !isShutdown,
+              let selectedDisplayIdentity,
+              let panel = panels[CGDirectDisplayID(selectedDisplayIdentity.rawValue)] else {
+            return false
+        }
+        panel.performVisibilityToggle()
+        return true
+    }
+
     private func handle(_ event: PanelLifecycleEvent, lease: UUID) {
         guard activeEventLease == lease,
               lifecycleEventSource.isRunning,
@@ -286,12 +318,7 @@ public final class PanelCoordinator {
             guard !isWorkspaceSleeping else { return }
             updatePointer(screenPoint)
         case .primaryShortcut:
-            guard !isWorkspaceSleeping,
-                  let selectedDisplayIdentity,
-                  let panel = panels[CGDirectDisplayID(selectedDisplayIdentity.rawValue)] else {
-                return
-            }
-            panel.performPrimaryAction()
+            _ = performPrimaryActionOnSelectedDisplay()
         }
     }
 

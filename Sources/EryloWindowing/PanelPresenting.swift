@@ -12,7 +12,16 @@ public protocol PanelPresenting: AnyObject {
     func update(snapshot: DisplaySnapshot)
     func updatePointer(screenPoint: CGPoint)
     func performPrimaryAction()
+    func performVisibilityToggle()
     func cancelPendingInteractions()
+}
+
+public extension PanelPresenting {
+    /// Compatibility fallback for injected presenters that only implement the original action.
+    /// The native presenter overrides this with a strict hidden/visible surface toggle.
+    func performVisibilityToggle() {
+        performPrimaryAction()
+    }
 }
 
 public typealias PanelPresentationFactory = @MainActor (

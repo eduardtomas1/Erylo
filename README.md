@@ -49,8 +49,10 @@ settles back into the top edge when you are done.
 > **Development preview:** the utility engines above are implemented and tested,
 > but they are not connected to the app you launch yet. Today's executable
 > includes the native notch surface, activity queue, multi-display behavior, and
-> global shortcut. It launches quietly unless given preview data, so the timer
-> shown here is not a running system timer.
+> global shortcut, plus a native menu-bar/settings control plane. Utility controls
+> remain visibly unavailable and cannot start provider work. The app launches
+> quietly unless given preview data, so the timer shown here is not a running
+> system timer.
 
 ## Designed to feel native
 
@@ -73,8 +75,8 @@ cd Erylo
 ERYLO_PREVIEW_SCENARIO=timer swift run Erylo
 ```
 
-Quit from the launching terminal when you are finished. Erylo does not publish a
-signed end-user download yet.
+Use Erylo's menu-bar item to show or hide the surface, reopen Settings, or quit.
+Erylo does not publish a signed end-user download yet.
 
 <details>
 <summary><strong>Building or contributing?</strong></summary>

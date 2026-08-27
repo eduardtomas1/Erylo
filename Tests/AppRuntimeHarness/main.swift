@@ -4,7 +4,9 @@ import EryloActivity
 import EryloAppRuntime
 import EryloCore
 import EryloIntegrations
+import EryloSettingsUI
 import EryloSurface
+import EryloTrust
 import EryloUpdates
 import EryloWindowing
 import Foundation
@@ -17,6 +19,8 @@ enum AppRuntimeHarnessMain {
         await harness.verifyDeterministicLifecycleAndResourceRelease()
         await harness.verifyStartShutdownOverlapAndRepeatedTermination()
         await harness.verifyCallerCancellationDoesNotAbandonStartup()
+        await harness.verifyControlPlanePresentationAndSafeSettings()
+        await harness.verifyMenuCommandRoutingAndUpdateAvailability()
         harness.finish()
     }
 }
@@ -230,6 +234,211 @@ private struct AppRuntimeHarness {
         check(await fixture.broker.workState() == .stopped, "caller-cancellation fixture releases broker work")
     }
 
+    mutating func verifyControlPlanePresentationAndSafeSettings() async {
+        let settingsOwner = RecordingApplicationSettingsOwner(settings: .safeDefaults)
+        let presenter = RecordingControlPresenter()
+        let plane = ApplicationControlPlane(
+            settingsOwner: settingsOwner,
+            diagnosticsExporter: DiagnosticsExporter(
+                collector: PrivacyPreservingDiagnosticsCollector(
+                    eventSource: InMemoryDiagnosticEventBuffer()
+                ),
+                writer: RejectingDiagnosticsWriter()
+            ),
+            presenter: presenter,
+            makeDisplayChoices: {
+                [DisplayChoice(identity: DisplayIdentity(rawValue: 1), name: "Main display")]
+            }
+        )
+
+        let initialPolicy = await plane.prepareForStartup()
+        check(initialPolicy == .safeDefault, "control plane loads the safe display policy without presenting UI")
+        check(presenter.statusItemCount == 0 && presenter.settingsWindowCount == 0, "control-plane preparation creates no menu or window resource")
+
+        var routedCommands: [ApplicationControlCommand] = []
+        var appliedPolicies: [DisplayPolicy] = []
+        await plane.start(
+            canCheckForUpdates: true,
+            commandHandler: { routedCommands.append($0) },
+            displayPolicyHandler: { appliedPolicies.append($0) }
+        )
+        await plane.start(
+            canCheckForUpdates: true,
+            commandHandler: { routedCommands.append($0) },
+            displayPolicyHandler: { appliedPolicies.append($0) }
+        )
+
+        check(presenter.statusItemCount == 1, "repeated control-plane start installs one status item")
+        check(presenter.settingsWindowCount == 1, "first launch presents one contained settings window")
+        check(presenter.presentationCount == 1, "first-launch presentation occurs once")
+        check(
+            presenter.menu?.items.contains(where: { $0.kind == .command(.checkForUpdates) }) == true,
+            "ready updater includes the manual update command"
+        )
+        check(
+            presenter.menu?.items.contains(where: { $0.title == ApplicationControlCopy.shortcutReminder }) == true,
+            "status menu includes the keyboard shortcut reminder"
+        )
+
+        plane.presentSettings()
+        plane.presentSettings()
+        check(presenter.settingsWindowCount == 1, "repeated Settings requests reuse one contained window")
+        check(presenter.presentationCount == 3, "repeated Settings requests bring the same window forward")
+
+        let modelReference = WeakReference<TrustSettingsViewModel>()
+        modelReference.value = presenter.presentedModel
+        if let model = presenter.presentedModel {
+            await model.setModuleEnabled(.timer, enabled: true)
+            check(await settingsOwner.moduleMutationCount == 0, "unavailable timer control cannot reach provider mutation")
+            check(
+                model.statusMessage?.contains("not connected") == true,
+                "unavailable utility reports that no work was started"
+            )
+
+            await model.setMotion(.reduce)
+            check(model.settings.motion == .systemDefault, "unwired motion preference cannot be persisted")
+            await model.setFullscreen(.remainAvailable)
+            check(model.settings.fullscreenBehavior == .hide, "unwired fullscreen preference cannot be persisted")
+
+            await model.setDisplaySurfaceEnabled(false)
+            check(appliedPolicies.last == DisplayPolicy(isEnabled: false), "display preference applies the proven panel policy")
+        } else {
+            check(false, "first-launch presenter receives a settings model")
+            check(false, "unavailable utility fixture has a model")
+            check(false, "unavailable utility status fixture has a model")
+            check(false, "motion availability fixture has a model")
+            check(false, "fullscreen availability fixture has a model")
+            check(false, "display-policy fixture has a model")
+        }
+
+        presenter.commandHandler?(.showSettings)
+        check(routedCommands == [.showSettings], "native presenter routes menu selections through the injected handler")
+
+        check(
+            ApplicationControlCopy.statusItemLabel == "Erylo controls"
+                && ApplicationControlCopy.statusItemHint.contains("surface")
+                && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("top edge")
+                && TrustAccessibilityCopy.onboardingInteractionExplanation.contains("Control–Option–Command–E")
+                && TrustAccessibilityCopy.onboardingSafetyExplanation.contains("Safe defaults")
+                && TrustAccessibilityCopy.onboardingControlExplanation.contains("quit"),
+            "control and onboarding accessibility copy explains the complete daily-use path"
+        )
+
+        await plane.shutdown()
+        await plane.shutdown()
+        check(await settingsOwner.stopCount == 1, "repeated control-plane shutdown drains settings ownership once")
+        check(presenter.shutdownCount == 1, "repeated control-plane shutdown releases native resources once")
+        check(presenter.statusItemCount == 0 && presenter.settingsWindowCount == 0, "control-plane shutdown leaves no menu or window resource")
+        check(modelReference.value == nil, "control-plane shutdown releases the settings model")
+        plane.presentSettings()
+        check(presenter.presentationCount == 3, "settings cannot reopen after terminal shutdown")
+
+        var completedSettings = EryloSettings.safeDefaults
+        completedSettings.onboardingCompleted = true
+        let returningOwner = RecordingApplicationSettingsOwner(settings: completedSettings)
+        let returningPresenter = RecordingControlPresenter()
+        let returningPlane = ApplicationControlPlane(
+            settingsOwner: returningOwner,
+            diagnosticsExporter: DiagnosticsExporter(
+                collector: PrivacyPreservingDiagnosticsCollector(
+                    eventSource: InMemoryDiagnosticEventBuffer()
+                ),
+                writer: RejectingDiagnosticsWriter()
+            ),
+            presenter: returningPresenter,
+            makeDisplayChoices: { [] }
+        )
+        _ = await returningPlane.prepareForStartup()
+        await returningPlane.start(
+            canCheckForUpdates: false,
+            commandHandler: { _ in },
+            displayPolicyHandler: { _ in }
+        )
+        check(returningPresenter.presentationCount == 0, "completed onboarding does not reopen Settings on launch")
+        returningPlane.presentSettings()
+        check(returningPresenter.presentationCount == 1, "returning users can reopen Settings deliberately")
+        await returningPlane.shutdown()
+    }
+
+    mutating func verifyMenuCommandRoutingAndUpdateAvailability() async {
+        let events = EventLog()
+        let broker = ActivityBroker()
+        let model = SurfaceActivityModel(broker: broker)
+        let eventSource = RecordingLifecycleEventSource(events: events)
+        let panel = RecordingPanel(
+            displayIdentity: DisplayIdentity(rawValue: 1),
+            events: events
+        )
+        let coordinator = PanelCoordinator(
+            displayProvider: FixedDisplayProvider(),
+            policy: .safeDefault,
+            lifecycleEventSource: eventSource,
+            activityModel: model,
+            panelFactory: { _, _ in panel }
+        )
+        let updateDriver = RecordingUpdateDriver(events: events)
+        let controlPlane = RecordingControlPlane()
+        let termination = Counter()
+        let runtime = ApplicationRuntime(
+            activityBroker: broker,
+            activityModel: model,
+            panelCoordinator: coordinator,
+            updateRuntime: UpdateRuntime(
+                configuration: Self.readyUpdateConfiguration(),
+                enforcePreferencePolicy: { true },
+                makeDriver: { updateDriver }
+            ),
+            controlPlane: controlPlane,
+            requestApplicationTermination: { termination.value += 1 }
+        )
+
+        check(await runtime.start(), "command-routing runtime starts")
+        check(controlPlane.lastCanCheckForUpdates == true, "ready updater is advertised to the control plane")
+        check(runtime.handle(.toggleSurface), "first menu show/hide request reaches the selected surface")
+        check(runtime.handle(.toggleSurface), "repeated menu show/hide request remains routable")
+        check(panel.visibilityToggleCount == 2, "repeated show/hide commands target one selected panel")
+        check(runtime.handle(.showSettings) && runtime.handle(.showSettings), "repeated Settings commands are accepted")
+        check(controlPlane.presentationCount == 2, "repeated Settings commands route to the settings owner")
+        check(runtime.handle(.checkForUpdates) && runtime.handle(.checkForUpdates), "manual update requests route only when available")
+        check(updateDriver.checkCount == 2, "each deliberate update command reaches the updater seam")
+        check(runtime.handle(.quit) && runtime.handle(.quit), "repeated Quit commands are handled idempotently")
+        check(termination.value == 1, "repeated Quit commands request application termination once")
+
+        await runtime.shutdown()
+        check(controlPlane.shutdownCount == 1, "runtime shutdown releases its control-plane resources")
+        check(!runtime.handle(.toggleSurface) && !runtime.handle(.showSettings) && !runtime.handle(.checkForUpdates), "terminal runtime rejects later control commands")
+
+        let disabledEvents = EventLog()
+        let disabledBroker = ActivityBroker()
+        let disabledModel = SurfaceActivityModel(broker: disabledBroker)
+        let disabledControlPlane = RecordingControlPlane()
+        let disabledRuntime = ApplicationRuntime(
+            activityBroker: disabledBroker,
+            activityModel: disabledModel,
+            panelCoordinator: PanelCoordinator(
+                displayProvider: FixedDisplayProvider(),
+                policy: .safeDefault,
+                lifecycleEventSource: RecordingLifecycleEventSource(events: disabledEvents),
+                activityModel: disabledModel,
+                panelFactory: { snapshot, _ in
+                    RecordingPanel(displayIdentity: snapshot.identity, events: disabledEvents)
+                }
+            ),
+            updateRuntime: UpdateRuntime(configuration: Self.disabledUpdateConfiguration()),
+            controlPlane: disabledControlPlane
+        )
+        check(await disabledRuntime.start(), "disabled-update runtime starts")
+        check(disabledControlPlane.lastCanCheckForUpdates == false, "disabled updater is not advertised")
+        check(!disabledRuntime.handle(.checkForUpdates), "disabled updater rejects a manual check command")
+        check(
+            !ApplicationMenuDescriptor(canCheckForUpdates: false).items.contains(where: {
+                $0.kind == .command(.checkForUpdates)
+            }),
+            "disabled updater omits Check for Updates from the menu"
+        )
+        await disabledRuntime.shutdown()
+    }
+
     private static func makeRuntime(events: EventLog) -> RuntimeFixture {
         let broker = ActivityBroker()
         let model = SurfaceActivityModel(broker: broker)
@@ -362,6 +571,151 @@ private final class EventLog {
 }
 
 @MainActor
+private final class Counter {
+    var value = 0
+}
+
+@MainActor
+private final class RecordingControlPlane: ApplicationControlPlaneOwning {
+    private(set) var lastCanCheckForUpdates: Bool?
+    private(set) var presentationCount = 0
+    private(set) var shutdownCount = 0
+    private var isShutDown = false
+
+    func prepareForStartup() async -> DisplayPolicy {
+        .safeDefault
+    }
+
+    func start(
+        canCheckForUpdates: Bool,
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
+        displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
+    ) async {
+        _ = commandHandler
+        _ = displayPolicyHandler
+        lastCanCheckForUpdates = canCheckForUpdates
+    }
+
+    func presentSettings() {
+        guard !isShutDown else { return }
+        presentationCount += 1
+    }
+
+    func shutdown() async {
+        guard !isShutDown else { return }
+        isShutDown = true
+        shutdownCount += 1
+    }
+}
+
+@MainActor
+private final class RecordingControlPresenter: ApplicationControlPresenting {
+    private(set) var statusItemCount = 0
+    private(set) var settingsWindowCount = 0
+    private(set) var presentationCount = 0
+    private(set) var shutdownCount = 0
+    private(set) var menu: ApplicationMenuDescriptor?
+    private(set) var commandHandler: (@MainActor (ApplicationControlCommand) -> Void)?
+    private(set) var presentedModel: TrustSettingsViewModel?
+
+    func installStatusMenu(
+        _ descriptor: ApplicationMenuDescriptor,
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
+    ) {
+        statusItemCount = 1
+        menu = descriptor
+        self.commandHandler = commandHandler
+    }
+
+    func presentSettings(model: TrustSettingsViewModel) {
+        settingsWindowCount = 1
+        presentationCount += 1
+        presentedModel = model
+    }
+
+    func shutdown() {
+        guard shutdownCount == 0 else { return }
+        shutdownCount = 1
+        statusItemCount = 0
+        settingsWindowCount = 0
+        menu = nil
+        commandHandler = nil
+        presentedModel = nil
+    }
+}
+
+private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
+    private var settings: EryloSettings
+    private(set) var moduleMutationCount = 0
+    private(set) var stopCount = 0
+
+    init(settings: EryloSettings) {
+        self.settings = settings
+    }
+
+    func currentSettings() -> EryloSettings {
+        settings
+    }
+
+    func launchAtLoginSnapshot() -> LaunchAtLoginSnapshot {
+        .unavailable
+    }
+
+    func setModuleEnabled(
+        _ module: EryloModule,
+        enabled: Bool,
+        permissionPolicy: PermissionRequestPolicy
+    ) -> TrustSettingsUpdateResult {
+        _ = permissionPolicy
+        moduleMutationCount += 1
+        settings.modules[module] = enabled
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func apply(_ change: TrustSettingsChange) -> TrustSettingsUpdateResult {
+        switch change {
+        case let .displays(displays):
+            settings.displays = displays
+        case let .motion(motion):
+            settings.motion = motion
+        case let .fullscreen(fullscreen):
+            settings.fullscreenBehavior = fullscreen
+        case let .crashAndDiagnosticSharingConsent(consent):
+            settings.crashAndDiagnosticSharingConsent = consent
+        case let .onboardingCompleted(completed):
+            settings.onboardingCompleted = completed
+        }
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) -> TrustSettingsUpdateResult {
+        settings.launchAtLogin = enabled
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func resetToSafeDefaults() -> TrustSettingsUpdateResult {
+        settings = .safeDefaults
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func diagnosticsContext() -> DiagnosticsContext {
+        DiagnosticsContext(settings: settings, providerHealth: [])
+    }
+
+    func stopAll() -> StopAllResult {
+        stopCount += 1
+        return StopAllResult(stoppedModules: [])
+    }
+}
+
+private struct RejectingDiagnosticsWriter: DiagnosticsWriting {
+    func write(_ data: Data, to destination: URL) async throws {
+        _ = data
+        _ = destination
+    }
+}
+
+@MainActor
 private final class RecordingService: ApplicationRuntimeService {
     private let name: String
     private let events: EventLog
@@ -437,6 +791,7 @@ private final class WeakReference<Value: AnyObject> {
 @MainActor
 private final class RecordingUpdateDriver: UpdateDriving {
     private let events: EventLog
+    private(set) var checkCount = 0
 
     init(events: EventLog) {
         self.events = events
@@ -448,7 +803,8 @@ private final class RecordingUpdateDriver: UpdateDriving {
     }
 
     func checkForUpdates() -> Bool {
-        true
+        checkCount += 1
+        return true
     }
 }
 
@@ -510,6 +866,8 @@ private final class RecordingLifecycleEventSource: PanelLifecycleEventSourcing {
 private final class RecordingPanel: PanelPresenting {
     let displayIdentity: DisplayIdentity
     private let events: EventLog
+    private(set) var primaryActionCount = 0
+    private(set) var visibilityToggleCount = 0
 
     init(displayIdentity: DisplayIdentity, events: EventLog) {
         self.displayIdentity = displayIdentity
@@ -528,7 +886,12 @@ private final class RecordingPanel: PanelPresenting {
 
     func update(snapshot: DisplaySnapshot) {}
     func updatePointer(screenPoint: CGPoint) {}
-    func performPrimaryAction() {}
+    func performPrimaryAction() {
+        primaryActionCount += 1
+    }
+    func performVisibilityToggle() {
+        visibilityToggleCount += 1
+    }
     func cancelPendingInteractions() {}
 }
 

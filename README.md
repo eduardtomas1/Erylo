@@ -2,72 +2,132 @@
 
 # Erylo
 
-**A calm, useful extension of your MacBook's notch.**
+### Your focus, one glance away.
 
-Erylo keeps a Focus Timer close to the top edge and out of the way. Meetings,
-music, battery, volume, and file handoffs are planned next.
+Erylo turns the quiet space around your MacBook's notch into a useful part of
+your day—present when it matters, invisible when it does not.
 
-macOS 14+ · Apple Silicon first · Native Swift · Open source
+<p>
+  <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square&logo=apple&logoColor=white">
+  <img alt="Native Swift 6" src="https://img.shields.io/badge/Swift-6-F6A23C?style=flat-square&logo=swift&logoColor=white">
+  <img alt="Local first" src="https://img.shields.io/badge/local--first-no%20analytics-2E8B74?style=flat-square">
+  <img alt="Apache 2.0 license" src="https://img.shields.io/badge/license-Apache%202.0-5D88E5?style=flat-square">
+</p>
 
-<img src="docs/images/erylo-timer-expanded.png" width="740" alt="Erylo expanded from the MacBook notch with a focus timer, progress, and cancel action">
+<img src="docs/images/erylo-timer-expanded.png" width="756" alt="Erylo extending from the MacBook notch with a live Focus Timer, progress, and cancel action">
 
-<sub>A real Focus Timer running in Erylo's native notch-attached window.</sub>
+<sub>The real Focus Timer running in Erylo's native notch-attached surface.</sub>
 
 </div>
 
-## The notch, made useful
+---
 
-Erylo rests as a slim black silhouette joined to the camera area. A click or the
-keyboard shortcut opens just enough room for the current activity, then it
-settles back into the top edge when you are done.
+## A timer should not need another window
+
+Start a 15, 25, or 50 minute Focus Timer from the Erylo menu. Its progress
+lives at the top edge of the display, where it can be checked without opening an
+app, moving a window, or breaking concentration.
+
+When you want more detail, reveal Erylo with a click or
+<kbd>Control</kbd> + <kbd>Option</kbd> + <kbd>Command</kbd> + <kbd>E</kbd>.
+Cancel from the expanded surface or directly from the menu. When the session
+ends, the activity disappears.
 
 <p align="center">
-  <img src="docs/images/erylo-timer-compact.png" width="500" alt="Erylo's compact timer state wrapping the MacBook notch">
+  <img src="docs/images/erylo-timer-compact.png" width="496" alt="Erylo's compact live timer state wrapping the MacBook notch">
+  <br>
+  <sub>Compact enough to glance at. Quiet enough to forget about.</sub>
 </p>
 
-- **Quiet by default.** No floating card, no permanent dashboard, and no idle
-  animation demanding attention.
-- **Useful at a glance.** The compact state keeps the essential signal visible;
-  the expanded state adds context, progress, and the action that matters.
-- **Built for real interruptions.** Activities are ordered, deduplicated, and
-  handed off without turning the notch into a notification pile.
-- **Motion with purpose.** Expansion uses a restrained spring and follows the
-  Mac's Reduce Motion preference.
+## One small rhythm
 
-## Available now
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>1 · Start</strong><br><br>
+      Choose a focus length from the native Erylo menu. Starting again cleanly
+      replaces the current session.
+    </td>
+    <td width="33%" valign="top">
+      <strong>2 · Glance</strong><br><br>
+      See the remaining time and live progress in a slim silhouette joined to
+      the notch—not in a floating dashboard.
+    </td>
+    <td width="33%" valign="top">
+      <strong>3 · Act</strong><br><br>
+      Open Erylo when you need context, cancel from the notch or menu, then let
+      the surface settle away.
+    </td>
+  </tr>
+</table>
 
-| Utility | What it brings to the notch |
+## Why Erylo feels different
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>Attached, not overlaid</strong><br>
+      The shape grows from the top edge and visually belongs to the notch. It is
+      not a card hovering below it.
+    </td>
+    <td width="50%" valign="top">
+      <strong>Calm by default</strong><br>
+      No idle animation, permanent dashboard, or hover-triggered opening. Erylo
+      waits for deliberate interaction.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>Useful without stealing focus</strong><br>
+      The activity surface is non-activating and supports a global shortcut,
+      menu commands, and VoiceOver-friendly actions.
+    </td>
+    <td width="50%" valign="top">
+      <strong>Built for the whole Mac</strong><br>
+      Erylo adapts to notched and non-notched displays, multiple displays,
+      Spaces, sleep, wake, and the system's Reduce Motion setting.
+    </td>
+  </tr>
+</table>
+
+> **Local first, by design.** Erylo has no analytics SDK, automatic diagnostics
+> upload, media history, or background polling just to keep the surface alive.
+> Browsing Settings starts no utility, permission request, socket, file access,
+> media automation, or network work.
+
+## Available today
+
+### Focus Timer
+
+- Start a **15, 25, or 50 minute** session from the Erylo menu.
+- Follow remaining time and live progress from the compact notch surface.
+- Expand for context and a clear **Cancel timer** action.
+- Cancel from the menu when keyboard or VoiceOver navigation is preferable.
+- Replace a running session safely by starting another preset.
+- Let natural completion clear the activity without leaving timer work behind.
+
+That is the complete live utility today. Erylo does not pretend unfinished
+foundations are product features.
+
+## What Erylo is growing into
+
+The activity foundation already anticipates more small, time-sensitive moments.
+These utilities are planned, but they are **not connected to the app and do not
+run in the background**:
+
+| Next utility | The moment it should simplify |
 | --- | --- |
-| **Focus Timer** | Start a 15, 25, or 50 minute session from the Erylo menu, follow live progress, and cancel from either the notch or menu. |
+| **Now Playing** | See and control Apple Music or Spotify without leaving the current task. |
+| **Meetings** | Notice an upcoming meeting only when it becomes relevant. |
+| **Battery & charging** | Get a short, useful signal instead of another persistent widget. |
+| **Volume** | Confirm output level and mute changes without a large overlay. |
+| **File Hold** | Keep one file close while moving between tasks. |
+| **External activities** | Let trusted local tools show and dismiss their own progress. |
 
-## Planned utilities
+## Run Erylo
 
-These ideas shape Erylo, but they are not connected to the app yet and do not
-run in the background.
-
-| Utility | What it could bring to the notch |
-| --- | --- |
-| **Now Playing** | Apple Music and Spotify status with playback, seek, and volume capabilities. |
-| **Meetings** | A quiet calendar cue when an upcoming meeting becomes relevant. |
-| **Battery & charging** | Low-battery awareness and short, useful charging updates. |
-| **Volume** | A brief acknowledgement of output level and mute changes. |
-| **File Hold** | A safe temporary home for a file you want to keep close while changing tasks. |
-| **External activities** | A local way for trusted tools to show and dismiss their own progress. |
-
-## Designed to feel native
-
-Erylo uses public macOS APIs and stays a non-activating accessory, so opening it
-does not pull focus away from your work. It adapts to notched and non-notched
-displays, supports multiple displays, and can be revealed with
-`Control–Option–Command–E`.
-
-The project is local-first: no analytics SDK, no automatic diagnostics upload,
-no media history, and no background polling just to keep the surface alive.
-Features ask for access only in the context where it is needed.
-
-## Try the Focus Timer
-
-You need macOS 14 or newer and Swift 6 Command Line Tools.
+Erylo currently ships source-first. You need macOS 14 or newer and Swift 6
+Command Line Tools.
 
 ```sh
 git clone https://github.com/eduardtomas1/Erylo.git
@@ -75,22 +135,35 @@ cd Erylo
 swift run Erylo
 ```
 
-Use Erylo's menu-bar item to start a Focus Timer, cancel it, show or hide the
-surface, reopen Settings, or quit. Erylo does not publish a signed end-user
-download yet.
+Look for **Erylo** in the menu bar. From there you can start or cancel a Focus
+Timer, show or hide the surface, open Settings, check for updates when a signed
+feed is configured, or quit cleanly.
+
+> Erylo does not publish a signed end-user download yet. The release pipeline is
+> in place, but real Developer ID signing, notarization, and update publication
+> remain explicit release gates.
 
 <details>
-<summary><strong>Building or contributing?</strong></summary>
+<summary><strong>Building, testing, or contributing?</strong></summary>
 
-Start with the [development guide](docs/DEVELOPMENT.md). The
-[architecture notes](docs/FOUNDATION.md),
-[compatibility matrix](docs/COMPATIBILITY_MATRIX.md), and
-[release runbook](docs/RELEASE_RUNBOOK.md) document the deeper engineering and
-remaining hardware and signing gates. Contributions are covered by
-[CONTRIBUTING.md](CONTRIBUTING.md).
+The product README stays intentionally human. The deeper material lives here:
+
+- [Development guide](docs/DEVELOPMENT.md)
+- [Architecture notes](docs/FOUNDATION.md)
+- [Glance provider lifecycle](docs/GLANCE_LIFECYCLE.md)
+- [Compatibility and hardware gates](docs/COMPATIBILITY_MATRIX.md)
+- [Release runbook](docs/RELEASE_RUNBOOK.md)
+- [Contribution guide](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
 
 </details>
 
 ---
 
-Erylo is available under the [Apache License 2.0](LICENSE).
+<div align="center">
+
+**Glance. Act. Disappear.**
+
+Erylo is open source under the [Apache License 2.0](LICENSE).
+
+</div>

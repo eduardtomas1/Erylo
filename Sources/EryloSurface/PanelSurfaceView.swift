@@ -404,7 +404,7 @@ public struct PanelSurfaceView: View {
                 )
                 .disabled(model.activityModel.actionDispatchState == .inProgress)
                 .accessibilityLabel(action.label)
-                .accessibilityHint(SurfaceStrings.actionHint)
+                .accessibilityHint(SurfaceStrings.actionHint(for: action.intent))
                 .accessibilitySortPriority(1)
             }
         } else if let status = content.actionStatus {

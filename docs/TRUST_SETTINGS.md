@@ -35,7 +35,13 @@ Permission policy is closed and module-specific:
 
 Opening or loading the settings view only reads settings and `SMAppService` status. It never constructs a provider, starts work, or asks permission.
 
-No utility provider is registered by the application control plane. Every module control is visibly unavailable and defensively rejected in the view model, so browsing or interacting with unavailable controls cannot create a provider, request permission, open a socket or file, invoke media automation, schedule a timer, or perform network work. The real Focus Timer is not part of this integration.
+No utility provider is registered by the application control plane. Focus Timer is
+owned separately by `ApplicationRuntime` and starts only from a deliberate Erylo
+menu command; its Settings row points to that menu and does not mutate provider
+state. Every planned module control remains visibly unavailable and defensively
+rejected in the view model, so browsing or interacting with Settings cannot start
+the Focus Timer, request permission, open a socket or file, invoke media
+automation, or perform network work.
 
 ## Launch at login
 

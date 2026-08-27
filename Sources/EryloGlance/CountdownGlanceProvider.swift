@@ -26,6 +26,7 @@ public actor CountdownGlanceProvider {
     private var mutationTask: Task<Void, Never>?
     private var mutationTailRevision: UInt64 = 0
     private var activeCountdown: CountdownTimer?
+    private var publishedActivityRevision: UInt64?
     private var currentPresentationDemand: CountdownPresentationDemand = .hidden
     private var boundaryTask: Task<Void, Never>?
     private var boundaryRevision: UInt64 = 0
@@ -169,6 +170,7 @@ public actor CountdownGlanceProvider {
         brokerOwnershipLease?.beginRetirement()
         let disableGeneration = generation
         operationRevision &+= 1
+        publishedActivityRevision = nil
         presentationDemandRevision &+= 1
         let pendingActivation = activationTask
         activationTask = nil
@@ -195,6 +197,7 @@ public actor CountdownGlanceProvider {
     /// Replaces the single active countdown. While disabled, this stores data but starts no work.
     public func setCountdown(_ countdown: CountdownTimer) async {
         operationRevision &+= 1
+        publishedActivityRevision = nil
         let revision = operationRevision
         let previous = mutationTask
         mutationTailRevision &+= 1
@@ -211,6 +214,7 @@ public actor CountdownGlanceProvider {
 
     public func cancelCountdown() async {
         operationRevision &+= 1
+        publishedActivityRevision = nil
         let revision = operationRevision
         let previous = mutationTask
         mutationTailRevision &+= 1
@@ -223,6 +227,33 @@ public actor CountdownGlanceProvider {
         mutationTask = task
         await task.value
         clearMutationTask(tailRevision: tailRevision)
+    }
+
+    /// Cancels only when the caller still refers to the exact activity revision
+    /// most recently published by this provider. Replacement and progress
+    /// publication invalidate older revisions before cancellation can begin.
+    @discardableResult
+    public func cancelCountdown(ifPublishedRevision revision: UInt64) async -> Bool {
+        guard enabled,
+              activeCountdown != nil,
+              publishedActivityRevision == revision else {
+            return false
+        }
+        operationRevision &+= 1
+        publishedActivityRevision = nil
+        let operationRevision = operationRevision
+        let previous = mutationTask
+        mutationTailRevision &+= 1
+        let tailRevision = mutationTailRevision
+        let task = Task { [weak self] in
+            await previous?.value
+            guard let self else { return }
+            await self.performCancelCountdown(operationRevision: operationRevision)
+        }
+        mutationTask = task
+        await task.value
+        clearMutationTask(tailRevision: tailRevision)
+        return activeCountdown == nil
     }
 
     /// Controls second-level broker updates. Hidden timers retain only their expiry
@@ -425,6 +456,7 @@ public actor CountdownGlanceProvider {
                 requiredPresentationDemandRevision: requiredPresentationDemandRevision
             ) else { return }
             activeCountdown = nil
+            publishedActivityRevision = nil
             currentStatus = GlanceProviderStatus(
                 isEnabled: true,
                 capability: .available,
@@ -433,14 +465,13 @@ public actor CountdownGlanceProvider {
             return
         }
 
-        let health: GlanceProviderHealth
+        let result: Result<UInt64, any Error>
         do {
-            try await submitBrokerCountdown(
+            result = .success(try await submitBrokerCountdown(
                 GlanceRequestFactory.countdown(countdown, now: now)
-            )
-            health = .healthy
+            ))
         } catch {
-            health = .degraded(.brokerRejected)
+            result = .failure(error)
         }
         guard isCurrent(
             generation: generation,
@@ -448,6 +479,15 @@ public actor CountdownGlanceProvider {
             countdown: countdown,
             requiredPresentationDemandRevision: requiredPresentationDemandRevision
         ) else { return }
+        let health: GlanceProviderHealth
+        switch result {
+        case let .success(revision):
+            publishedActivityRevision = revision
+            health = .healthy
+        case .failure:
+            publishedActivityRevision = nil
+            health = .degraded(.brokerRejected)
+        }
         currentStatus = GlanceProviderStatus(
             isEnabled: true,
             capability: .available,
@@ -482,6 +522,7 @@ public actor CountdownGlanceProvider {
             mutationTask = nil
         }
         currentPresentationDemand = .hidden
+        publishedActivityRevision = nil
         currentStatus = .disabled
         releaseCleanupToken.complete(generation: releaseCleanupGeneration)
     }
@@ -590,21 +631,13 @@ public actor CountdownGlanceProvider {
         }
 
         if currentPresentationDemand == .visible {
+            let result: Result<UInt64, any Error>
             do {
-                try await submitBrokerCountdown(
+                result = .success(try await submitBrokerCountdown(
                     GlanceRequestFactory.countdown(countdown, now: now)
-                )
-                currentStatus = GlanceProviderStatus(
-                    isEnabled: true,
-                    capability: .available,
-                    health: .healthy
-                )
+                ))
             } catch {
-                currentStatus = GlanceProviderStatus(
-                    isEnabled: true,
-                    capability: .available,
-                    health: .degraded(.brokerRejected)
-                )
+                result = .failure(error)
             }
             guard isCurrent(
                 generation: generation,
@@ -612,6 +645,20 @@ public actor CountdownGlanceProvider {
                 countdown: countdown,
                 requiredPresentationDemandRevision: presentationDemandRevision
             ), self.boundaryRevision == boundaryRevision else { return }
+            let health: GlanceProviderHealth
+            switch result {
+            case let .success(revision):
+                publishedActivityRevision = revision
+                health = .healthy
+            case .failure:
+                publishedActivityRevision = nil
+                health = .degraded(.brokerRejected)
+            }
+            currentStatus = GlanceProviderStatus(
+                isEnabled: true,
+                capability: .available,
+                health: health
+            )
         }
         boundaryTask = nil
         startBoundary(
@@ -644,6 +691,7 @@ public actor CountdownGlanceProvider {
         ), self.boundaryRevision == boundaryRevision else { return }
         boundaryTask = nil
         activeCountdown = nil
+        publishedActivityRevision = nil
         currentStatus = GlanceProviderStatus(
             isEnabled: true,
             capability: .available,
@@ -651,19 +699,29 @@ public actor CountdownGlanceProvider {
         )
     }
 
-    private func submitBrokerCountdown(_ request: ActivityRequest) async throws {
+    private func submitBrokerCountdown(_ request: ActivityRequest) async throws -> UInt64 {
+        let snapshot: ActivityBrokerSnapshot
         if let ownershipBroker {
-            guard let brokerOwnershipLease,
-                  try await ownershipBroker.submit(
-                    request,
-                    ifOwnedBy: brokerOwnershipLease
-                  ) != nil else {
+            guard let brokerOwnershipLease else {
                 throw BrokerMutationError.rejected
             }
+            guard let submitted = try await ownershipBroker.submit(
+                request,
+                ifOwnedBy: brokerOwnershipLease
+            ) else {
+                throw BrokerMutationError.rejected
+            }
+            snapshot = submitted
         } else {
-            let snapshot = try await broker.submit(request)
+            snapshot = try await broker.submit(request)
             legacyActivityLease.record(snapshot)
         }
+        guard let published = snapshot.ordered.first(where: {
+            $0.activity.identity == GlanceActivityIdentity.timer
+        }) else {
+            throw BrokerMutationError.rejected
+        }
+        return published.revision
     }
 
     private func cancelBrokerCountdown() async {

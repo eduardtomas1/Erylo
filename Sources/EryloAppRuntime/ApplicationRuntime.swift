@@ -1,4 +1,5 @@
 import EryloActivity
+import EryloGlance
 import EryloSurface
 import EryloUpdates
 import EryloWindowing
@@ -31,6 +32,7 @@ package final class ApplicationRuntime {
     private let panelCoordinator: PanelCoordinator
     private let updateRuntime: UpdateRuntime
     private let controlPlane: (any ApplicationControlPlaneOwning)?
+    private let focusTimer: FocusTimerRuntimeService?
     private let requestApplicationTermination: @MainActor () -> Void
     private var registeredServices: [any ApplicationRuntimeService] = []
     private var startedServices: [any ApplicationRuntimeService] = []
@@ -46,6 +48,7 @@ package final class ApplicationRuntime {
         panelCoordinator: PanelCoordinator,
         updateRuntime: UpdateRuntime,
         controlPlane: (any ApplicationControlPlaneOwning)? = nil,
+        focusTimer: FocusTimerRuntimeService? = nil,
         requestApplicationTermination: @escaping @MainActor () -> Void = {}
     ) {
         self.activityBroker = activityBroker
@@ -53,6 +56,7 @@ package final class ApplicationRuntime {
         self.panelCoordinator = panelCoordinator
         self.updateRuntime = updateRuntime
         self.controlPlane = controlPlane
+        self.focusTimer = focusTimer
         self.requestApplicationTermination = requestApplicationTermination
     }
 
@@ -61,6 +65,7 @@ package final class ApplicationRuntime {
         requestApplicationTermination: @escaping @MainActor () -> Void
     ) -> ApplicationRuntime {
         let activityBroker = ActivityBroker()
+        let focusTimer = FocusTimerRuntimeService(broker: activityBroker)
         let activityModel: SurfaceActivityModel
         let panelCoordinator: PanelCoordinator
 
@@ -73,23 +78,41 @@ package final class ApplicationRuntime {
                 previewInitialState: ActivitySurfacePreviewCatalog.timer.state
             )
         } else {
-            activityModel = SurfaceActivityModel(broker: activityBroker)
+            activityModel = SurfaceActivityModel(
+                broker: activityBroker,
+                actionHandler: FocusTimerActionRouter(
+                    broker: activityBroker,
+                    focusTimer: focusTimer
+                )
+            )
             panelCoordinator = PanelCoordinator(activityModel: activityModel)
         }
         #else
         _ = environment
-        activityModel = SurfaceActivityModel(broker: activityBroker)
+        activityModel = SurfaceActivityModel(
+            broker: activityBroker,
+            actionHandler: FocusTimerActionRouter(
+                broker: activityBroker,
+                focusTimer: focusTimer
+            )
+        )
         panelCoordinator = PanelCoordinator(activityModel: activityModel)
         #endif
 
-        return ApplicationRuntime(
+        panelCoordinator.setActivityVisibilityHandler { [weak focusTimer] isVisible in
+            focusTimer?.setSurfaceVisible(isVisible)
+        }
+        let runtime = ApplicationRuntime(
             activityBroker: activityBroker,
             activityModel: activityModel,
             panelCoordinator: panelCoordinator,
             updateRuntime: UpdateRuntime(configuration: .mainBundle),
             controlPlane: ApplicationControlPlane.production(),
+            focusTimer: focusTimer,
             requestApplicationTermination: requestApplicationTermination
         )
+        precondition(runtime.register(focusTimer), "Focus Timer service registration failed")
+        return runtime
     }
 
     /// Registration is deliberately limited to composition time so startup order is stable.
@@ -156,6 +179,14 @@ package final class ApplicationRuntime {
         switch command {
         case .toggleSurface:
             return panelCoordinator.toggleSelectedPanelVisibility()
+        case .startFocusTimer15:
+            return focusTimer?.requestStart(.fifteenMinutes) == true
+        case .startFocusTimer25:
+            return focusTimer?.requestStart(.twentyFiveMinutes) == true
+        case .startFocusTimer50:
+            return focusTimer?.requestStart(.fiftyMinutes) == true
+        case .cancelFocusTimer:
+            return focusTimer?.requestCancel() == true
         case .showSettings:
             guard let controlPlane else { return false }
             controlPlane.presentSettings()

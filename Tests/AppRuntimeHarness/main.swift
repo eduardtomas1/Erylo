@@ -3,6 +3,7 @@ import Darwin
 import EryloActivity
 import EryloAppRuntime
 import EryloCore
+import EryloGlance
 import EryloIntegrations
 import EryloSettingsUI
 import EryloSurface
@@ -21,6 +22,7 @@ enum AppRuntimeHarnessMain {
         await harness.verifyCallerCancellationDoesNotAbandonStartup()
         await harness.verifyControlPlanePresentationAndSafeSettings()
         await harness.verifyMenuCommandRoutingAndUpdateAvailability()
+        await harness.verifyFocusTimerVerticalSlice()
         harness.finish()
     }
 }
@@ -319,7 +321,8 @@ private struct AppRuntimeHarness {
                 && ApplicationControlCopy.statusItemHint.contains("surface")
                 && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("top edge")
                 && TrustAccessibilityCopy.onboardingInteractionExplanation.contains("Control–Option–Command–E")
-                && TrustAccessibilityCopy.onboardingSafetyExplanation.contains("Safe defaults")
+                && TrustAccessibilityCopy.onboardingSafetyExplanation.contains("Browsing Settings")
+                && TrustAccessibilityCopy.onboardingControlExplanation.contains("Focus Timer")
                 && TrustAccessibilityCopy.onboardingControlExplanation.contains("quit"),
             "control and onboarding accessibility copy explains the complete daily-use path"
         )
@@ -437,6 +440,430 @@ private struct AppRuntimeHarness {
             "disabled updater omits Check for Updates from the menu"
         )
         await disabledRuntime.shutdown()
+    }
+
+    mutating func verifyFocusTimerVerticalSlice() async {
+        let now = Date(timeIntervalSinceReferenceDate: 90_000.25)
+        let clock = ManualFocusClock(now: now)
+        let broker = ActivityBroker()
+        let focusTimer = FocusTimerRuntimeService(broker: broker, clock: clock)
+        let router = FocusTimerActionRouter(broker: broker, focusTimer: focusTimer)
+        let model = SurfaceActivityModel(broker: broker, actionHandler: router)
+        let events = EventLog()
+        let eventSource = RecordingLifecycleEventSource(events: events)
+        let panel = VisibilityReportingPanel(
+            displayIdentity: DisplayIdentity(rawValue: 1),
+            events: events
+        )
+        let coordinator = PanelCoordinator(
+            displayProvider: FixedDisplayProvider(),
+            policy: .safeDefault,
+            lifecycleEventSource: eventSource,
+            activityModel: model,
+            panelFactory: { _, _ in panel }
+        )
+        coordinator.setActivityVisibilityHandler { [weak focusTimer] isVisible in
+            focusTimer?.setSurfaceVisible(isVisible)
+        }
+        let termination = Counter()
+        let controlPlane = RecordingControlPlane()
+        let runtime = ApplicationRuntime(
+            activityBroker: broker,
+            activityModel: model,
+            panelCoordinator: coordinator,
+            updateRuntime: UpdateRuntime(configuration: Self.disabledUpdateConfiguration()),
+            controlPlane: controlPlane,
+            focusTimer: focusTimer,
+            requestApplicationTermination: { termination.value += 1 }
+        )
+        check(runtime.register(focusTimer), "Focus Timer registers with the application lifecycle owner")
+
+        check(!runtime.handle(.startFocusTimer25), "Focus Timer commands fail closed before startup")
+        check(await focusTimer.provider.status() == .disabled, "Focus Timer construction is inert")
+        check(await focusTimer.provider.workState().isIdle, "inert Focus Timer owns no task or timer")
+        check(
+            await broker.workState().activeOwnershipCount == 0,
+            "inert Focus Timer claims no broker ownership"
+        )
+
+        check(await runtime.start(), "Focus Timer application runtime starts")
+        check(await focusTimer.provider.status() == .disabled, "application startup does not enable the timer provider")
+        check(await focusTimer.provider.workState().isIdle, "application startup creates no countdown boundary")
+        check(
+            await broker.workState().activeOwnershipCount == 0,
+            "application startup creates no timer ownership side effect"
+        )
+        check(runtime.handle(.showSettings), "Settings remains available before any timer starts")
+        check(controlPlane.presentationCount == 1, "Settings browsing routes without timer ownership")
+        check(await focusTimer.provider.status() == .disabled, "Settings browsing does not enable the timer provider")
+        check(await focusTimer.provider.workState().isIdle, "Settings browsing creates no timer work")
+        check(
+            await broker.workState().activeOwnershipCount == 0,
+            "Settings browsing creates no timer broker ownership"
+        )
+
+        let menu = ApplicationMenuDescriptor(canCheckForUpdates: false)
+        let timerItems = menu.items.filter {
+            switch $0.kind {
+            case .command(.startFocusTimer15), .command(.startFocusTimer25),
+                 .command(.startFocusTimer50), .command(.cancelFocusTimer):
+                true
+            default:
+                false
+            }
+        }
+        check(timerItems.count == 4, "status menu exposes three Focus Timer presets and Cancel")
+        check(
+            timerItems.map(\.keyEquivalent) == ["1", "2", "5", "."],
+            "Focus Timer menu commands provide keyboard equivalents"
+        )
+        check(
+            timerItems.allSatisfy {
+                $0.accessibilityHint?.isEmpty == false
+                    && $0.accessibilityIdentifier?.hasPrefix("erylo.focus-timer.") == true
+            },
+            "Focus Timer menu commands provide accurate accessibility metadata"
+        )
+        check(
+            !menu.items.map(\.title).joined(separator: " ").lowercased().contains("pause")
+                && !menu.items.map(\.title).joined(separator: " ").lowercased().contains("resume"),
+            "Focus Timer menu makes no unsupported pause or resume claim"
+        )
+
+        check(runtime.handle(.startFocusTimer25), "25-minute Focus Timer command is accepted")
+        check(
+            await waitUntil {
+                let countdown = await focusTimer.provider.countdown()
+                let snapshot = await broker.snapshot()
+                return countdown != nil
+                    && snapshot.current?.activity.identity == CountdownActivityContract.identity
+            },
+            "Focus Timer command publishes through the shared broker"
+        )
+        if let timer = await focusTimer.provider.countdown() {
+            check(timer.title == "Focus Timer", "Focus Timer uses the daily-use title")
+            check(
+                timer.endsAt.timeIntervalSince(timer.startedAt) == 25 * 60,
+                "25-minute preset creates the exact requested duration"
+            )
+        } else {
+            check(false, "25-minute preset creates a countdown")
+            check(false, "25-minute preset duration is observable")
+        }
+        check(
+            await focusTimer.provider.presentationDemand() == .hidden,
+            "hidden notch retains expiry-only timer demand"
+        )
+        check(
+            await waitUntil { await clock.pendingCount == 1 },
+            "hidden Focus Timer owns one bounded expiry one-shot"
+        )
+
+        panel.setContentVisible(true)
+        check(
+            await waitUntil { await focusTimer.provider.presentationDemand() == .visible },
+            "visible notch starts live Focus Timer demand"
+        )
+        let firstTick = Date(timeIntervalSinceReferenceDate: 90_001)
+        check(
+            await waitUntil { await clock.pendingDeadlines == [firstTick] },
+            "visible Focus Timer owns one aligned progress boundary"
+        )
+        let originalRevision = await broker.snapshot().current?.revision
+        await clock.advance(to: firstTick)
+        check(
+            await waitUntil {
+                guard let current = await broker.snapshot().current else { return false }
+                return current.revision != originalRevision
+                    && (current.activity.presentation.progress?.fractionCompleted ?? 0) > 0
+            },
+            "visible Focus Timer publishes timestamp-derived live progress"
+        )
+
+        panel.setContentVisible(false)
+        check(
+            await waitUntil { await focusTimer.provider.presentationDemand() == .hidden },
+            "hiding the notch stops live Focus Timer demand"
+        )
+        check(
+            await waitUntil {
+                await clock.pendingDeadlines
+                    == [Date(timeIntervalSinceReferenceDate: 91_500.25)]
+            },
+            "hidden Focus Timer returns to one expiry-only boundary"
+        )
+
+        guard let staleAction = model.currentAction else {
+            check(false, "live Focus Timer exposes its typed cancel action")
+            await runtime.shutdown()
+            return
+        }
+        check(runtime.handle(.startFocusTimer15), "starting a new preset replaces the running Focus Timer")
+        check(
+            await waitUntil {
+                guard let timer = await focusTimer.provider.countdown() else { return false }
+                return timer.endsAt.timeIntervalSince(timer.startedAt) == 15 * 60
+                    && model.currentAction?.identity.activityRevision
+                        != staleAction.identity.activityRevision
+            },
+            "replacement publishes a fresh activity revision"
+        )
+        check(
+            !model.dispatch(staleAction),
+            "saved notch action fails closed after Focus Timer replacement"
+        )
+        check(await focusTimer.provider.countdown() != nil, "stale action cannot cancel the replacement timer")
+
+        guard let replacementAction = model.currentAction else {
+            check(false, "replacement Focus Timer exposes a fresh cancel action")
+            await runtime.shutdown()
+            return
+        }
+        let wrongAction = SurfaceActionIdentity(
+            activityIdentity: replacementAction.identity.activityIdentity,
+            activityRevision: replacementAction.identity.activityRevision,
+            actionIdentifier: "timer.pause"
+        )
+        check(
+            await router.handle(.cancel, identity: wrongAction) == .unhandled,
+            "typed router rejects a mismatched action identifier"
+        )
+        check(
+            await router.handle(.pause, identity: replacementAction.identity) == .unhandled,
+            "typed router rejects a mismatched action intent"
+        )
+        let wrongSource = SurfaceActionIdentity(
+            activityIdentity: ActivityIdentity(
+                source: .external,
+                identifier: try! ActivityIdentifier(
+                    validating: CountdownActivityContract.identifier
+                )
+            ),
+            activityRevision: replacementAction.identity.activityRevision,
+            actionIdentifier: CountdownActivityContract.cancelActionIdentifier
+        )
+        check(
+            await router.handle(.cancel, identity: wrongSource) == .unhandled,
+            "typed router rejects a mismatched activity source"
+        )
+        let wrongIdentifier = SurfaceActionIdentity(
+            activityIdentity: ActivityIdentity(
+                source: .timer,
+                identifier: try! ActivityIdentifier(validating: "another-countdown")
+            ),
+            activityRevision: replacementAction.identity.activityRevision,
+            actionIdentifier: CountdownActivityContract.cancelActionIdentifier
+        )
+        check(
+            await router.handle(.cancel, identity: wrongIdentifier) == .unhandled,
+            "typed router rejects a mismatched activity identifier"
+        )
+        check(await focusTimer.provider.countdown() != nil, "mismatched actions never cancel the current timer")
+
+        check(
+            await router.handle(.cancel, identity: replacementAction.identity) == .handled,
+            "fresh typed Focus Timer action cancels through its provider"
+        )
+        check(
+            await waitUntil {
+                let countdown = await focusTimer.provider.countdown()
+                let snapshot = await broker.snapshot()
+                return countdown == nil
+                    && snapshot.current == nil
+                    && focusTimer.workState().isIdle
+            },
+            "notch cancellation drains timer, broker activity, and command work"
+        )
+        check(await focusTimer.provider.status() == .disabled, "successful cancel releases timer capability ownership")
+
+        check(runtime.handle(.startFocusTimer25), "surface-routing Focus Timer starts")
+        check(
+            await waitUntil {
+                let countdown = await focusTimer.provider.countdown()
+                return countdown != nil && model.currentAction != nil
+            },
+            "surface-routing Focus Timer exposes a current action"
+        )
+        if let surfaceAction = model.currentAction {
+            check(model.dispatch(surfaceAction), "application surface dispatches the typed timer action")
+            check(
+                await waitUntil {
+                    let countdown = await focusTimer.provider.countdown()
+                    let snapshot = await broker.snapshot()
+                    return countdown == nil
+                        && snapshot.current == nil
+                        && !model.workState.hasActionTask
+                },
+                "application surface action drains through router and provider"
+            )
+        } else {
+            check(false, "application surface exposes an action to dispatch")
+            check(false, "application surface action can settle")
+        }
+
+        let wrongKindBroker = ActivityBroker()
+        let wrongKindFocus = FocusTimerRuntimeService(broker: wrongKindBroker, clock: clock)
+        let wrongKindRouter = FocusTimerActionRouter(broker: wrongKindBroker, focusTimer: wrongKindFocus)
+        await wrongKindFocus.start()
+        do {
+            let snapshot = try await wrongKindBroker.submit(
+                ActivityRequest(
+                    identifier: CountdownActivityContract.identifier,
+                    source: ActivitySource.timer.rawValue,
+                    kind: ActivityKind.generic.rawValue,
+                    priority: ActivityPriority.normal.rawValue,
+                    title: "Not a countdown",
+                    actionIdentifier: CountdownActivityContract.cancelActionIdentifier,
+                    actionLabel: "Cancel",
+                    actionIntent: ActivityActionIntent.cancel.rawValue
+                )
+            )
+            if let presented = snapshot.current {
+                let identity = SurfaceActionIdentity(
+                    activityIdentity: presented.activity.identity,
+                    activityRevision: presented.revision,
+                    actionIdentifier: CountdownActivityContract.cancelActionIdentifier
+                )
+                check(
+                    await wrongKindRouter.handle(.cancel, identity: identity) == .unhandled,
+                    "typed router validates activity kind"
+                )
+                check(
+                    await wrongKindBroker.snapshot().current?.revision == presented.revision,
+                    "kind mismatch fails closed without removing broker state"
+                )
+            } else {
+                check(false, "wrong-kind fixture publishes an action")
+                check(false, "wrong-kind fixture remains present")
+            }
+        } catch {
+            recordUnexpected(error, context: "wrong-kind action route")
+            check(false, "wrong-kind fixture remains inspectable")
+        }
+        do {
+            let snapshot = try await wrongKindBroker.submit(
+                ActivityRequest(
+                    identifier: CountdownActivityContract.identifier,
+                    source: ActivitySource.timer.rawValue,
+                    kind: ActivityKind.timer.rawValue,
+                    priority: ActivityPriority.normal.rawValue,
+                    title: "Wrong action contract",
+                    actionIdentifier: "timer.pause",
+                    actionLabel: "Pause",
+                    actionIntent: ActivityActionIntent.pause.rawValue
+                )
+            )
+            if let presented = snapshot.current {
+                let forgedCanonicalAction = SurfaceActionIdentity(
+                    activityIdentity: presented.activity.identity,
+                    activityRevision: presented.revision,
+                    actionIdentifier: CountdownActivityContract.cancelActionIdentifier
+                )
+                check(
+                    await wrongKindRouter.handle(.cancel, identity: forgedCanonicalAction)
+                        == .unhandled,
+                    "typed router validates the activity's declared action contract"
+                )
+            } else {
+                check(false, "wrong-action fixture publishes an activity")
+            }
+
+            let capabilitySnapshot = try await wrongKindBroker.submit(
+                ActivityRequest(
+                    identifier: CountdownActivityContract.identifier,
+                    source: ActivitySource.timer.rawValue,
+                    kind: ActivityKind.timer.rawValue,
+                    priority: ActivityPriority.normal.rawValue,
+                    title: "Unavailable provider",
+                    actionIdentifier: CountdownActivityContract.cancelActionIdentifier,
+                    actionLabel: "Cancel",
+                    actionIntent: ActivityActionIntent.cancel.rawValue
+                )
+            )
+            if let presented = capabilitySnapshot.current {
+                let action = SurfaceActionIdentity(
+                    activityIdentity: presented.activity.identity,
+                    activityRevision: presented.revision,
+                    actionIdentifier: CountdownActivityContract.cancelActionIdentifier
+                )
+                check(
+                    await wrongKindRouter.handle(.cancel, identity: action) == .unhandled,
+                    "typed router rejects unavailable timer capability"
+                )
+                check(
+                    await wrongKindBroker.snapshot().current?.revision == presented.revision,
+                    "unavailable capability fails closed without removing broker state"
+                )
+            } else {
+                check(false, "unavailable-capability fixture publishes an activity")
+                check(false, "unavailable-capability fixture remains present")
+            }
+        } catch {
+            recordUnexpected(error, context: "action-contract and capability routes")
+            check(false, "action-contract fixture remains inspectable")
+            check(false, "capability fixture remains inspectable")
+            check(false, "capability fixture remains present")
+        }
+        await wrongKindFocus.shutdown()
+        await wrongKindBroker.shutdown()
+
+        for _ in 0..<20 {
+            check(runtime.handle(.startFocusTimer50), "repeated Focus Timer start remains bounded")
+            check(runtime.handle(.cancelFocusTimer), "repeated Focus Timer cancel remains bounded")
+        }
+        check(
+            await waitUntil {
+                let status = await focusTimer.provider.status()
+                let snapshot = await broker.snapshot()
+                return focusTimer.workState().isIdle
+                    && status == .disabled
+                    && snapshot.current == nil
+            },
+            "repeated start/cancel converges with no orphan command or timer work"
+        )
+
+        panel.setContentVisible(false)
+        check(runtime.handle(.startFocusTimer15), "natural-completion Focus Timer starts")
+        check(
+            await waitUntil { await focusTimer.provider.countdown() != nil },
+            "natural-completion timer becomes active"
+        )
+        guard let completionDeadline = await focusTimer.provider.countdown()?.endsAt else {
+            check(false, "natural-completion timer exposes its deadline")
+            await runtime.shutdown()
+            return
+        }
+        await clock.advance(to: completionDeadline)
+        check(
+            await waitUntil {
+                let countdown = await focusTimer.provider.countdown()
+                let snapshot = await broker.snapshot()
+                let providerWork = await focusTimer.provider.workState()
+                return countdown == nil && snapshot.current == nil && providerWork.isIdle
+            },
+            "natural completion clears activity and owns zero timer tasks"
+        )
+
+        check(runtime.handle(.startFocusTimer50), "shutdown-overlap Focus Timer starts")
+        check(
+            await waitUntil { await focusTimer.provider.countdown() != nil },
+            "shutdown-overlap timer reaches provider state"
+        )
+        check(runtime.handle(.quit) && runtime.handle(.quit), "Quit remains idempotent with timer work active")
+        check(termination.value == 1, "timer-active Quit requests termination exactly once")
+        let firstShutdown = Task { @MainActor in await runtime.shutdown() }
+        let secondShutdown = Task { @MainActor in await runtime.shutdown() }
+        firstShutdown.cancel()
+        _ = await firstShutdown.value
+        _ = await secondShutdown.value
+
+        check(runtime.phase == .stopped, "overlapping timer shutdown reaches terminal runtime state")
+        check(await focusTimer.provider.workState().isIdle, "terminal shutdown drains provider timers and mutations")
+        check(focusTimer.workState().isIdle, "terminal shutdown drains app-owned command work")
+        check(model.workState == .stopped, "terminal shutdown drains surface timer actions and subscription")
+        check(await broker.workState() == .stopped, "terminal shutdown drains broker timers, subscribers, and ownership")
+        check(await clock.pendingCount == 0, "terminal shutdown leaves no countdown clock waiter")
+        check(!runtime.handle(.startFocusTimer15), "Focus Timer commands fail closed after terminal shutdown")
     }
 
     private static func makeRuntime(events: EventLog) -> RuntimeFixture {
@@ -893,6 +1320,133 @@ private final class RecordingPanel: PanelPresenting {
         visibilityToggleCount += 1
     }
     func cancelPendingInteractions() {}
+}
+
+@MainActor
+private final class VisibilityReportingPanel: PanelPresenting, PanelActivityVisibilityReporting {
+    let displayIdentity: DisplayIdentity
+    private let events: EventLog
+    private var isWindowVisible = false
+    private var isContentVisible = false
+    private var lastReportedVisibility = false
+    private var visibilityHandler: (@MainActor @Sendable (Bool) -> Void)?
+
+    var isActivitySurfaceVisible: Bool {
+        isWindowVisible && isContentVisible
+    }
+
+    init(displayIdentity: DisplayIdentity, events: EventLog) {
+        self.displayIdentity = displayIdentity
+        self.events = events
+    }
+
+    func setActivityVisibilityHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    ) {
+        visibilityHandler = handler
+        reportVisibility(force: true)
+    }
+
+    func setContentVisible(_ visible: Bool) {
+        isContentVisible = visible
+        reportVisibility()
+    }
+
+    func show() {
+        isWindowVisible = true
+        events.append("panel.show")
+        reportVisibility()
+    }
+
+    func hide() {
+        isWindowVisible = false
+        reportVisibility()
+    }
+
+    func close() {
+        isWindowVisible = false
+        events.append("panel.close")
+        reportVisibility()
+    }
+
+    func update(snapshot: DisplaySnapshot) {}
+    func updatePointer(screenPoint: CGPoint) {}
+    func performPrimaryAction() {}
+
+    func performVisibilityToggle() {
+        isContentVisible.toggle()
+        reportVisibility()
+    }
+
+    func cancelPendingInteractions() {}
+
+    private func reportVisibility(force: Bool = false) {
+        let visible = isActivitySurfaceVisible
+        guard force || visible != lastReportedVisibility else { return }
+        lastReportedVisibility = visible
+        visibilityHandler?(visible)
+    }
+}
+
+private actor ManualFocusClock: GlanceClock {
+    private struct Waiter {
+        let identifier: UUID
+        let deadline: Date
+        let continuation: CheckedContinuation<Void, any Error>
+    }
+
+    private var currentDate: Date
+    private var waiters: [Waiter] = []
+    private var cancelledBeforeRegistration: Set<UUID> = []
+
+    init(now: Date) {
+        currentDate = now
+    }
+
+    var pendingCount: Int { waiters.count }
+    var pendingDeadlines: [Date] { waiters.map(\.deadline).sorted() }
+
+    func now() async -> Date {
+        currentDate
+    }
+
+    func sleep(until deadline: Date) async throws {
+        if deadline <= currentDate { return }
+        let identifier = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, any Error>) in
+                if cancelledBeforeRegistration.remove(identifier) != nil {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    waiters.append(
+                        Waiter(
+                            identifier: identifier,
+                            deadline: deadline,
+                            continuation: continuation
+                        )
+                    )
+                }
+            }
+        } onCancel: {
+            Task { await self.cancel(identifier) }
+        }
+    }
+
+    func advance(to date: Date) {
+        currentDate = date
+        let ready = waiters.filter { $0.deadline <= date }
+        waiters.removeAll { $0.deadline <= date }
+        ready.forEach { $0.continuation.resume() }
+    }
+
+    private func cancel(_ identifier: UUID) {
+        guard let index = waiters.firstIndex(where: { $0.identifier == identifier }) else {
+            cancelledBeforeRegistration.insert(identifier)
+            return
+        }
+        waiters.remove(at: index).continuation.resume(throwing: CancellationError())
+    }
 }
 
 private actor ManualExpirationScheduler: ActivityExpirationScheduling {

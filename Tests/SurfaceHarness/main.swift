@@ -2312,6 +2312,15 @@ private struct SurfaceHarness {
             check(expanded.accessibility.value.contains(SurfaceStrings.mediaKind), "accessibility value names activity kind without color")
             check(expanded.accessibility.hint == SurfaceStrings.collapseHint, "expanded accessibility hint explains the focus-safe shortcut")
             check(expanded.accessibility.hint.hasPrefix("Activate Erylo"), "expanded accessibility copy names deliberate activation instead of hover")
+            check(
+                SurfaceStrings.actionHint(for: .cancel)
+                    == SurfaceStrings.cancelTimerActionHint,
+                "timer cancel exposes an accurate VoiceOver hint"
+            )
+            check(
+                SurfaceStrings.actionHint(for: .pause) == SurfaceStrings.actionHint,
+                "non-timer actions retain the generic action hint"
+            )
 
             let compact = try ActivitySurfacePreviewCatalog.makeModel(
                 scenario: ActivitySurfacePreviewCatalog.generic,

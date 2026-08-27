@@ -7,6 +7,10 @@ import SwiftUI
 
 package enum ApplicationControlCommand: Int, Equatable, Sendable {
     case toggleSurface
+    case startFocusTimer15
+    case startFocusTimer25
+    case startFocusTimer50
+    case cancelFocusTimer
     case showSettings
     case checkForUpdates
     case quit
@@ -22,22 +26,34 @@ package struct ApplicationMenuItemDescriptor: Equatable, Sendable {
     package let kind: ApplicationMenuItemKind
     package let title: String
     package let keyEquivalent: String
+    package let accessibilityHint: String?
+    package let accessibilityIdentifier: String?
 
     package init(
         kind: ApplicationMenuItemKind,
         title: String,
-        keyEquivalent: String = ""
+        keyEquivalent: String = "",
+        accessibilityHint: String? = nil,
+        accessibilityIdentifier: String? = nil
     ) {
         self.kind = kind
         self.title = title
         self.keyEquivalent = keyEquivalent
+        self.accessibilityHint = accessibilityHint
+        self.accessibilityIdentifier = accessibilityIdentifier
     }
 }
 
 package enum ApplicationControlCopy {
     package static let statusItemLabel = "Erylo controls"
-    package static let statusItemHint = "Opens controls for the Erylo surface, settings, updates, and quitting."
+    package static let statusItemHint = "Opens Focus Timer controls, the Erylo surface, settings, updates, and quitting."
     package static let toggleSurface = "Show/Hide Erylo"
+    package static let startFocus15 = "Start 15-Minute Focus Timer"
+    package static let startFocus25 = "Start 25-Minute Focus Timer"
+    package static let startFocus50 = "Start 50-Minute Focus Timer"
+    package static let cancelFocus = "Cancel Focus Timer"
+    package static let startFocusHint = "Starts a new focus timer and replaces any focus timer already running."
+    package static let cancelFocusHint = "Cancels the current focus timer. It has no effect when no focus timer is running."
     package static let settings = "Settings…"
     package static let checkForUpdates = "Check for Updates…"
     package static let shortcutReminder = "Shortcut: Control–Option–Command–E"
@@ -53,6 +69,36 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
                 kind: .command(.toggleSurface),
                 title: ApplicationControlCopy.toggleSurface
             ),
+            ApplicationMenuItemDescriptor(kind: .separator, title: ""),
+            ApplicationMenuItemDescriptor(
+                kind: .command(.startFocusTimer15),
+                title: ApplicationControlCopy.startFocus15,
+                keyEquivalent: "1",
+                accessibilityHint: ApplicationControlCopy.startFocusHint,
+                accessibilityIdentifier: "erylo.focus-timer.start-15"
+            ),
+            ApplicationMenuItemDescriptor(
+                kind: .command(.startFocusTimer25),
+                title: ApplicationControlCopy.startFocus25,
+                keyEquivalent: "2",
+                accessibilityHint: ApplicationControlCopy.startFocusHint,
+                accessibilityIdentifier: "erylo.focus-timer.start-25"
+            ),
+            ApplicationMenuItemDescriptor(
+                kind: .command(.startFocusTimer50),
+                title: ApplicationControlCopy.startFocus50,
+                keyEquivalent: "5",
+                accessibilityHint: ApplicationControlCopy.startFocusHint,
+                accessibilityIdentifier: "erylo.focus-timer.start-50"
+            ),
+            ApplicationMenuItemDescriptor(
+                kind: .command(.cancelFocusTimer),
+                title: ApplicationControlCopy.cancelFocus,
+                keyEquivalent: ".",
+                accessibilityHint: ApplicationControlCopy.cancelFocusHint,
+                accessibilityIdentifier: "erylo.focus-timer.cancel"
+            ),
+            ApplicationMenuItemDescriptor(kind: .separator, title: ""),
             ApplicationMenuItemDescriptor(
                 kind: .command(.showSettings),
                 title: ApplicationControlCopy.settings,
@@ -285,6 +331,13 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
                 menuItem.representedObject = NSNumber(value: command.rawValue)
                 menuItem.isEnabled = true
                 menuItem.keyEquivalentModifierMask = descriptor.keyEquivalent.isEmpty ? [] : [.command]
+                menuItem.setAccessibilityLabel(descriptor.title)
+                if let accessibilityHint = descriptor.accessibilityHint {
+                    menuItem.setAccessibilityHelp(accessibilityHint)
+                }
+                if let accessibilityIdentifier = descriptor.accessibilityIdentifier {
+                    menuItem.setAccessibilityIdentifier(accessibilityIdentifier)
+                }
                 menu.addItem(menuItem)
             case .information:
                 let menuItem = NSMenuItem(

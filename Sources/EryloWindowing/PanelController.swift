@@ -4,7 +4,7 @@ import EryloSurface
 import SwiftUI
 
 @MainActor
-final class PanelController: PanelPresenting {
+final class PanelController: PanelPresenting, PanelActivityVisibilityReporting {
     let directDisplayID: CGDirectDisplayID
 
     var displayIdentity: DisplayIdentity {
@@ -15,6 +15,12 @@ final class PanelController: PanelPresenting {
     private let rootView: PanelHitTestView
     private let model: PanelSurfaceModel
     private var isVisible = false
+    private var lastReportedActivityVisibility = false
+    private var activityVisibilityHandler: (@MainActor @Sendable (Bool) -> Void)?
+
+    var isActivitySurfaceVisible: Bool {
+        isVisible && model.state != .hidden
+    }
 
     init(
         snapshot: DisplaySnapshot,
@@ -45,10 +51,18 @@ final class PanelController: PanelPresenting {
         }
     }
 
+    func setActivityVisibilityHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    ) {
+        activityVisibilityHandler = handler
+        reportActivityVisibilityIfNeeded(force: true)
+    }
+
     func show() {
         isVisible = true
         panel.orderFrontRegardless()
         updatePointer(screenPoint: NSEvent.mouseLocation)
+        reportActivityVisibilityIfNeeded()
     }
 
     func close() {
@@ -56,6 +70,7 @@ final class PanelController: PanelPresenting {
         model.cancelPendingInteractions()
         panel.ignoresMouseEvents = true
         panel.close()
+        reportActivityVisibilityIfNeeded()
     }
 
     func hide() {
@@ -63,6 +78,7 @@ final class PanelController: PanelPresenting {
         model.cancelPendingInteractions()
         panel.ignoresMouseEvents = true
         panel.orderOut(nil)
+        reportActivityVisibilityIfNeeded()
     }
 
     func update(snapshot: DisplaySnapshot) {
@@ -128,5 +144,13 @@ final class PanelController: PanelPresenting {
         if isVisible {
             updatePointer(screenPoint: NSEvent.mouseLocation)
         }
+        reportActivityVisibilityIfNeeded()
+    }
+
+    private func reportActivityVisibilityIfNeeded(force: Bool = false) {
+        let visible = isActivitySurfaceVisible
+        guard force || visible != lastReportedActivityVisibility else { return }
+        lastReportedActivityVisibility = visible
+        activityVisibilityHandler?(visible)
     }
 }

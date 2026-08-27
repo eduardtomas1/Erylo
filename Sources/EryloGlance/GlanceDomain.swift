@@ -695,7 +695,7 @@ public enum GlanceRequestFactory {
             ),
             detail: presentation.detail,
             progress: presentation.fractionCompleted,
-            actionIdentifier: "timer.cancel",
+            actionIdentifier: CountdownActivityContract.cancelActionIdentifier,
             actionLabel: "Cancel",
             actionIntent: ActivityActionIntent.cancel.rawValue
         )
@@ -703,16 +703,30 @@ public enum GlanceRequestFactory {
 
 }
 
+/// The closed activity contract used by the built-in countdown provider and its
+/// application action router. It contains identifiers only, never executable work.
+public enum CountdownActivityContract {
+    public static let identifier = "active-countdown"
+    public static let source = ActivitySource.timer
+    public static let kind = ActivityKind.timer
+    public static let cancelActionIdentifier = "timer.cancel"
+
+    public static let identity = ActivityIdentity(
+        source: source,
+        identifier: try! ActivityIdentifier(validating: identifier)
+    )
+}
+
 enum GlanceActivityIdentity {
     static let batteryIdentifier = "battery-status"
     static let volumeIdentifier = "output-volume"
     static let meetingIdentifier = "next-meeting"
-    static let timerIdentifier = "active-countdown"
+    static let timerIdentifier = CountdownActivityContract.identifier
 
     static let battery = make(source: .battery, identifier: batteryIdentifier)
     static let volume = make(source: .volume, identifier: volumeIdentifier)
     static let meeting = make(source: .calendar, identifier: meetingIdentifier)
-    static let timer = make(source: .timer, identifier: timerIdentifier)
+    static let timer = CountdownActivityContract.identity
 
     private static func make(source: ActivitySource, identifier: String) -> ActivityIdentity {
         do {

@@ -43,7 +43,7 @@ public struct PanelSurfaceView: View {
                     surfaceHeight: layout.surfaceFrame.height,
                     occlusionWidth: model.displayGeometry.topEdgeOcclusion?.frame.width ?? 0
                 )
-                .opacity(model.isPointerInside ? 1 : 0.82)
+                .opacity(model.isPointerInside ? 1 : 0.9)
                 .animation(.easeOut(duration: 0.12), value: model.isPointerInside)
             } else {
                 VStack(spacing: 0) {
@@ -79,8 +79,19 @@ public struct PanelSurfaceView: View {
                 silhouette
                     .stroke(EryloPalette.sky.opacity(0.72), lineWidth: 1)
                     .accessibilityHidden(true)
+            } else if layout.attachment == .notchlessPill {
+                silhouette
+                    .stroke(EryloPalette.cloud.opacity(0.1), lineWidth: 0.5)
+                    .accessibilityHidden(true)
             }
         }
+        .shadow(
+            color: layout.attachment == .notchlessPill
+                ? Color.black.opacity(0.28)
+                : .clear,
+            radius: 7,
+            y: 2
+        )
         .offset(y: layout.surfaceTopInset)
         .onDrop(
             of: [UTType.fileURL.identifier],
@@ -95,8 +106,7 @@ public struct PanelSurfaceView: View {
             height: model.metrics.maximumSize.height,
             alignment: .top
         )
-        .animation(animation, value: model.state)
-        .animation(animation, value: model.activityModel.snapshotVersion)
+        .animation(surfaceAnimation, value: model.state)
         .onChange(of: reduceMotion, initial: true) { _, newValue in
             model.updateReduceMotion(newValue)
         }
@@ -107,6 +117,7 @@ public struct PanelSurfaceView: View {
         .accessibilityLabel(accessibility.label)
         .accessibilityValue(accessibility.value)
         .accessibilityHint(accessibility.hint)
+        .accessibilityIdentifier("erylo.activity-surface")
     }
 
     private var dropTargetBinding: Binding<Bool> {
@@ -214,6 +225,7 @@ public struct PanelSurfaceView: View {
         }
         .id(ContentIdentity(content: content))
         .transition(.opacity)
+        .animation(contentAnimation, value: ContentIdentity(content: content))
     }
 
     private func compactActivity(_ item: ActivitySurfaceItem) -> some View {
@@ -237,21 +249,31 @@ public struct PanelSurfaceView: View {
     }
 
     private func peekActivity(_ item: ActivitySurfaceItem) -> some View {
-        HStack(spacing: 9) {
-            activitySymbol(item, size: 12)
-            Text(item.title)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(EryloPalette.cloud)
-                .lineLimit(1)
-            Spacer(minLength: 0)
-            if let value = item.detail ?? item.shortProgressValue {
-                Text(value)
-                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                    .foregroundStyle(EryloPalette.mist)
+        VStack(spacing: 4) {
+            HStack(spacing: 9) {
+                activitySymbol(item, size: 12)
+                Text(item.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(EryloPalette.cloud)
                     .lineLimit(1)
+                Spacer(minLength: 0)
+                if let value = item.detail ?? item.shortProgressValue {
+                    Text(value)
+                        .font(.system(size: 10, weight: .medium, design: .monospaced))
+                        .foregroundStyle(EryloPalette.mist)
+                        .lineLimit(1)
+                }
+            }
+            if let progress = item.progressFraction {
+                SurfaceProgressTrack(
+                    progress: progress,
+                    tint: accentColor(item.accent),
+                    height: 2
+                )
             }
         }
         .padding(.horizontal, 16)
+        .padding(.vertical, 6)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(item.accessibilitySummary)
         .accessibilitySortPriority(3)
@@ -263,14 +285,14 @@ public struct PanelSurfaceView: View {
     ) -> some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 12) {
-                activitySymbol(item, size: 18)
-                VStack(alignment: .leading, spacing: 3) {
+                activitySymbol(item, size: 19)
+                VStack(alignment: .leading, spacing: 4) {
                     Text(item.kindLabel.uppercased())
                         .font(.system(size: 9, weight: .semibold))
-                        .tracking(1)
+                        .tracking(1.1)
                         .foregroundStyle(accentColor(item.accent))
                     Text(item.title)
-                        .font(.system(size: 16, weight: .semibold))
+                        .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(EryloPalette.cloud)
                         .lineLimit(1)
                     if let detail = item.detail {
@@ -281,38 +303,40 @@ public struct PanelSurfaceView: View {
                     }
                     if let progress = item.progressFraction,
                        let progressValue = item.shortProgressValue {
-                        HStack(spacing: 9) {
-                            ProgressView(value: progress)
-                                .progressViewStyle(.linear)
-                                .tint(accentColor(item.accent))
-                                .accessibilityHidden(true)
+                        HStack(spacing: 10) {
+                            SurfaceProgressTrack(
+                                progress: progress,
+                                tint: accentColor(item.accent),
+                                height: 4
+                            )
                             Text(progressValue)
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
                                 .foregroundStyle(EryloPalette.mist)
                         }
+                        .padding(.top, 2)
                     }
                 }
                 Spacer(minLength: 0)
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 18)
-            .padding(.bottom, content.queue.items.isEmpty ? 10 : 11)
+            .padding(.horizontal, 19)
+            .padding(.top, 17)
+            .padding(.bottom, content.queue.items.isEmpty ? 9 : 11)
             .accessibilityElement(children: .combine)
             .accessibilityLabel(item.accessibilitySummary)
             .accessibilitySortPriority(4)
 
             if !content.queue.items.isEmpty {
                 Rectangle()
-                    .fill(EryloPalette.graphite)
+                    .fill(EryloPalette.cloud.opacity(0.08))
                     .frame(height: 1)
                     .accessibilityHidden(true)
                 queueView(content.queue)
             }
 
-            Spacer(minLength: 5)
+            Spacer(minLength: 4)
             actionArea(content)
-                .padding(.horizontal, 20)
-                .padding(.bottom, 15)
+                .padding(.horizontal, 19)
+                .padding(.bottom, 14)
         }
     }
 
@@ -362,10 +386,7 @@ public struct PanelSurfaceView: View {
         if let action = content.action {
             HStack(spacing: 10) {
                 if let status = content.actionStatus {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(EryloPalette.coral)
-                        .accessibilityHidden(true)
+                    actionStatusIcon
                     Text(status)
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(EryloPalette.mist)
@@ -375,7 +396,12 @@ public struct PanelSurfaceView: View {
                 Button(action.label) {
                     model.activityModel.dispatch(action)
                 }
-                .buttonStyle(SurfaceActionButtonStyle())
+                .buttonStyle(
+                    SurfaceActionButtonStyle(
+                        tint: actionColor(action),
+                        reduceMotion: model.motionStyle == .reduced
+                    )
+                )
                 .disabled(model.activityModel.actionDispatchState == .inProgress)
                 .accessibilityLabel(action.label)
                 .accessibilityHint(SurfaceStrings.actionHint)
@@ -383,10 +409,7 @@ public struct PanelSurfaceView: View {
             }
         } else if let status = content.actionStatus {
             HStack(spacing: 7) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(EryloPalette.coral)
-                    .accessibilityHidden(true)
+                actionStatusIcon
                 Text(status)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(EryloPalette.mist)
@@ -471,6 +494,30 @@ public struct PanelSurfaceView: View {
             .accessibilityHidden(true)
     }
 
+    @ViewBuilder
+    private var actionStatusIcon: some View {
+        if model.activityModel.actionDispatchState == .inProgress {
+            ProgressView()
+                .controlSize(.small)
+                .tint(EryloPalette.mist)
+                .accessibilityHidden(true)
+        } else {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(EryloPalette.coral)
+                .accessibilityHidden(true)
+        }
+    }
+
+    private func actionColor(_ action: SurfaceActivityAction) -> Color {
+        switch action.intent {
+        case .cancel, .dismiss:
+            EryloPalette.coral
+        case .pause, .resume, .openSource, .togglePlayback:
+            EryloPalette.sky
+        }
+    }
+
     private func accentColor(_ accent: ActivityAccent) -> Color {
         switch accent {
         case .mint:
@@ -486,10 +533,14 @@ public struct PanelSurfaceView: View {
         }
     }
 
-    private var animation: Animation {
+    private var surfaceAnimation: Animation? {
         model.motionStyle == .reduced
-            ? .easeOut(duration: 0.12)
-            : .spring(response: 0.24, dampingFraction: 0.92)
+            ? nil
+            : .spring(response: 0.22, dampingFraction: 0.9)
+    }
+
+    private var contentAnimation: Animation {
+        .easeOut(duration: model.motionStyle == .reduced ? 0.12 : 0.16)
     }
 }
 
@@ -578,26 +629,55 @@ private struct ContentIdentity: Hashable {
     }
 }
 
+private struct SurfaceProgressTrack: View {
+    let progress: Double
+    let tint: Color
+    let height: CGFloat
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(EryloPalette.cloud.opacity(0.12))
+                Capsule(style: .continuous)
+                    .fill(tint)
+                    .frame(width: proxy.size.width * min(max(progress, 0), 1))
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: height)
+        .accessibilityHidden(true)
+    }
+}
+
 private struct SurfaceActionButtonStyle: ButtonStyle {
+    let tint: Color
+    let reduceMotion: Bool
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(EryloPalette.cloud)
-            .padding(.horizontal, 13)
-            .padding(.vertical, 7)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
             .background(
                 Capsule(style: .continuous)
                     .fill(
                         configuration.isPressed
-                            ? EryloPalette.graphite.opacity(0.72)
-                            : EryloPalette.graphite
+                            ? tint.opacity(0.28)
+                            : tint.opacity(0.16)
                     )
                     .overlay {
                         Capsule(style: .continuous)
-                            .stroke(EryloPalette.cloud.opacity(0.12), lineWidth: 0.5)
+                            .stroke(tint.opacity(0.34), lineWidth: 0.5)
                     }
             )
-            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .opacity(configuration.isPressed ? 0.86 : 1)
+            .scaleEffect(!reduceMotion && configuration.isPressed ? 0.98 : 1)
+            .animation(
+                reduceMotion ? nil : .easeOut(duration: 0.08),
+                value: configuration.isPressed
+            )
     }
 }
 

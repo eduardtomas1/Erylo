@@ -31,9 +31,9 @@ public struct PanelMetrics: Equatable, Sendable {
     public static let feasibility = PanelMetrics(
         maximumSize: CGSize(width: 560, height: 240),
         compactSize: CGSize(width: 240, height: 32),
-        peekSize: CGSize(width: 284, height: 64),
-        expandedSize: CGSize(width: 368, height: 156),
-        dropTargetSize: CGSize(width: 392, height: 168),
+        peekSize: CGSize(width: 292, height: 68),
+        expandedSize: CGSize(width: 376, height: 164),
+        dropTargetSize: CGSize(width: 404, height: 180),
         notchHorizontalPadding: 30,
         notchlessTopInset: 8
     )
@@ -214,11 +214,11 @@ public struct PanelLayout: Equatable, Sendable {
             case .compact:
                 6
             case .peek:
-                12
+                13
             case .expanded:
-                18
+                19
             case .dropTarget:
-                20
+                21
             }
             surfaceContentTopInset = state == .compact
                 ? 0
@@ -257,9 +257,9 @@ public struct PanelLayout: Equatable, Sendable {
         case (.notchIntegrated, .compact):
             min(14, size.height / 2)
         case (.notchIntegrated, .peek):
-            min(18, size.height / 2)
+            min(19, size.height / 2)
         case (_, .expanded), (_, .dropTarget):
-            min(22, size.height / 2)
+            min(23, size.height / 2)
         }
 
         if state == .hidden {

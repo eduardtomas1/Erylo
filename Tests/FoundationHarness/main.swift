@@ -84,6 +84,7 @@ private struct FoundationHarness {
         let compact = PanelLayout(display: display, state: .compact)
         check(compact.attachment == .notchlessPill, "notchless display uses pill attachment")
         check(compact.surfaceTopInset == 8, "notchless pill is inset from the display edge")
+        check(compact.surfaceFrame.size == CGSize(width: 240, height: 32), "compact fallback keeps a quiet capsule footprint")
         check(
             compact.surfaceFrame.maxY == compact.fixedFrame.height - compact.surfaceTopInset,
             "notchless pill inset is represented in AppKit-local geometry"
@@ -102,6 +103,21 @@ private struct FoundationHarness {
             "rounded-region boundary is interactive"
         )
 
+        let peek = PanelLayout(display: display, state: .peek)
+        let expanded = PanelLayout(display: display, state: .expanded)
+        let dropTarget = PanelLayout(display: display, state: .dropTarget)
+        check(peek.surfaceFrame.size == CGSize(width: 292, height: 68), "peek adds one bounded line of context")
+        check(expanded.surfaceFrame.size == CGSize(width: 376, height: 164), "expanded geometry stays compact while preserving content breathing room")
+        check(dropTarget.surfaceFrame.size == CGSize(width: 404, height: 180), "drop target remains a bounded extension of expanded geometry")
+        check(
+            [peek, expanded, dropTarget].allSatisfy {
+                $0.attachment == .notchlessPill
+                    && $0.surfaceTopInset == 8
+                    && $0.hitRegion.contains($0.surfaceFrame.center)
+            },
+            "every visible notchless state keeps the inset rounded fallback interactive"
+        )
+
         let notchedDisplay = DisplayGeometry(
             frame: display.frame,
             visibleFrame: display.visibleFrame,
@@ -116,6 +132,30 @@ private struct FoundationHarness {
         check(notched.fixedFrame == compact.fixedFrame, "notch does not change the maximum frame")
         check(notched.surfaceFrame.width == 280, "notch width and padding expand compact surface")
         check(notched.surfaceFrame.height == 74, "notch height expands compact surface")
+        check(notched.topCornerRadius == 6, "compact notch shoulders use the smallest top curl")
+        check(notched.surfaceContentTopInset == 0, "compact content remains in the notch wings")
+
+        let realisticNotchedDisplay = DisplayGeometry(
+            frame: CGRect(x: 0, y: 0, width: 1_512, height: 982),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1_512, height: 950),
+            backingScaleFactor: 2,
+            topEdgeOcclusion: TopEdgeOcclusion(
+                frame: CGRect(x: 663, y: 950, width: 185, height: 32)
+            )
+        )
+        let realisticPeek = PanelLayout(display: realisticNotchedDisplay, state: .peek)
+        let realisticExpanded = PanelLayout(display: realisticNotchedDisplay, state: .expanded)
+        check(realisticPeek.surfaceFrame.size == CGSize(width: 292, height: 68), "peek geometry clears a representative hardware notch")
+        check(realisticPeek.surfaceContentTopInset == 32, "peek content begins below the physical occlusion")
+        check(realisticPeek.topCornerRadius == 13, "peek uses a restrained intermediate top curl")
+        check(realisticExpanded.surfaceFrame.size == CGSize(width: 376, height: 164), "expanded geometry preserves the designed visual hierarchy")
+        check(realisticExpanded.surfaceContentTopInset == 32, "expanded content clears the physical occlusion")
+        check(realisticExpanded.topCornerRadius == 19, "expanded shoulders flow gradually from the top bezel")
+        check(
+            realisticPeek.hitRegion.contains(realisticPeek.surfaceFrame.center)
+                && realisticExpanded.hitRegion.contains(realisticExpanded.surfaceFrame.center),
+            "notch-integrated peek and expanded bodies retain bounded click regions"
+        )
 
         let constrainedMetrics = PanelMetrics(
             maximumSize: CGSize(width: 100, height: 80),
@@ -132,7 +172,6 @@ private struct FoundationHarness {
         )
         check(constrained.surfaceFrame.size == constrainedMetrics.maximumSize, "surface is clamped to maximum frame")
 
-        let expanded = PanelLayout(display: display, state: .expanded)
         let conservativeRegion = compact.hitRegion.intersecting(expanded.hitRegion)
         check(
             conservativeRegion.contains(compact.surfaceFrame.center),
@@ -272,6 +311,10 @@ private struct FoundationHarness {
         check(
             stressModel.interactionHitRegion == stressModel.layout.hitRegion,
             "only the latest completion settles after reversal stress"
+        )
+        check(
+            stressScheduler.activeOperationCount == 0,
+            "reversal stress settles with zero pending interaction work"
         )
 
         let reduceMotionScheduler = ManualOneShotScheduler()

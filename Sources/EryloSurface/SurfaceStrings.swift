@@ -65,15 +65,15 @@ public enum SurfaceStrings {
     )
     public static let expandHint = String(
         localized: "surface.accessibility.expand-hint",
-        defaultValue: "Use Control-Option-Command-E to show activity details."
+        defaultValue: "Activate Erylo or press Control-Option-Command-E to show activity details."
     )
     public static let collapseHint = String(
         localized: "surface.accessibility.collapse-hint",
-        defaultValue: "Use Control-Option-Command-E to return to compact view."
+        defaultValue: "Activate Erylo or press Control-Option-Command-E to return to compact view."
     )
     public static let hideHint = String(
         localized: "surface.accessibility.hide-hint",
-        defaultValue: "Use Control-Option-Command-E to hide Erylo."
+        defaultValue: "Activate Erylo or press Control-Option-Command-E to hide Erylo."
     )
     public static let dropTargetHint = String(
         localized: "surface.accessibility.drop-target-hint",

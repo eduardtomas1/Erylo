@@ -2222,6 +2222,7 @@ private struct SurfaceHarness {
             check(expanded.accessibility.value.contains(SurfaceStrings.expandedState), "accessibility value names the presentation state")
             check(expanded.accessibility.value.contains(SurfaceStrings.mediaKind), "accessibility value names activity kind without color")
             check(expanded.accessibility.hint == SurfaceStrings.collapseHint, "expanded accessibility hint explains the focus-safe shortcut")
+            check(expanded.accessibility.hint.hasPrefix("Activate Erylo"), "expanded accessibility copy names deliberate activation instead of hover")
 
             let compact = try ActivitySurfacePreviewCatalog.makeModel(
                 scenario: ActivitySurfacePreviewCatalog.generic,
@@ -2229,6 +2230,7 @@ private struct SurfaceHarness {
                 scheduler: ManualOneShotScheduler()
             )
             check(compact.accessibility.hint == SurfaceStrings.expandHint, "compact accessibility hint explains expansion")
+            check(compact.accessibility.hint.hasPrefix("Activate Erylo"), "compact accessibility copy names deliberate activation instead of hover")
 
             let dropTarget = try ActivitySurfacePreviewCatalog.makeModel(
                 scenario: ActivitySurfacePreviewCatalog.dropTarget,
@@ -2322,6 +2324,7 @@ private struct SurfaceHarness {
         check(model.content.state == model.state, "content mapping remains synchronized during rapid state changes")
         scheduler.runAll()
         check(model.interactionHitRegion == model.layout.hitRegion, "cancelled motion completions cannot restore stale hit testing")
+        check(scheduler.activeOperationCount == 0, "rapid interaction stress settles with zero pending surface work")
     }
 
     mutating func verifySharedBrokerVisibilityAndDisabledWork() async {

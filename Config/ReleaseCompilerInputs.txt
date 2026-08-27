@@ -2,6 +2,7 @@ Package.swift
 Sources/EryloActivity/ActivityBroker.swift
 Sources/EryloActivity/ActivityDomain.swift
 Sources/EryloApp/EryloApplication.swift
+Sources/EryloAppRuntime/ApplicationRuntime.swift
 Sources/EryloCore/DisplayIdentity.swift
 Sources/EryloCore/DisplayPolicy.swift
 Sources/EryloCore/MediaTypes.swift

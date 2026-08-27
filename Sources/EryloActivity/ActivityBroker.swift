@@ -149,6 +149,7 @@ public final class ActivityOwnershipCoordinator: @unchecked Sendable {
     private let lock = NSLock()
     private var lanes: [ActivityIdentity: Lane] = [:]
     private var pendingIntentCount = 0
+    private var isShutDown = false
 
     public init() {}
 
@@ -159,7 +160,8 @@ public final class ActivityOwnershipCoordinator: @unchecked Sendable {
     ) -> ActivityOwnershipClaimIntent? {
         lock.lock()
         defer { lock.unlock() }
-        guard lanes[identity] != nil
+        guard !isShutDown,
+              lanes[identity] != nil
                 || lanes.count < ActivityLimits.maximumOwnershipCount else {
             return nil
         }
@@ -248,6 +250,14 @@ public final class ActivityOwnershipCoordinator: @unchecked Sendable {
               lane.pendingSequences.remove(sequence) != nil else { return }
         pendingIntentCount -= 1
         storeOrPrune(lane, for: identity)
+    }
+
+    fileprivate func shutDown() {
+        lock.lock()
+        isShutDown = true
+        lanes.removeAll()
+        pendingIntentCount = 0
+        lock.unlock()
     }
 
     private func storeOrPrune(_ lane: Lane, for identity: ActivityIdentity) {
@@ -345,6 +355,7 @@ package struct ActivityBrokerSnapshotSubscription: Sendable {
 package enum ActivityBrokerSubscriptionError: Error, Equatable, Sendable {
     case duplicateSubscriberIdentifier
     case capacityExceeded(maximum: Int)
+    case brokerShutDown
 }
 
 /// Owns validation, identity-based dedupe, ordering, preemption, expiry, and cancellation.
@@ -377,6 +388,7 @@ public actor ActivityBroker {
     private var nextOwnershipGeneration: UInt64 = 0
     private var ownershipGenerations: [ActivityIdentity: UInt64] = [:]
     private var version: UInt64 = 0
+    private var isShutDown = false
 
     public init(
         expirationScheduler: any ActivityExpirationScheduling = ContinuousActivityExpirationScheduler()
@@ -393,6 +405,7 @@ public actor ActivityBroker {
     /// Validates and atomically inserts or replaces a request. Identity is the dedupe key.
     @discardableResult
     public func submit(_ request: ActivityRequest) throws(ActivityBrokerError) -> ActivityBrokerSnapshot {
+        guard !isShutDown else { throw .brokerShutDown }
         let activity: Activity
         do {
             activity = try Activity(validating: request)
@@ -416,6 +429,10 @@ public actor ActivityBroker {
         of identity: ActivityIdentity,
         admitting intent: ActivityOwnershipClaimIntent
     ) -> ActivityOwnershipLease? {
+        guard !isShutDown else {
+            intent.retire()
+            return nil
+        }
         guard let admissionSequence = ownershipCoordinator.admit(
             intent,
             for: identity
@@ -449,6 +466,7 @@ public actor ActivityBroker {
             identity: lease.identity,
             sequence: lease.admissionSequence
         )
+        guard !isShutDown else { return false }
         guard ownershipGenerations[lease.identity] == lease.generation else {
             return false
         }
@@ -463,6 +481,7 @@ public actor ActivityBroker {
         _ request: ActivityRequest,
         ifOwnedBy lease: ActivityOwnershipLease
     ) throws(ActivityBrokerError) -> ActivityBrokerSnapshot? {
+        guard !isShutDown else { throw .brokerShutDown }
         let activity: Activity
         do {
             activity = try Activity(validating: request)
@@ -518,6 +537,7 @@ public actor ActivityBroker {
     /// Removes one identity explicitly. Returns false and publishes nothing when it is absent.
     @discardableResult
     public func cancel(_ identity: ActivityIdentity) -> Bool {
+        guard !isShutDown else { return false }
         ownershipCoordinator.invalidateClaims(for: identity)
         ownershipGenerations.removeValue(forKey: identity)
         return removeRecord(identity)
@@ -528,6 +548,7 @@ public actor ActivityBroker {
     /// with no suspension point between them.
     @discardableResult
     public func cancel(_ identity: ActivityIdentity, ifRevision revision: UInt64) -> Bool {
+        guard !isShutDown else { return false }
         guard records[identity]?.presented.revision == revision else { return false }
         ownershipCoordinator.invalidateClaims(for: identity)
         ownershipGenerations.removeValue(forKey: identity)
@@ -539,6 +560,7 @@ public actor ActivityBroker {
     /// makes the older cleanup fail closed before it can touch shared state.
     @discardableResult
     public func cancel(_ identity: ActivityIdentity, ifOwnedBy lease: ActivityOwnershipLease) -> Bool {
+        guard !isShutDown else { return false }
         guard identity == lease.identity,
               ownershipGenerations[identity] == lease.generation,
               records[identity]?.ownershipGeneration == lease.generation else {
@@ -557,6 +579,7 @@ public actor ActivityBroker {
         actionIdentifier: String,
         intent: ActivityActionIntent
     ) -> Bool {
+        guard !isShutDown else { return false }
         guard let current = makeSnapshot().current,
               current.activity.identity == identity,
               current.revision == revision,
@@ -578,6 +601,7 @@ public actor ActivityBroker {
 
     /// Newest-only buffering bounds each slow subscriber to one pending snapshot.
     public func snapshots() throws(ActivityBrokerError) -> AsyncStream<ActivityBrokerSnapshot> {
+        guard !isShutDown else { throw .brokerShutDown }
         guard subscribers.count < ActivityLimits.maximumSubscriberCount else {
             throw .subscriberCapacityExceeded(maximum: ActivityLimits.maximumSubscriberCount)
         }
@@ -593,6 +617,7 @@ public actor ActivityBroker {
     package func snapshotSubscription(
         subscriberID: UUID
     ) throws(ActivityBrokerSubscriptionError) -> ActivityBrokerSnapshotSubscription {
+        guard !isShutDown else { throw .brokerShutDown }
         guard subscribers[subscriberID] == nil else {
             throw .duplicateSubscriberIdentifier
         }
@@ -634,6 +659,27 @@ public actor ActivityBroker {
             activeOwnershipCount: ownershipWork.retainedIdentityCount,
             pendingOwnershipIntentCount: ownershipWork.pendingIntentCount
         )
+    }
+
+    /// Terminal package boundary used by the process composition root. Admission
+    /// closes before any suspension, then all one-shot and subscription work is joined.
+    package func shutdown() async {
+        guard !isShutDown else { return }
+        isShutDown = true
+        ownershipCoordinator.shutDown()
+
+        let tasks = Array(expiryTasks.values)
+        expiryTasks.removeAll()
+        records.removeAll()
+        ownershipGenerations.removeAll()
+
+        let continuations = subscribers.values.map(\.continuation)
+        subscribers.removeAll()
+        continuations.forEach { $0.finish() }
+        tasks.forEach { $0.cancel() }
+        for task in tasks {
+            _ = await task.value
+        }
     }
 
     private func scheduleExpiry(for identity: ActivityIdentity, ttl: ActivityTTL, revision: UInt64) {

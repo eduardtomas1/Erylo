@@ -162,6 +162,12 @@ public actor ActivityIntegrationController: ActivityIntegrationHandling {
                     code: .invalidRequest,
                     message: message
                 )
+            case .brokerShutDown:
+                return .failure(
+                    requestIdentifier: request.requestIdentifier,
+                    code: .internalError,
+                    message: "activity service unavailable"
+                )
             }
         } catch let error as ActivityValidationError {
             return .failure(

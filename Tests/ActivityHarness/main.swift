@@ -22,6 +22,7 @@ enum ActivityHarnessMain {
         await harness.verifySubscriberCapacity()
         await harness.verifySubscriberIdentityIsolation()
         await harness.verifyZeroRepeatingIdleWork()
+        await harness.verifyTerminalShutdown()
         harness.finish()
     }
 }
@@ -124,6 +125,66 @@ private struct ActivityHarness {
             check(await broker.workState().scheduledExpiryCount == 0, "explicit cancellation releases scheduled work")
         } catch {
             recordUnexpected(error, context: "explicit cancellation")
+        }
+    }
+
+    mutating func verifyTerminalShutdown() async {
+        let scheduler = ManualExpirationScheduler()
+        let broker = ActivityBroker(expirationScheduler: scheduler)
+        let identity = ActivityIdentity(
+            source: .timer,
+            identifier: try! ActivityIdentifier(validating: "terminal-shutdown")
+        )
+        guard let delayedIntent = broker.ownershipCoordinator.prepareClaim(for: identity) else {
+            check(false, "terminal shutdown fixture prepares ownership intent")
+            return
+        }
+
+        do {
+            _ = try await broker.submit(
+                request(id: "terminal-shutdown", priority: 50, ttlMilliseconds: 60_000)
+            )
+            let stream = try await broker.snapshots()
+            check(
+                await waitUntil {
+                    let work = await broker.workState()
+                    return work.scheduledExpiryCount == 1 && work.subscriberCount == 1
+                },
+                "terminal shutdown fixture owns expiry and subscription work"
+            )
+
+            await broker.shutdown()
+            await broker.shutdown()
+            withExtendedLifetime(stream) {}
+
+            let work = await broker.workState()
+            check(work.scheduledExpiryCount == 0, "terminal shutdown releases expiry work")
+            check(work.subscriberCount == 0, "terminal shutdown finishes subscriptions")
+            check(work.activeOwnershipCount == 0, "terminal shutdown releases ownership state")
+            check(work.pendingOwnershipIntentCount == 0, "terminal shutdown releases pending ownership intent state")
+            check(await scheduler.cancellationCount == 1, "terminal shutdown joins expiry cancellation")
+            check(await broker.snapshot().ordered.isEmpty, "terminal shutdown clears broker records")
+            check(
+                await broker.claimOwnership(of: identity, admitting: delayedIntent) == nil,
+                "terminal shutdown rejects a delayed ownership claim"
+            )
+            check(
+                broker.ownershipCoordinator.prepareClaim(for: identity) == nil,
+                "terminal shutdown rejects new ownership intent admission"
+            )
+            await expect(
+                .brokerShutDown,
+                from: broker,
+                request: request(id: "after-shutdown", priority: 50)
+            )
+            do {
+                _ = try await broker.snapshots()
+                check(false, "terminal shutdown rejects a new subscription")
+            } catch let error {
+                check(error == .brokerShutDown, "terminal subscription rejection is typed")
+            }
+        } catch {
+            recordUnexpected(error, context: "terminal shutdown")
         }
     }
 

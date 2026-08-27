@@ -293,6 +293,11 @@ private struct UpdateHarness {
         check(readyDriver.startCount == 1, "ready runtime starts the driver exactly once")
         check(readyRuntime.checkForUpdates(), "ready runtime exposes an injected manual check seam")
         check(readyDriver.checkCount == 1, "manual check is forwarded exactly once")
+        readyRuntime.shutdown()
+        readyRuntime.shutdown()
+        check(!readyRuntime.startIfConfigured(), "terminal updater runtime cannot restart")
+        check(!readyRuntime.checkForUpdates(), "terminal updater runtime rejects manual checks")
+        check(readyDriver.startCount == 1, "repeated updater shutdown does not restart the driver")
 
         let blockedDriver = RecordingUpdateDriver()
         var blockedFactoryCalls = 0

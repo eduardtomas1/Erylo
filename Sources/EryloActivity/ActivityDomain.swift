@@ -63,6 +63,7 @@ public enum ActivityBrokerError: Error, Equatable, Sendable, CustomStringConvert
     case invalid(ActivityValidationError)
     case activityCapacityExceeded(maximum: Int)
     case subscriberCapacityExceeded(maximum: Int)
+    case brokerShutDown
 
     public var description: String {
         switch self {
@@ -72,6 +73,8 @@ public enum ActivityBrokerError: Error, Equatable, Sendable, CustomStringConvert
             "activity capacity of \(maximum) reached"
         case let .subscriberCapacityExceeded(maximum):
             "snapshot subscriber capacity of \(maximum) reached"
+        case .brokerShutDown:
+            "activity broker is shut down"
         }
     }
 }

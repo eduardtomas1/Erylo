@@ -118,6 +118,7 @@ public final class UpdateRuntime {
     private let enforcePreferencePolicy: @MainActor () -> Bool
     private let makeDriver: @MainActor () -> any UpdateDriving
     private var driver: (any UpdateDriving)?
+    private var isShutDown = false
 
     public init(
         configuration: UpdateConfiguration,
@@ -133,6 +134,7 @@ public final class UpdateRuntime {
 
     @discardableResult
     public func startIfConfigured() -> Bool {
+        guard !isShutDown else { return false }
         guard configuration.status == .ready else {
             return false
         }
@@ -152,9 +154,18 @@ public final class UpdateRuntime {
 
     @discardableResult
     public func checkForUpdates() -> Bool {
+        guard !isShutDown else { return false }
         guard let driver else {
             return false
         }
         return driver.checkForUpdates()
+    }
+
+    /// Terminal process cleanup. Sparkle exposes no restartable stop operation;
+    /// releasing the driver is therefore final and future checks fail closed.
+    package func shutdown() {
+        guard !isShutDown else { return }
+        isShutDown = true
+        driver = nil
     }
 }

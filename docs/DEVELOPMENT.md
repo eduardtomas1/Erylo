@@ -2,7 +2,7 @@
 
 ## Current state
 
-This repository contains a Swift 6, macOS 14+ SwiftPM foundation. `Scripts/ci.sh` is the canonical entry point: it builds with warnings as errors, runs the activity, foundation, File Hold, Glance, Media, Trust, Local Integrations, surface, updater, and release harnesses, and uses `shellcheck` when that optional local tool is installed.
+This repository contains a Swift 6, macOS 14+ SwiftPM foundation. `Scripts/ci.sh` is the canonical entry point: it builds with warnings as errors, runs the activity, foundation, File Hold, Glance, Media, Trust, Local Integrations, surface, updater, application-runtime, and release harnesses, and uses `shellcheck` when that optional local tool is installed.
 
 Continuous verification uses the following discovery order:
 

@@ -30,6 +30,7 @@ let package = Package(
         .executable(name: "EryloIntegrationTests", targets: ["EryloIntegrationTests"]),
         .executable(name: "EryloSurfaceTests", targets: ["EryloSurfaceTests"]),
         .executable(name: "EryloUpdateTests", targets: ["EryloUpdateTests"]),
+        .executable(name: "EryloAppRuntimeTests", targets: ["EryloAppRuntimeTests"]),
     ],
     dependencies: [
         .package(
@@ -92,14 +93,18 @@ let package = Package(
                 .product(name: "Sparkle", package: "Sparkle"),
             ]
         ),
-        .executableTarget(
-            name: "EryloApp",
+        .target(
+            name: "EryloAppRuntime",
             dependencies: [
                 "EryloActivity",
                 "EryloSurface",
                 "EryloUpdates",
                 "EryloWindowing",
             ]
+        ),
+        .executableTarget(
+            name: "EryloApp",
+            dependencies: ["EryloAppRuntime"]
         ),
         .executableTarget(
             name: "EryloActivityTests",
@@ -169,6 +174,19 @@ let package = Package(
             name: "EryloUpdateTests",
             dependencies: ["EryloUpdates"],
             path: "Tests/UpdateHarness"
+        ),
+        .executableTarget(
+            name: "EryloAppRuntimeTests",
+            dependencies: [
+                "EryloActivity",
+                "EryloAppRuntime",
+                "EryloCore",
+                "EryloIntegrations",
+                "EryloSurface",
+                "EryloUpdates",
+                "EryloWindowing",
+            ],
+            path: "Tests/AppRuntimeHarness"
         ),
     ],
     swiftLanguageModes: [.v6]

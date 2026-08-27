@@ -25,6 +25,7 @@ swift run EryloTrustTests
 swift run EryloIntegrationTests
 swift run EryloSurfaceTests
 swift run EryloUpdateTests
+swift run EryloAppRuntimeTests
 bash Tests/ReleaseHarness/run.sh
 
 if command -v shellcheck >/dev/null 2>&1; then

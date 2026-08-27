@@ -4,14 +4,14 @@
 
 **A calm, useful extension of your MacBook's notch.**
 
-Erylo keeps the small moments that interrupt your flow—timers, meetings, music,
-battery, volume, and file handoffs—close to the top edge and out of the way.
+Erylo keeps a Focus Timer close to the top edge and out of the way. Meetings,
+music, battery, volume, and file handoffs are planned next.
 
 macOS 14+ · Apple Silicon first · Native Swift · Open source
 
 <img src="docs/images/erylo-timer-expanded.png" width="740" alt="Erylo expanded from the MacBook notch with a focus timer, progress, and cancel action">
 
-<sub>A real native Erylo window running the deterministic focus-timer preview.</sub>
+<sub>A real Focus Timer running in Erylo's native notch-attached window.</sub>
 
 </div>
 
@@ -34,25 +34,25 @@ settles back into the top edge when you are done.
 - **Motion with purpose.** Expansion uses a restrained spring and follows the
   Mac's Reduce Motion preference.
 
-## Utilities Erylo is built around
+## Available now
 
 | Utility | What it brings to the notch |
 | --- | --- |
-| **Focus timers** | Remaining time, live progress, and pause, resume, or cancel actions. |
+| **Focus Timer** | Start a 15, 25, or 50 minute session from the Erylo menu, follow live progress, and cancel from either the notch or menu. |
+
+## Planned utilities
+
+These ideas shape Erylo, but they are not connected to the app yet and do not
+run in the background.
+
+| Utility | What it could bring to the notch |
+| --- | --- |
 | **Now Playing** | Apple Music and Spotify status with playback, seek, and volume capabilities. |
 | **Meetings** | A quiet calendar cue when an upcoming meeting becomes relevant. |
 | **Battery & charging** | Low-battery awareness and short, useful charging updates. |
 | **Volume** | A brief acknowledgement of output level and mute changes. |
 | **File Hold** | A safe temporary home for a file you want to keep close while changing tasks. |
 | **External activities** | A local way for trusted tools to show and dismiss their own progress. |
-
-> **Development preview:** the utility engines above are implemented and tested,
-> but they are not connected to the app you launch yet. Today's executable
-> includes the native notch surface, activity queue, multi-display behavior, and
-> global shortcut, plus a native menu-bar/settings control plane. Utility controls
-> remain visibly unavailable and cannot start provider work. The app launches
-> quietly unless given preview data, so the timer shown here is not a running
-> system timer.
 
 ## Designed to feel native
 
@@ -65,18 +65,19 @@ The project is local-first: no analytics SDK, no automatic diagnostics upload,
 no media history, and no background polling just to keep the surface alive.
 Features ask for access only in the context where it is needed.
 
-## Try the native preview
+## Try the Focus Timer
 
 You need macOS 14 or newer and Swift 6 Command Line Tools.
 
 ```sh
 git clone https://github.com/eduardtomas1/Erylo.git
 cd Erylo
-ERYLO_PREVIEW_SCENARIO=timer swift run Erylo
+swift run Erylo
 ```
 
-Use Erylo's menu-bar item to show or hide the surface, reopen Settings, or quit.
-Erylo does not publish a signed end-user download yet.
+Use Erylo's menu-bar item to start a Focus Timer, cancel it, show or hide the
+surface, reopen Settings, or quit. Erylo does not publish a signed end-user
+download yet.
 
 <details>
 <summary><strong>Building or contributing?</strong></summary>

@@ -60,7 +60,7 @@ public struct TrustSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Glance. Act. Disappear.")
                         .font(.system(.title2, design: .rounded, weight: .semibold))
-                    Text("Erylo is a quiet, local-first activity layer. Utility modules stay off unless a build connects them and you explicitly enable them.")
+                    Text("Erylo is a quiet, local-first activity layer. Focus Timer starts only when you choose it from the Erylo menu; other utility modules stay off.")
                         .foregroundStyle(EryloPalette.mist)
                         .fixedSize(horizontal: false, vertical: true)
                     if !model.settings.onboardingCompleted {
@@ -96,7 +96,7 @@ public struct TrustSettingsView: View {
         sectionCard(
             title: "Modules",
             subtitle: model.availableModules.isEmpty
-                ? "Utilities are not connected in this build. These controls are visible for transparency, but cannot start providers, permission requests, sockets, timers, media automation, or network work."
+                ? "Focus Timer is available from the Erylo menu. The planned utility switches below are visible for transparency and cannot start permissions, files, sockets, media automation, or network work."
                 : "Off means stopped: no permission-dependent work, timers, or network activity."
         ) {
             VStack(spacing: 0) {
@@ -136,7 +136,9 @@ public struct TrustSettingsView: View {
                     .foregroundStyle(EryloPalette.mist)
                     .fixedSize(horizontal: false, vertical: true)
                 if !model.isModuleAvailable(module) {
-                    Text("Not connected in this build; this utility is not running.")
+                    Text(module == .timer
+                        ? "Focus Timer is live from the Erylo menu; this background-module switch is not used."
+                        : "Not connected in this build; this utility is not running.")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(EryloPalette.amber)
                         .fixedSize(horizontal: false, vertical: true)
@@ -148,12 +150,16 @@ public struct TrustSettingsView: View {
         .disabled(!model.isModuleAvailable(module))
         .padding(.vertical, 10)
         .accessibilityLabel(
-            model.isModuleAvailable(module)
+            module == .timer
+                ? "Focus Timer menu control"
+                : model.isModuleAvailable(module)
                 ? TrustAccessibilityCopy.moduleLabel(module)
                 : TrustAccessibilityCopy.unavailableModuleLabel(module)
         )
         .accessibilityHint(
-            model.isModuleAvailable(module)
+            module == .timer
+                ? "Use the Erylo menu to start a 15, 25, or 50 minute Focus Timer, or cancel the current timer."
+                : model.isModuleAvailable(module)
                 ? TrustAccessibilityCopy.moduleHint(module)
                 : TrustAccessibilityCopy.unavailableModuleHint(module)
         )
@@ -354,6 +360,7 @@ public struct TrustSettingsView: View {
     }
 
     private func moduleBadge(_ module: EryloModule) -> String? {
+        if module == .timer { return "USE ERYLO MENU" }
         if !model.isModuleAvailable(module) { return "NOT AVAILABLE" }
         if module.permissionRequirement != nil { return "ASKS WHEN ENABLED" }
         switch module {

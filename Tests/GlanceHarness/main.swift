@@ -1748,6 +1748,39 @@ private struct GlanceHarness {
             await provider.disable()
             await provider.disable()
             check(await provider.status() == .disabled, "countdown disable is idempotent")
+
+            let endedClock = ManualGlanceClock(
+                now: now.addingTimeInterval(300)
+            )
+            let endedBroker = makeBroker()
+            let endedProvider = CountdownGlanceProvider(
+                broker: endedBroker,
+                clock: endedClock
+            )
+            let alreadyEnded = try CountdownTimer(
+                title: "Already ended",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(30)
+            )
+            await endedProvider.setCountdown(alreadyEnded)
+            await endedProvider.enable()
+            check(
+                await endedProvider.countdown() == nil,
+                "already-ended countdown clears provider state during activation"
+            )
+            check(
+                await endedBroker.snapshot().ordered.isEmpty,
+                "already-ended countdown publishes no activity"
+            )
+            check(
+                await endedProvider.workState().isIdle,
+                "already-ended countdown schedules no timer work"
+            )
+            await endedProvider.disable()
+            check(
+                await endedBroker.workState().activeOwnershipCount == 0,
+                "already-ended countdown releases ownership on disable"
+            )
         } catch {
             recordUnexpected(error, context: "countdown lifecycle")
         }

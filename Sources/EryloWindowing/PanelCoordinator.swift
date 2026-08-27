@@ -53,6 +53,8 @@ public final class PanelCoordinator {
     private var pointerDisplayID: CGDirectDisplayID?
     private var isTerminalCleanupInProgress = false
     private var terminalCleanupWaiters: [CheckedContinuation<Void, Never>] = []
+    private var activityVisibilityHandler: (@MainActor @Sendable (Bool) -> Void)?
+    private var lastReportedActivityVisibility = false
 
     /// Preserves the original coordinator entry point with a stopped, zero-work activity model.
     public convenience init(
@@ -199,7 +201,17 @@ public final class PanelCoordinator {
         retireLifecycleEventSource()
         await activityModel.shutdown()
         closeAllPanels()
+        activityVisibilityHandler = nil
         finishTerminalCleanup()
+    }
+
+    /// Installs one edge-triggered aggregate visibility route for application
+    /// services. Reporting itself owns no task, timer, observer, or polling loop.
+    package func setActivityVisibilityHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    ) {
+        activityVisibilityHandler = handler
+        reportActivityVisibilityIfNeeded(force: true)
     }
 
     /// Source-compatible immediate policy request. Use `updateAndWait(policy:)`
@@ -240,7 +252,10 @@ public final class PanelCoordinator {
 
         let staleIDs = panels.keys.filter { !currentIDs.contains($0) }
         for staleID in staleIDs {
-            panels.removeValue(forKey: staleID)?.close()
+            let panel = panels.removeValue(forKey: staleID)
+            (panel as? any PanelActivityVisibilityReporting)?
+                .setActivityVisibilityHandler(nil)
+            panel?.close()
         }
 
         for snapshot in resolution.enabledDisplays {
@@ -253,6 +268,10 @@ public final class PanelCoordinator {
             } else {
                 let controller = panelFactory(snapshot, activityModel)
                 panels[directDisplayID] = controller
+                (controller as? any PanelActivityVisibilityReporting)?
+                    .setActivityVisibilityHandler { [weak self] _ in
+                        self?.reportActivityVisibilityIfNeeded()
+                    }
                 if !isWorkspaceSleeping {
                     controller.show()
                 }
@@ -260,6 +279,7 @@ public final class PanelCoordinator {
         }
 
         updatePointer(NSEvent.mouseLocation, forceAll: true)
+        reportActivityVisibilityIfNeeded()
     }
 
     /// Deliberate keyboard/menu action for the currently selected display.
@@ -368,12 +388,27 @@ public final class PanelCoordinator {
     }
 
     private func closeAllPanels() {
-        panels.values.forEach { $0.close() }
+        panels.values.forEach { panel in
+            (panel as? any PanelActivityVisibilityReporting)?
+                .setActivityVisibilityHandler(nil)
+            panel.close()
+        }
         panels.removeAll()
         displayFrames.removeAll()
         lastPointerScreenPoint = nil
         pointerDisplayID = nil
         selectedDisplayIdentity = nil
+        reportActivityVisibilityIfNeeded()
+    }
+
+    private func reportActivityVisibilityIfNeeded(force: Bool = false) {
+        let visible = panels.values.contains { panel in
+            (panel as? any PanelActivityVisibilityReporting)?
+                .isActivitySurfaceVisible == true
+        }
+        guard force || visible != lastReportedActivityVisibility else { return }
+        lastReportedActivityVisibility = visible
+        activityVisibilityHandler?(visible)
     }
 
     private func waitForTerminalCleanup() async {

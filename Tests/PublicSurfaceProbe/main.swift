@@ -2,9 +2,11 @@ import CoreGraphics
 import Darwin
 import EryloActivity
 import EryloCore
+import EryloGlance
 import EryloIntegrations
 import EryloSurface
 import EryloWindowing
+import Foundation
 
 @main
 @MainActor
@@ -17,6 +19,7 @@ enum PublicSurfaceProbeMain {
         await probe.verifyRetiredEpochWorkCannotReopen()
         await probe.verifyQueuedWorkCannotBeginAfterStopIntent()
         await probe.verifyImmediateStartStopCreatesNoSubscription()
+        await probe.verifyPublicCountdownContract()
         probe.finish()
     }
 }
@@ -337,6 +340,43 @@ private struct PublicSurfaceProbe {
         check(fixture.model.workState == .stopped, "immediate start-stop settles zero model work")
         check(await fixture.broker.workState().subscriberCount == 0, "immediate start-stop settles zero subscribers")
         check(!fixture.events.isRunning && fixture.panels.openCount == 0, "immediate start-stop settles zero events and panels")
+    }
+
+    mutating func verifyPublicCountdownContract() async {
+        let now = Date(timeIntervalSinceReferenceDate: 75_000)
+        let broker = ActivityBroker()
+        let provider = CountdownGlanceProvider(broker: broker)
+        do {
+            let timer = try CountdownTimer(
+                title: "Public countdown",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(300)
+            )
+            await provider.setCountdown(timer)
+            check(await provider.workState().isIdle, "public disabled countdown storage is inert")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "public disabled countdown claims no ownership"
+            )
+            check(
+                CountdownActivityContract.identity.source == .timer
+                    && CountdownActivityContract.kind == .timer
+                    && CountdownActivityContract.cancelActionIdentifier == "timer.cancel",
+                "public countdown contract exposes closed typed metadata"
+            )
+            check(
+                !(await provider.cancelCountdown(ifPublishedRevision: 1)),
+                "public conditional countdown cancel fails closed without a published revision"
+            )
+        } catch {
+            check(false, "public countdown contract constructs valid bounded data")
+        }
+        await provider.disable()
+        check(await provider.workState().isIdle, "public countdown disable owns zero work")
+        check(
+            await broker.workState().activeOwnershipCount == 0,
+            "public countdown probe releases broker ownership"
+        )
     }
 
     private mutating func loadAction(

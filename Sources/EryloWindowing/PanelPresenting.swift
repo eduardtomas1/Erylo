@@ -16,6 +16,17 @@ public protocol PanelPresenting: AnyObject {
     func cancelPendingInteractions()
 }
 
+/// Package-only feedback from native panels to the process coordinator. The
+/// surface is demanded only while its window is shown and its state is not hidden.
+@MainActor
+package protocol PanelActivityVisibilityReporting: AnyObject {
+    var isActivitySurfaceVisible: Bool { get }
+
+    func setActivityVisibilityHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    )
+}
+
 public extension PanelPresenting {
     /// Compatibility fallback for injected presenters that only implement the original action.
     /// The native presenter overrides this with a strict hidden/visible surface toggle.

@@ -1,3 +1,4 @@
+import EryloActivity
 import Foundation
 
 /// User-facing surface copy lives in one place so a string catalog can replace the fallbacks.
@@ -83,6 +84,14 @@ public enum SurfaceStrings {
         localized: "surface.accessibility.action-hint",
         defaultValue: "Runs the single action supplied by this activity."
     )
+    public static let cancelTimerActionHint = String(
+        localized: "surface.accessibility.cancel-timer-action-hint",
+        defaultValue: "Cancels this focus timer."
+    )
+
+    public static func actionHint(for intent: ActivityActionIntent) -> String {
+        intent == .cancel ? cancelTimerActionHint : actionHint
+    }
 
     public static let genericKind = String(localized: "activity.kind.generic", defaultValue: "Activity")
     public static let batteryKind = String(localized: "activity.kind.battery", defaultValue: "Battery")

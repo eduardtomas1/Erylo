@@ -119,6 +119,7 @@ printf '%s\n' \
     '            dependencies: [' \
     '                .product(name: "EryloActivity", package: "Erylo"),' \
     '                .product(name: "EryloCore", package: "Erylo"),' \
+    '                .product(name: "EryloGlance", package: "Erylo"),' \
     '                .product(name: "EryloIntegrations", package: "Erylo"),' \
     '                .product(name: "EryloSurface", package: "Erylo"),' \
     '                .product(name: "EryloWindowing", package: "Erylo"),' \

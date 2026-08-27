@@ -19,6 +19,120 @@ public protocol PanelLifecycleEventSourcing: AnyObject {
     func stop()
 }
 
+package typealias PanelLifecycleEventDeliveryScheduler = @Sendable (
+    @escaping @MainActor @Sendable () async -> Void
+) -> Void
+
+package struct PanelPointerDeliveryWorkState: Equatable, Sendable {
+    package let pendingDeliveryCount: Int
+    package let hasBufferedPosition: Bool
+    package let maximumPendingDeliveryCount: Int
+}
+
+/// Thread-safe newest-value handoff from AppKit's local and global monitor callbacks
+/// to one bounded MainActor delivery loop.
+private final class PanelPointerEventCoalescer: @unchecked Sendable {
+    private struct PendingPosition {
+        let point: CGPoint
+        let lease: UUID
+    }
+
+    private struct State {
+        var activeLease: UUID?
+        var pendingPosition: PendingPosition?
+        var lastDeliveredPosition: CGPoint?
+        var isDeliveryScheduled = false
+        var maximumPendingDeliveryCount = 0
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+    private let schedule: PanelLifecycleEventDeliveryScheduler
+    private let deliver: @MainActor @Sendable (CGPoint, UUID) -> Void
+
+    init(
+        schedule: @escaping PanelLifecycleEventDeliveryScheduler,
+        deliver: @escaping @MainActor @Sendable (CGPoint, UUID) -> Void
+    ) {
+        self.schedule = schedule
+        self.deliver = deliver
+    }
+
+    func activate(lease: UUID) {
+        lock.withLock {
+            state.activeLease = lease
+            state.pendingPosition = nil
+            state.lastDeliveredPosition = nil
+        }
+    }
+
+    func deactivate() {
+        lock.withLock {
+            state.activeLease = nil
+            state.pendingPosition = nil
+            state.lastDeliveredPosition = nil
+        }
+    }
+
+    func submit(_ point: CGPoint, lease: UUID) {
+        let shouldSchedule = lock.withLock { () -> Bool in
+            guard state.activeLease == lease else { return false }
+            if state.pendingPosition?.point == point {
+                return false
+            }
+            if state.pendingPosition == nil, state.lastDeliveredPosition == point {
+                return false
+            }
+
+            state.pendingPosition = PendingPosition(point: point, lease: lease)
+            guard !state.isDeliveryScheduled else { return false }
+            state.isDeliveryScheduled = true
+            state.maximumPendingDeliveryCount = max(
+                state.maximumPendingDeliveryCount,
+                1
+            )
+            return true
+        }
+
+        guard shouldSchedule else { return }
+        schedule { [weak self] in
+            await self?.drain()
+        }
+    }
+
+    var workState: PanelPointerDeliveryWorkState {
+        lock.withLock {
+            PanelPointerDeliveryWorkState(
+                pendingDeliveryCount: state.isDeliveryScheduled ? 1 : 0,
+                hasBufferedPosition: state.pendingPosition != nil,
+                maximumPendingDeliveryCount: state.maximumPendingDeliveryCount
+            )
+        }
+    }
+
+    @MainActor
+    private func drain() async {
+        while let pendingPosition = takeNextPosition() {
+            deliver(pendingPosition.point, pendingPosition.lease)
+            await Task.yield()
+        }
+    }
+
+    private func takeNextPosition() -> PendingPosition? {
+        lock.withLock {
+            guard let pendingPosition = state.pendingPosition,
+                  state.activeLease == pendingPosition.lease else {
+                state.pendingPosition = nil
+                state.isDeliveryScheduled = false
+                return nil
+            }
+            state.pendingPosition = nil
+            state.lastDeliveredPosition = pendingPosition.point
+            return pendingPosition
+        }
+    }
+}
+
 @MainActor
 package final class PanelLifecycleEventSourceWorkProbe {
     private let resources: SystemPanelLifecycleResources
@@ -54,9 +168,14 @@ package final class PanelLifecycleEventSourceWorkProbe {
         resources.hasActiveLease ? 1 : 0
     }
 
+    package var pointerDeliveryWorkState: PanelPointerDeliveryWorkState {
+        resources.pointerDeliveryWorkState
+    }
+
     package var hasWork: Bool {
         isRunning || observerCount > 0 || monitorCount > 0
             || hotKeyResourceCount > 0 || handlerCount > 0 || callbackLeaseCount > 0
+            || pointerDeliveryWorkState.pendingDeliveryCount > 0
     }
 }
 
@@ -72,9 +191,17 @@ public final class SystemPanelLifecycleEventSource: PanelLifecycleEventSourcing 
         PanelLifecycleEventSourceWorkProbe(resources: resources)
     }
 
-    private let resources = SystemPanelLifecycleResources()
+    private let resources: SystemPanelLifecycleResources
 
-    public init() {}
+    public init() {
+        resources = SystemPanelLifecycleResources()
+    }
+
+    package init(pointerDeliveryScheduler: @escaping PanelLifecycleEventDeliveryScheduler) {
+        resources = SystemPanelLifecycleResources(
+            pointerDeliveryScheduler: pointerDeliveryScheduler
+        )
+    }
 
     public func start(handler: @escaping @MainActor @Sendable (PanelLifecycleEvent) -> Void) {
         resources.start(handler: handler)
@@ -82,6 +209,10 @@ public final class SystemPanelLifecycleEventSource: PanelLifecycleEventSourcing 
 
     public func stop() {
         resources.stop()
+    }
+
+    package func submitPointerPositionForTesting(_ point: CGPoint) {
+        resources.submitCurrentPointerPosition(point)
     }
 
     deinit {
@@ -104,6 +235,22 @@ private final class SystemPanelLifecycleResources {
     fileprivate var hotKeyContextReference: Unmanaged<SystemPanelHotKeyContext>?
     private var handler: (@MainActor @Sendable (PanelLifecycleEvent) -> Void)?
     private var activeLease: UUID?
+    private let pointerDeliveryScheduler: PanelLifecycleEventDeliveryScheduler
+    private lazy var pointerDelivery = PanelPointerEventCoalescer(
+        schedule: pointerDeliveryScheduler
+    ) { [weak self] point, lease in
+        self?.emit(.pointerMoved(point), lease: lease)
+    }
+
+    init(
+        pointerDeliveryScheduler: @escaping PanelLifecycleEventDeliveryScheduler = { operation in
+            Task { @MainActor in
+                await operation()
+            }
+        }
+    ) {
+        self.pointerDeliveryScheduler = pointerDeliveryScheduler
+    }
 
     fileprivate var hasHandler: Bool {
         handler != nil
@@ -113,12 +260,17 @@ private final class SystemPanelLifecycleResources {
         activeLease != nil
     }
 
+    fileprivate var pointerDeliveryWorkState: PanelPointerDeliveryWorkState {
+        pointerDelivery.workState
+    }
+
     func start(handler: @escaping @MainActor @Sendable (PanelLifecycleEvent) -> Void) {
         guard !isRunning else { return }
         let lease = UUID()
         isRunning = true
         activeLease = lease
         self.handler = handler
+        pointerDelivery.activate(lease: lease)
         installNotifications(lease: lease)
         installPointerMonitors(lease: lease)
         installPrimaryShortcut(lease: lease)
@@ -128,6 +280,7 @@ private final class SystemPanelLifecycleResources {
         guard isRunning else { return }
         isRunning = false
         activeLease = nil
+        pointerDelivery.deactivate()
 
         applicationObservers.forEach(NotificationCenter.default.removeObserver)
         applicationObservers.removeAll()
@@ -214,17 +367,19 @@ private final class SystemPanelLifecycleResources {
             .rightMouseDragged,
             .otherMouseDragged,
         ]
-        globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: pointerEvents) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.emit(.pointerMoved(NSEvent.mouseLocation), lease: lease)
-            }
+        let pointerDelivery = pointerDelivery
+        globalPointerMonitor = NSEvent.addGlobalMonitorForEvents(matching: pointerEvents) { _ in
+            pointerDelivery.submit(NSEvent.mouseLocation, lease: lease)
         }
-        localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: pointerEvents) { [weak self] event in
-            Task { @MainActor [weak self] in
-                self?.emit(.pointerMoved(NSEvent.mouseLocation), lease: lease)
-            }
+        localPointerMonitor = NSEvent.addLocalMonitorForEvents(matching: pointerEvents) { event in
+            pointerDelivery.submit(NSEvent.mouseLocation, lease: lease)
             return event
         }
+    }
+
+    fileprivate func submitCurrentPointerPosition(_ point: CGPoint) {
+        guard let activeLease else { return }
+        pointerDelivery.submit(point, lease: activeLease)
     }
 
     /// Carbon's public hot-key registration provides a global route without Accessibility

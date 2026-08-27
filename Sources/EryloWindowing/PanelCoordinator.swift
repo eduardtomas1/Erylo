@@ -48,6 +48,9 @@ public final class PanelCoordinator {
     private var isWorkspaceSleeping = false
     private var isShutdown = false
     private var activeEventLease: UUID?
+    private var displayFrames: [CGDirectDisplayID: CGRect] = [:]
+    private var lastPointerScreenPoint: CGPoint?
+    private var pointerDisplayID: CGDirectDisplayID?
     private var isTerminalCleanupInProgress = false
     private var terminalCleanupWaiters: [CheckedContinuation<Void, Never>] = []
 
@@ -229,6 +232,11 @@ public final class PanelCoordinator {
         let currentIDs = Set(
             resolution.enabledDisplays.map { CGDirectDisplayID($0.identity.rawValue) }
         )
+        displayFrames = Dictionary(
+            uniqueKeysWithValues: resolution.enabledDisplays.map {
+                (CGDirectDisplayID($0.identity.rawValue), $0.geometry.frame)
+            }
+        )
 
         let staleIDs = panels.keys.filter { !currentIDs.contains($0) }
         for staleID in staleIDs {
@@ -251,7 +259,7 @@ public final class PanelCoordinator {
             }
         }
 
-        updatePointer(NSEvent.mouseLocation)
+        updatePointer(NSEvent.mouseLocation, forceAll: true)
     }
 
     private func handle(_ event: PanelLifecycleEvent, lease: UUID) {
@@ -287,8 +295,32 @@ public final class PanelCoordinator {
         }
     }
 
-    private func updatePointer(_ screenPoint: CGPoint) {
-        panels.values.forEach { $0.updatePointer(screenPoint: screenPoint) }
+    private func updatePointer(_ screenPoint: CGPoint, forceAll: Bool = false) {
+        guard forceAll || lastPointerScreenPoint != screenPoint else { return }
+
+        let previousDisplayID = pointerDisplayID
+        var currentDisplayID: CGDirectDisplayID?
+        for (displayID, frame) in displayFrames where frame.contains(screenPoint) {
+            if let candidate = currentDisplayID {
+                currentDisplayID = min(candidate, displayID)
+            } else {
+                currentDisplayID = displayID
+            }
+        }
+        lastPointerScreenPoint = screenPoint
+        pointerDisplayID = currentDisplayID
+
+        if forceAll {
+            panels.values.forEach { $0.updatePointer(screenPoint: screenPoint) }
+            return
+        }
+
+        if let previousDisplayID {
+            panels[previousDisplayID]?.updatePointer(screenPoint: screenPoint)
+        }
+        if let currentDisplayID, currentDisplayID != previousDisplayID {
+            panels[currentDisplayID]?.updatePointer(screenPoint: screenPoint)
+        }
     }
 
     private func startLifecycleEventSource() {
@@ -311,6 +343,9 @@ public final class PanelCoordinator {
     private func closeAllPanels() {
         panels.values.forEach { $0.close() }
         panels.removeAll()
+        displayFrames.removeAll()
+        lastPointerScreenPoint = nil
+        pointerDisplayID = nil
         selectedDisplayIdentity = nil
     }
 

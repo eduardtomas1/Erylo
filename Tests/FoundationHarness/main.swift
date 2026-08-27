@@ -458,6 +458,49 @@ private struct FoundationHarness {
             "coordinator excludes duplicate and mirrored displays"
         )
 
+        eventSource.emit(.pointerMoved(CGPoint(x: -100, y: -100)))
+        let mainPanel = registry.latestPanel(for: main.identity)
+        let externalPanel = registry.latestPanel(for: external.identity)
+        let mainPointerBaseline = mainPanel?.pointerUpdateCount ?? 0
+        let externalPointerBaseline = externalPanel?.pointerUpdateCount ?? 0
+
+        let mainPosition = CGPoint(x: 100, y: 100)
+        eventSource.emit(.pointerMoved(mainPosition))
+        check(
+            mainPanel?.pointerUpdateCount == mainPointerBaseline + 1
+                && externalPanel?.pointerUpdateCount == externalPointerBaseline,
+            "pointer movement routes only to its current display"
+        )
+        eventSource.emit(.pointerMoved(mainPosition))
+        check(
+            mainPanel?.pointerUpdateCount == mainPointerBaseline + 1
+                && externalPanel?.pointerUpdateCount == externalPointerBaseline,
+            "equivalent pointer positions do not repeat panel coordination"
+        )
+
+        let externalPosition = CGPoint(x: 1_500, y: 100)
+        eventSource.emit(.pointerMoved(externalPosition))
+        check(
+            mainPanel?.pointerUpdateCount == mainPointerBaseline + 2
+                && externalPanel?.pointerUpdateCount == externalPointerBaseline + 1,
+            "cross-display movement updates the exited and entered displays exactly once"
+        )
+        check(
+            mainPanel?.lastPointerPosition == externalPosition
+                && externalPanel?.lastPointerPosition == externalPosition,
+            "cross-display routing preserves the global pointer coordinate for both panels"
+        )
+
+        eventSource.emit(.pointerMoved(CGPoint(x: -200, y: -200)))
+        let outsideMainCount = mainPanel?.pointerUpdateCount
+        let outsideExternalCount = externalPanel?.pointerUpdateCount
+        eventSource.emit(.pointerMoved(CGPoint(x: -300, y: -300)))
+        check(
+            mainPanel?.pointerUpdateCount == outsideMainCount
+                && externalPanel?.pointerUpdateCount == outsideExternalCount,
+            "pointer movement outside every display skips irrelevant panel work after exit"
+        )
+
         eventSource.emit(.primaryShortcut)
         check(registry.latestPanel(for: external.identity)?.primaryActionCount == 1, "shortcut targets selected display")
         check(registry.latestPanel(for: main.identity)?.primaryActionCount == 0, "shortcut does not fan out")
@@ -699,6 +742,7 @@ private final class FakePanel: PanelPresenting {
     private(set) var closeCount = 0
     private(set) var updateCount = 0
     private(set) var pointerUpdateCount = 0
+    private(set) var lastPointerPosition: CGPoint?
     private(set) var primaryActionCount = 0
     private(set) var cancellationCount = 0
 
@@ -724,6 +768,7 @@ private final class FakePanel: PanelPresenting {
 
     func updatePointer(screenPoint: CGPoint) {
         pointerUpdateCount += 1
+        lastPointerPosition = screenPoint
     }
 
     func performPrimaryAction() {

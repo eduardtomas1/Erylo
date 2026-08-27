@@ -23,6 +23,7 @@ enum SurfaceHarnessMain {
         await harness.verifyStopIntentSynchronouslyRevokesAdmission()
         await harness.verifyPendingSubscriptionEpochRetirement()
         await harness.verifyEventCallbackLeases()
+        await harness.verifyPointerEventDeliveryIsBounded()
         await harness.verifyCoordinatorDeinitDoesNotPoisonSharedModel()
         await harness.verifyDetachedReleaseTeardown()
         harness.verifyLegacyCompatibilityDefaultsAreInert()
@@ -1920,6 +1921,94 @@ private struct SurfaceHarness {
         events.replayRegistration(registration, event: .primaryShortcut)
     }
 
+    mutating func verifyPointerEventDeliveryIsBounded() async {
+        let scheduler = ManualMainActorDeliveryScheduler()
+        let source = SystemPanelLifecycleEventSource(
+            pointerDeliveryScheduler: { operation in
+                scheduler.schedule(operation)
+            }
+        )
+        let probe = source.workProbe
+        var deliveredPositions: [CGPoint] = []
+        source.start { event in
+            guard case let .pointerMoved(point) = event else { return }
+            deliveredPositions.append(point)
+        }
+
+        check(probe.monitorCount == 2, "system pointer delivery retains one local and one global monitor")
+        for revision in 0..<20_000 {
+            source.submitPointerPositionForTesting(
+                CGPoint(x: CGFloat(revision), y: CGFloat(revision % 997))
+            )
+        }
+        let newestBurstPosition = CGPoint(x: 19_999, y: CGFloat(19_999 % 997))
+        check(scheduler.pendingOperationCount == 1, "high-rate pointer burst schedules exactly one MainActor delivery")
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 1
+                && probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "high-rate pointer burst owns one pending delivery and one newest-value buffer"
+        )
+        check(
+            probe.pointerDeliveryWorkState.maximumPendingDeliveryCount == 1,
+            "pointer delivery work-state never exceeds its one-task bound"
+        )
+
+        await scheduler.runNext()
+        check(deliveredPositions == [newestBurstPosition], "pointer burst delivers only its newest screen position")
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "newest pointer delivery drains all scheduled and buffered work"
+        )
+
+        source.submitPointerPositionForTesting(newestBurstPosition)
+        source.submitPointerPositionForTesting(newestBurstPosition)
+        check(scheduler.pendingOperationCount == 0, "equivalent delivered pointer positions schedule no work")
+
+        source.submitPointerPositionForTesting(CGPoint(x: 21_000, y: 210))
+        check(scheduler.pendingOperationCount == 1, "a fresh pointer position schedules one delivery")
+        source.stop()
+        await scheduler.runNext()
+        check(deliveredPositions == [newestBurstPosition], "stop revokes a queued pointer callback before delivery")
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "stopped pointer delivery settles with zero owned work"
+        )
+        check(probe.monitorCount == 0, "stop removes both pointer monitors")
+
+        let releaseScheduler = ManualMainActorDeliveryScheduler()
+        var releasedDeliveryCount = 0
+        var releasableSource: SystemPanelLifecycleEventSource? = SystemPanelLifecycleEventSource(
+            pointerDeliveryScheduler: { operation in
+                releaseScheduler.schedule(operation)
+            }
+        )
+        let releaseProbe = releasableSource?.workProbe
+        weak var releasedSource: SystemPanelLifecycleEventSource?
+        releasedSource = releasableSource
+        releasableSource?.start { event in
+            if case .pointerMoved = event {
+                releasedDeliveryCount += 1
+            }
+        }
+        for revision in 0..<20_000 {
+            releasableSource?.submitPointerPositionForTesting(
+                CGPoint(x: CGFloat(revision), y: CGFloat(-revision))
+            )
+        }
+        check(releaseScheduler.pendingOperationCount == 1, "release stress retains one queued delivery at peak load")
+        releasableSource = nil
+        check(releasedSource == nil, "high-rate event source releases synchronously without task retention")
+        check(
+            await waitUntil { releaseProbe?.isRunning == false },
+            "high-rate event source release retires platform registrations on MainActor"
+        )
+        await releaseScheduler.runNext()
+        check(releasedDeliveryCount == 0, "released high-rate event source emits no stale pointer callback")
+        check(releaseProbe?.hasWork == false, "released high-rate event source settles every owned resource")
+    }
+
     mutating func verifyCoordinatorDeinitDoesNotPoisonSharedModel() async {
         let broker = ActivityBroker()
         let model = SurfaceActivityModel(broker: broker)
@@ -2885,6 +2974,29 @@ private final class FakeLifecycleEventSource: PanelLifecycleEventSourcing {
     func replayRegistration(_ registration: Int, event: PanelLifecycleEvent) {
         guard registrations.indices.contains(registration) else { return }
         registrations[registration](event)
+    }
+}
+
+private final class ManualMainActorDeliveryScheduler: @unchecked Sendable {
+    private let lock = NSLock()
+    private var operations: [@MainActor @Sendable () async -> Void] = []
+
+    var pendingOperationCount: Int {
+        lock.withLock { operations.count }
+    }
+
+    func schedule(_ operation: @escaping @MainActor @Sendable () async -> Void) {
+        lock.withLock {
+            operations.append(operation)
+        }
+    }
+
+    @MainActor
+    func runNext() async {
+        let operation = lock.withLock {
+            operations.isEmpty ? nil : operations.removeFirst()
+        }
+        await operation?()
     }
 }
 

@@ -1,10 +1,10 @@
 # Trust, settings, onboarding, and diagnostics foundation
 
-This slice adds reusable trust-domain and SwiftUI library targets. It deliberately does not mount a settings window into `EryloApp` or change the activity panel.
+The trust-domain and SwiftUI settings targets are mounted by `EryloAppRuntime` in one contained native settings window. First launch explains the passive top-edge/notch surface, deliberate click and `Control-Option-Command-E` interaction, safe defaults, and how to reopen Settings, quit, and relaunch. The window activates the accessory app only when it is intentionally presented; the passive panel remains nonactivating.
 
 ## Safe defaults and persistence
 
-`EryloSettings` is a versioned `Codable` value stored as one bounded JSON blob. `SettingsRepository` owns serialization and commits its in-memory value only after the injected `AtomicSettingsStorage` replaces the complete blob. The system adapter uses one `UserDefaults` value; tests can inject failures without touching process preferences.
+`EryloSettings` is a versioned `Codable` value stored as one bounded JSON blob. `SettingsRepository` owns serialization and commits its in-memory value only after the injected `AtomicSettingsStorage` replaces the complete blob. The system adapter uses one `UserDefaults` value; tests can inject failures without touching process preferences. The mounted application host disables automatic migration persistence while loading/browsing, so a legacy value is migrated in memory and is written only after an explicit settings action.
 
 The decoder rejects data above 64 KiB before JSON parsing. Enabled display IDs are deduplicated, sorted, and capped at 32 before encode and after decode. Corrupt, oversized, unreadable, and unsupported versions return safe defaults with distinct load reports. Version 1 migration is covered and is rewritten only through one whole-value replacement.
 
@@ -18,7 +18,7 @@ Safe defaults are:
 - crash and diagnostic sharing consent off; and
 - onboarding incomplete.
 
-`DisplayPreferences.displayPolicy` is the integration boundary for `EryloCore.DisplayPolicy`. The stored fullscreen and motion choices are intentionally not wired into the existing panel in this branch.
+`DisplayPreferences.displayPolicy` is the integration boundary for `EryloCore.DisplayPolicy`, and the runtime applies that proven preference at startup and after a successful settings change. Stored fullscreen and explicit motion choices remain intentionally unwired; their controls are disabled and described as unavailable rather than claiming an effect the current surface does not implement.
 
 ## Lifecycle and permissions
 
@@ -34,6 +34,8 @@ Permission policy is closed and module-specific:
 - Local integrations request no system permission; enabling the validated local listener is the explicit action.
 
 Opening or loading the settings view only reads settings and `SMAppService` status. It never constructs a provider, starts work, or asks permission.
+
+No utility provider is registered by the application control plane. Every module control is visibly unavailable and defensively rejected in the view model, so browsing or interacting with unavailable controls cannot create a provider, request permission, open a socket or file, invoke media automation, schedule a timer, or perform network work. The real Focus Timer is not part of this integration.
 
 ## Launch at login
 
@@ -57,10 +59,10 @@ The schema has no message, path, URL, file, media, meeting, attendee, payload, t
 
 `TrustSettingsView` and `TrustSettingsViewModel` live in `EryloSettingsUI`. They use native toggles, pickers, buttons, confirmation, and save panels with explicit accessibility labels and hints. No focus binding, application activation, custom keyboard interception, or permission work occurs during browsing. Display choices are deduplicated and bounded; names are stripped of controls and capped before `ForEach` and VoiceOver see them. Async results carry local sequence numbers so an older completion cannot overwrite newer UI intent.
 
-The Ink, Mint, Graphite, Sky, Cloud, Mist, Amber, and Coral palette is scoped to this view. A later application branch can host it without rewriting the main panel.
+`EryloAppRuntime` owns a native status item and exactly one reusable settings window. The menu exposes Show/Hide Erylo, Settings, a shortcut reminder, Quit, and Check for Updates only when the signed-feed updater has safely started. Menu actions route back through the runtime, repeated Quit requests collapse to one termination request, and shutdown removes the status item/window and terminally drains trust settings before the panel, broker, and updater are released. The Ink, Mint, Graphite, Sky, Cloud, Mist, Amber, and Coral palette remains scoped to the contained view.
 
 ## Verification boundary
 
-`EryloTrustTests` is a deterministic standard-library harness covering migration, corrupt/oversized fallback, atomic persistence, display bounds and round trips, cancellation/coalescing/queue capacity, permission and start cancellation, lifecycle rollback, terminal/cancellation-insensitive awaited shutdown, reset, the `SMAppService` seam, diagnostics rebounding/redaction/schema/export failures, stale UI completions, and accessibility copy.
+`EryloTrustTests` is a deterministic standard-library harness covering migration, corrupt/oversized fallback, atomic persistence, display bounds and round trips, cancellation/coalescing/queue capacity, permission and start cancellation, lifecycle rollback, terminal/cancellation-insensitive awaited shutdown, reset, the `SMAppService` seam, diagnostics rebounding/redaction/schema/export failures, stale UI completions, and accessibility copy. `EryloAppRuntimeTests` adds menu routing, first-launch presentation, unavailable controls, repeated control requests, update availability, display-policy application, lifecycle overlap, and resource release without launching a real user session.
 
 SwiftPM does not produce the signed `.app` bundle needed to manually verify Login Items approval, window-level keyboard traversal, VoiceOver announcements, the save panel, or final visual contrast. Those remain app-bundle/manual gates for the integration branch.

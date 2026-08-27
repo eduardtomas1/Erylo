@@ -66,12 +66,18 @@ public final class TrustSettingsViewModel {
     public private(set) var statusMessage: String?
     public private(set) var isWorking = false
     public private(set) var displayChoices: [DisplayChoice]
+    public let availableModules: Set<EryloModule>
+    public let supportsMotionPreference: Bool
+    public let supportsFullscreenPreference: Bool
 
     @ObservationIgnored
     private let coordinator: any TrustSettingsCoordinating
 
     @ObservationIgnored
     private let diagnosticsExporter: DiagnosticsExporter
+
+    @ObservationIgnored
+    private let settingsDidChange: @MainActor (EryloSettings) -> Void
 
     @ObservationIgnored
     private var operationCount = 0
@@ -89,10 +95,18 @@ public final class TrustSettingsViewModel {
         coordinator: any TrustSettingsCoordinating,
         diagnosticsExporter: DiagnosticsExporter,
         initialSettings: EryloSettings = .safeDefaults,
-        displayChoices: [DisplayChoice] = []
+        displayChoices: [DisplayChoice] = [],
+        availableModules: Set<EryloModule> = Set(EryloModule.allCases),
+        supportsMotionPreference: Bool = true,
+        supportsFullscreenPreference: Bool = true,
+        settingsDidChange: @escaping @MainActor (EryloSettings) -> Void = { _ in }
     ) {
         self.coordinator = coordinator
         self.diagnosticsExporter = diagnosticsExporter
+        self.availableModules = availableModules
+        self.supportsMotionPreference = supportsMotionPreference
+        self.supportsFullscreenPreference = supportsFullscreenPreference
+        self.settingsDidChange = settingsDidChange
         settings = initialSettings
         launchAtLogin = .unavailable
         self.displayChoices = Self.normalizedDisplayChoices(displayChoices)
@@ -112,6 +126,10 @@ public final class TrustSettingsViewModel {
     }
 
     public func setModuleEnabled(_ module: EryloModule, enabled: Bool) async {
+        guard availableModules.contains(module) else {
+            statusMessage = "This utility is not connected in this build. No work was started."
+            return
+        }
         let sequence = beginOperation()
         let result = await coordinator.setModuleEnabled(
             module,
@@ -120,6 +138,10 @@ public final class TrustSettingsViewModel {
         )
         apply(result, sequence: sequence)
         endOperation()
+    }
+
+    public func isModuleAvailable(_ module: EryloModule) -> Bool {
+        availableModules.contains(module)
     }
 
     public func setDisplaySurfaceEnabled(_ enabled: Bool) async {
@@ -171,10 +193,18 @@ public final class TrustSettingsViewModel {
     }
 
     public func setMotion(_ motion: MotionPreference) async {
+        guard supportsMotionPreference else {
+            statusMessage = "Motion preferences are not connected to the surface in this build."
+            return
+        }
         await applySettingChange(.motion(motion))
     }
 
     public func setFullscreen(_ fullscreen: FullscreenBehavior) async {
+        guard supportsFullscreenPreference else {
+            statusMessage = "Fullscreen preferences are not connected to the surface in this build."
+            return
+        }
         await applySettingChange(.fullscreen(fullscreen))
     }
 
@@ -254,6 +284,7 @@ public final class TrustSettingsViewModel {
     private func apply(_ result: TrustSettingsUpdateResult, sequence: UInt64) -> Bool {
         guard accept(sequence) else { return false }
         settings = result.settings
+        settingsDidChange(settings)
         if let launchAtLogin = result.launchAtLogin {
             self.launchAtLogin = launchAtLogin
         }

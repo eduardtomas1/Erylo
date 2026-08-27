@@ -97,7 +97,10 @@ let package = Package(
             name: "EryloAppRuntime",
             dependencies: [
                 "EryloActivity",
+                "EryloCore",
+                "EryloSettingsUI",
                 "EryloSurface",
+                "EryloTrust",
                 "EryloUpdates",
                 "EryloWindowing",
             ]
@@ -182,7 +185,9 @@ let package = Package(
                 "EryloAppRuntime",
                 "EryloCore",
                 "EryloIntegrations",
+                "EryloSettingsUI",
                 "EryloSurface",
+                "EryloTrust",
                 "EryloUpdates",
                 "EryloWindowing",
             ],

@@ -23,7 +23,11 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     private var isStopping = false
 
     override init() {
-        runtime = ApplicationRuntime.production()
+        runtime = ApplicationRuntime.production(
+            requestApplicationTermination: {
+                NSApplication.shared.terminate(nil)
+            }
+        )
         super.init()
     }
 

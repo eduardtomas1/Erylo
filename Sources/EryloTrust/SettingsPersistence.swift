@@ -48,7 +48,8 @@ public actor SettingsRepository {
     public init(
         storage: any AtomicSettingsStorage = UserDefaultsSettingsStorage(),
         storageKey: String = SettingsRepository.defaultStorageKey,
-        codec: SettingsCodec = SettingsCodec()
+        codec: SettingsCodec = SettingsCodec(),
+        automaticallyPersistsMigrations: Bool = true
     ) {
         self.storage = storage
         self.storageKey = storageKey
@@ -67,7 +68,8 @@ public actor SettingsRepository {
         settings = initialResult.settings
         report = initialResult.report
 
-        if initialResult.report.disposition == .migrated,
+        if automaticallyPersistsMigrations,
+           initialResult.report.disposition == .migrated,
            let migratedData = try? codec.encode(initialResult.settings) {
             do {
                 try storage.replace(migratedData, forKey: storageKey)

@@ -13,6 +13,7 @@ release_harness_assertion_states=()
 release_harness_assertion_names=()
 release_harness_assertion_messages=()
 release_harness_assertion_expectations=()
+release_harness_assertion_diagnostics=()
 release_harness_assertion_head=0
 release_harness_assertion_started=0
 release_harness_assertion_reaped=0
@@ -147,11 +148,20 @@ expect_background_failure() {
     local message="$1"
     local process_id="$2"
     local state_path="$3"
+    local expected_stderr="${4:-}"
+    local stderr_path="${5:-}"
     local classification
     check_count=$((check_count + 1))
     release_harness_wait_status "$process_id"
     classification="$(release_harness_state_field "$state_path" classification)"
     if [[ "$release_harness_wait_result" -ne 0 && "$classification" == exited ]]; then
+        if [[ -z "$expected_stderr" ]] \
+            || /usr/bin/grep -Fq "$expected_stderr" "$stderr_path"; then
+            return
+        fi
+        printf 'FAIL: %s (unexpected failure boundary; expected stderr: %s)\n' \
+            "$message" "$expected_stderr" >&2
+        failure_count=$((failure_count + 1))
         return
     fi
     printf 'FAIL: %s (classification=%s, status=%d)\n' \
@@ -161,10 +171,11 @@ expect_background_failure() {
 
 release_harness_queue_background_assertion() {
     local expectation="$1"
-    local message="$2"
-    local name="$3"
-    local timeout="$4"
-    shift 4
+    local expected_stderr="$2"
+    local message="$3"
+    local name="$4"
+    local timeout="$5"
+    shift 5
     local stdout_path="$test_root/logs/${name}.out"
     local stderr_path="$test_root/logs/${name}.err"
     local active_count=$((${#release_harness_assertion_pids[@]} - release_harness_assertion_head))
@@ -184,6 +195,7 @@ release_harness_queue_background_assertion() {
     release_harness_assertion_names+=("$name")
     release_harness_assertion_messages+=("$message")
     release_harness_assertion_expectations+=("$expectation")
+    release_harness_assertion_diagnostics+=("$expected_stderr")
     release_harness_assertion_started=$((release_harness_assertion_started + 1))
     active_count=$((${#release_harness_assertion_pids[@]} - release_harness_assertion_head))
     if [[ "$active_count" -gt "$release_harness_assertion_peak_active" ]]; then
@@ -192,11 +204,21 @@ release_harness_queue_background_assertion() {
 }
 
 release_harness_queue_background_success() {
-    release_harness_queue_background_assertion success "$@"
+    release_harness_queue_background_assertion success "" "$@"
 }
 
 release_harness_queue_background_failure() {
-    release_harness_queue_background_assertion failure "$@"
+    release_harness_queue_background_assertion failure "" "$@"
+}
+
+release_harness_queue_background_failure_with_stderr() {
+    local message="$1"
+    local name="$2"
+    local timeout="$3"
+    local expected_stderr="$4"
+    shift 4
+    release_harness_queue_background_assertion \
+        failure "$expected_stderr" "$message" "$name" "$timeout" "$@"
 }
 
 release_harness_drain_background_assertion() {
@@ -211,7 +233,9 @@ release_harness_drain_background_assertion() {
         expect_background_failure \
             "${release_harness_assertion_messages[$index]}" \
             "${release_harness_assertion_pids[$index]}" \
-            "${release_harness_assertion_states[$index]}"
+            "${release_harness_assertion_states[$index]}" \
+            "${release_harness_assertion_diagnostics[$index]}" \
+            "$test_root/logs/${release_harness_assertion_names[$index]}.err"
     fi
     release_harness_assertion_head=$((release_harness_assertion_head + 1))
     release_harness_assertion_reaped=$((release_harness_assertion_reaped + 1))
@@ -223,6 +247,7 @@ release_harness_discard_background_assertions() {
     release_harness_assertion_names=()
     release_harness_assertion_messages=()
     release_harness_assertion_expectations=()
+    release_harness_assertion_diagnostics=()
     release_harness_assertion_head=0
     release_harness_assertion_started=0
     release_harness_assertion_reaped=0

@@ -442,12 +442,20 @@ def wait_ready(arguments)
   pattern = Regexp.new(pattern_text)
   started = monotonic
   deadline = started + timeout
+  test_gate_held = false
   loop do
     begin
       contents = File.binread(log_path)
       exit 0 if pattern.match?(contents)
     rescue Errno::ENOENT
       # The owned process may not have opened its log yet.
+    end
+    if !test_gate_held && (gate = ENV["ERYLO_RELEASE_SUPERVISOR_TEST_READINESS_GATE"])
+      gate_started = monotonic
+      File.write("#{gate}.ready", "ready\n")
+      sleep 0.01 until File.exist?("#{gate}.release")
+      deadline += monotonic - gate_started
+      test_gate_held = true
     end
     state = read_state(state_path)
     if state && state["classification"] != "running"

@@ -105,6 +105,21 @@ expect_failure() {
     fi
 }
 
+expect_failure_with_stderr() {
+    local message="$1"
+    local log_name="$2"
+    local expected="$3"
+    shift 3
+    check_count=$((check_count + 1))
+    if "$@" >"$test_root/logs/$log_name.out" 2>"$test_root/logs/$log_name.err"; then
+        printf 'FAIL: %s\n' "$message" >&2
+        failure_count=$((failure_count + 1))
+    elif ! /usr/bin/grep -Fq "$expected" "$test_root/logs/$log_name.err"; then
+        printf 'FAIL: %s (unexpected failure boundary)\n' "$message" >&2
+        failure_count=$((failure_count + 1))
+    fi
+}
+
 release_set_digest() {
     /usr/bin/ruby -rdigest -e '
       root = ARGV.fetch(0)
@@ -133,18 +148,83 @@ private_fixture_commit="$harness_private_commit"
 private_fixture_tree="2222222222222222222222222222222222222222"
 private_fixture_appcast_hash="$(shasum -a 256 Config/Appcast.example.plist | awk '{print $1}')"
 
-prepare_release_build_fixture() {
-    staged_binary="$repo_root/.release/build/arm64/release/Erylo"
-    staged_dsym="$repo_root/.release/build/arm64/release/Symbols/Erylo.app.dSYM"
-    Scripts/release/build-app.sh
-    fixture_toolchain_hash="$(/usr/bin/shasum -a 256 \
-        "$repo_root/.release/build/arm64/release/Toolchain.json" | /usr/bin/awk '{print $1}')"
+prepare_compiled_release_fixture() {
+    local metadata_file
+    local minimum_system_version
+    local target_architecture
+    local triple
+    local swift_tool
+    local scratch_path
+    local bin_path
+
+    metadata_file="$(release_repo_file "$repo_root" "Config/ReleaseVersion.env")"
+    target_architecture="$(release_metadata_value "$metadata_file" TARGET_ARCHITECTURE)"
+    minimum_system_version="$(release_metadata_value "$metadata_file" MINIMUM_SYSTEM_VERSION)"
+    [[ "$target_architecture" == arm64 && "$minimum_system_version" == 14.0 ]] \
+        || release_die "compiled harness fixture must match release architecture and deployment"
+    triple="${target_architecture}-apple-macosx${minimum_system_version}"
+    swift_tool="$(release_developer_tool_path swift)"
+    scratch_path="$(release_output_path "$repo_root" ".release/harness-swift-build/placeholder")"
+    scratch_path="$(/usr/bin/dirname "$scratch_path")"
+    release_remove_path "$repo_root" "$scratch_path"
+    release_build_swift_product "$swift_tool" "$repo_root" "$scratch_path" Erylo "$triple"
+    bin_path="$release_swift_product_bin_path"
+    fixture_binary="$bin_path/Erylo"
+    fixture_framework="$bin_path/Sparkle.framework"
+    [[ -f "$fixture_binary" && -x "$fixture_binary" && ! -L "$fixture_binary" ]] \
+        || release_die "compiled harness fixture has no regular Erylo executable"
+    [[ -d "$fixture_framework" && ! -L "$fixture_framework" ]] \
+        || release_die "compiled harness fixture has no real Sparkle framework"
+    fixture_toolchain="$test_root/compiled-release/Toolchain.json"
+    release_make_directory "$repo_root" "$(/usr/bin/dirname "$fixture_toolchain")" >/dev/null
+    printf '%s\n' "$ERYLO_RELEASE_TOOLCHAIN_JSON" > "$fixture_toolchain"
+    /bin/chmod 0600 "$fixture_toolchain"
+    fixture_toolchain_hash="$(/usr/bin/shasum -a 256 "$fixture_toolchain" | /usr/bin/awk '{print $1}')"
+    [[ "$fixture_toolchain_hash" == "$ERYLO_RELEASE_TOOLCHAIN_SHA256" ]] \
+        || release_die "compiled harness fixture toolchain binding is inconsistent"
+}
+
+assemble_compiled_fixture() {
+    Scripts/release/assemble-app.sh \
+        --binary "$fixture_binary" \
+        --framework "$fixture_framework" \
+        --toolchain "$fixture_toolchain" \
+        "$@"
+}
+
+prepare_compiled_symbol_fixture() {
+    local dsymutil_tool
+
+    prepare_compiled_release_fixture
+    staged_binary="$fixture_binary"
+    staged_dsym="$test_root/compiled-symbols/Erylo.app.dSYM"
+    release_make_directory "$repo_root" "$(/usr/bin/dirname "$staged_dsym")" >/dev/null
+    dsymutil_tool="$(release_developer_tool_path dsymutil)"
+    "$dsymutil_tool" "$staged_binary" -o "$staged_dsym"
+}
+
+prepare_hostile_path_fixture() {
+    hostile_path="$test_root/hostile-path/bin"
+    hostile_path_marker="$test_root/hostile-path/executed"
+    /bin/mkdir -p "$hostile_path"
+    for shadow_tool in bash git ruby swift swiftc xcrun lipo otool dsymutil dwarfdump ditto; do
+        printf '#!/bin/bash\nprintf "%%s\\n" "$0" >> %q\nexit 97\n' "$hostile_path_marker" \
+            > "$hostile_path/$shadow_tool"
+        /bin/chmod 0755 "$hostile_path/$shadow_tool"
+    done
+}
+
+prepare_private_evidence_fixture() {
+    fixture_toolchain_hash="$ERYLO_RELEASE_TOOLCHAIN_SHA256"
+    symbols_one="$test_root/private-evidence/Erylo-0.1.0-1-arm64.dSYM.zip"
+    release_make_directory "$repo_root" "$(/usr/bin/dirname "$symbols_one")" >/dev/null
+    printf 'structural private-symbol archive fixture\n' > "$symbols_one"
 }
 
 prepare_default_bundle_fixture() {
-    prepare_release_build_fixture
+    prepare_compiled_release_fixture
     default_app="$test_root/default/Erylo.app"
-    Scripts/release/assemble-app.sh --output "$default_app"
+    assemble_compiled_fixture --output "$default_app"
     plist="$default_app/Contents/Info.plist"
     missing_notice_app="$test_root/missing-notice/Erylo.app"
     /usr/bin/ditto "$default_app" "$missing_notice_app"
@@ -172,7 +252,7 @@ prepare_bundle_fixtures() {
     prepare_ticket_fixture
     prepare_appcast_fixture
     updater_app="$test_root/updater/Erylo.app"
-    Scripts/release/assemble-app.sh --appcast-config "$test_appcast" --output "$updater_app"
+    assemble_compiled_fixture --appcast-config "$test_appcast" --output "$updater_app"
     empty_userinfo_appcast="$test_root/empty-userinfo-appcast.plist"
     /bin/cp "$test_appcast" "$empty_userinfo_appcast"
     /usr/bin/plutil -replace SUFeedURL -string \
@@ -180,10 +260,9 @@ prepare_bundle_fixtures() {
 }
 
 prepare_update_vector_fixtures() {
-    prepare_release_build_fixture
+    prepare_compiled_release_fixture
     prepare_appcast_fixture
     updater_app="$test_root/updater/Erylo.app"
-    Scripts/release/assemble-app.sh --appcast-config "$test_appcast" --output "$updater_app"
     archive_one="$test_root/signing-fixture/Erylo.zip"
     /bin/mkdir -p "$(dirname "$archive_one")"
     printf 'structural signing archive fixture\n' > "$archive_one"
@@ -191,17 +270,39 @@ prepare_update_vector_fixtures() {
     /bin/mkdir -p "$non_xcode_developer_dir"
 }
 
-prepare_evidence_fixtures() {
+prepare_evidence_metadata_fixtures() {
+    fixture_toolchain_hash="$ERYLO_RELEASE_TOOLCHAIN_SHA256"
+    archive_one="$test_root/evidence-metadata/Erylo.zip"
+    release_make_directory "$repo_root" "$(/usr/bin/dirname "$archive_one")" >/dev/null
+    printf 'structural evidence archive fixture\n' > "$archive_one"
+    hash_one="$(shasum -a 256 "$archive_one" | awk '{print $1}')"
+    verify_update_tool="$repo_root/.release/build/arm64/release/Tools/sign_update"
+    release_make_directory "$repo_root" "$(/usr/bin/dirname "$verify_update_tool")" >/dev/null
+    printf '#!/bin/bash\nexit 1\n' > "$verify_update_tool"
+    /bin/chmod 0755 "$verify_update_tool"
+}
+
+prepare_archive_evidence_fixtures() {
     prepare_default_bundle_fixture
     prepare_ticket_fixture
-    archive_one="$test_root/archive-one/Erylo.zip"
-    Scripts/release/archive-app.sh --app "$default_app" --output "$archive_one" \
-        --source-date-epoch 1700000000
-    hash_one="$(shasum -a 256 "$archive_one" | awk '{print $1}')"
+}
+
+prepare_release_cleanup_fixture() {
+    archive_one="$test_root/release-cleanup/Erylo.zip"
+    release_make_directory "$repo_root" "$(/usr/bin/dirname "$archive_one")" >/dev/null
+    printf 'structural cleanup archive fixture\n' > "$archive_one"
 }
 
 prepare_publication_fixtures() {
     fixture_toolchain_hash="$ERYLO_RELEASE_TOOLCHAIN_SHA256"
+    publication_build_root="$repo_root/.release/build/arm64/release"
+    release_make_directory "$repo_root" "$publication_build_root/Tools" >/dev/null
+    printf '%s\n' "$ERYLO_RELEASE_TOOLCHAIN_JSON" > "$publication_build_root/Toolchain.json"
+    /bin/chmod 0600 "$publication_build_root/Toolchain.json"
+    for publication_tool in sign_update generate_keys; do
+        printf '#!/bin/bash\nexit 1\n' > "$publication_build_root/Tools/$publication_tool"
+        /bin/chmod 0755 "$publication_build_root/Tools/$publication_tool"
+    done
     prepare_appcast_fixture
     empty_userinfo_appcast="$test_root/empty-userinfo-appcast.plist"
     /bin/cp "$test_appcast" "$empty_userinfo_appcast"
@@ -1293,14 +1394,78 @@ done
 wrong_mode_dir="$test_root/wrong-mode-parent"
 release_make_directory "$repo_root" "$wrong_mode_dir" >/dev/null
 /bin/chmod 0777 "$wrong_mode_dir"
-check "anchored directory creation repairs an unsafe pre-existing mode under umask 000" bash -c '
+
+concurrent_create_repo="$external_test_root/concurrent-create-repo"
+concurrent_create_external="$external_test_root/concurrent-create-external"
+/bin/mkdir "$concurrent_create_repo" "$concurrent_create_external"
+concurrent_create_repo="$(cd "$concurrent_create_repo" && pwd -P)"
+concurrent_create_external="$(cd "$concurrent_create_external" && pwd -P)"
+printf 'concurrent-create-external-sentinel\n' > "$concurrent_create_external/sentinel"
+/usr/bin/ruby Scripts/release/fs-helper.rb make-directory \
+    "$concurrent_create_repo" .release/gates >/dev/null
+concurrent_create_gate="$concurrent_create_repo/.release/gates/release"
+concurrent_create_one_log="$test_root/logs/concurrent-create-one.err"
+concurrent_create_two_log="$test_root/logs/concurrent-create-two.err"
+concurrent_create_one_output="$test_root/logs/concurrent-create-one.out"
+concurrent_create_two_output="$test_root/logs/concurrent-create-two.out"
+release_harness_start_background concurrent-create-one \
+    "$release_harness_background_timeout" /usr/bin/env \
+    ERYLO_RELEASE_FS_TESTING=1 \
+    ERYLO_RELEASE_FS_TEST_PAUSE_STAGE=before-create-directory-tmp \
+    ERYLO_RELEASE_FS_TEST_GATE="$concurrent_create_gate" \
+    /usr/bin/ruby Scripts/release/fs-helper.rb make-temp \
+        "$concurrent_create_repo" concurrent-one \
+    >"$concurrent_create_one_output" 2>"$concurrent_create_one_log"
+concurrent_create_one_pid="$release_harness_background_pid"
+concurrent_create_one_state="$release_harness_background_state"
+release_harness_start_background concurrent-create-two \
+    "$release_harness_background_timeout" /usr/bin/env \
+    ERYLO_RELEASE_FS_TESTING=1 \
+    ERYLO_RELEASE_FS_TEST_PAUSE_STAGE=before-create-directory-tmp \
+    ERYLO_RELEASE_FS_TEST_GATE="$concurrent_create_gate" \
+    /usr/bin/ruby Scripts/release/fs-helper.rb make-temp \
+        "$concurrent_create_repo" concurrent-two \
+    >"$concurrent_create_two_output" 2>"$concurrent_create_two_log"
+concurrent_create_two_pid="$release_harness_background_pid"
+concurrent_create_two_state="$release_harness_background_state"
+wait_for_fs_test_pause "$concurrent_create_one_log" "$concurrent_create_one_pid" \
+    "$concurrent_create_one_state" concurrent-create-one
+wait_for_fs_test_pause "$concurrent_create_two_log" "$concurrent_create_two_pid" \
+    "$concurrent_create_two_state" concurrent-create-two
+printf 'release\n' > "$concurrent_create_gate"
+/bin/chmod 0600 "$concurrent_create_gate"
+release_harness_require_background_success "$concurrent_create_one_pid" \
+    "$concurrent_create_one_state" concurrent-create-one
+release_harness_require_background_success "$concurrent_create_two_pid" \
+    "$concurrent_create_two_state" concurrent-create-two
+concurrent_create_one="$(<"$concurrent_create_one_output")"
+concurrent_create_two="$(<"$concurrent_create_two_output")"
+
+check "anchored directory creation repairs unsafe modes and admits concurrent creators" bash -c '
+    set -euo pipefail
     umask 000
     source Scripts/release/lib.sh
     release_make_directory "$1" "$2/child" >/dev/null
     [[ "$(/usr/bin/stat -f "%Lp" "$1/.release")" == 700 ]]
     [[ "$(/usr/bin/stat -f "%Lp" "$2")" == 700 ]]
     [[ "$(/usr/bin/stat -f "%Lp" "$2/child")" == 700 ]]
-  ' _ "$repo_root" "$wrong_mode_dir"
+    [[ "$(/usr/bin/stat -f "%Lp" "$3/.release")" == 700 ]]
+    [[ -d "$3/.release/tmp" && ! -L "$3/.release/tmp" ]]
+    [[ "$(/usr/bin/stat -f "%Lp" "$3/.release/tmp")" == 700 ]]
+    [[ "$4" != "$5" ]]
+    case "$4" in "$3/.release/tmp/"*) ;; *) exit 1 ;; esac
+    case "$5" in "$3/.release/tmp/"*) ;; *) exit 1 ;; esac
+    [[ -d "$4" && ! -L "$4" && "$(/usr/bin/stat -f "%Lp" "$4")" == 700 ]]
+    [[ -d "$5" && ! -L "$5" && "$(/usr/bin/stat -f "%Lp" "$5")" == 700 ]]
+    [[ "$(/usr/bin/find "$6" -mindepth 1 -maxdepth 1 -print | /usr/bin/wc -l | /usr/bin/tr -d " ")" == 1 ]]
+    /usr/bin/grep -Fxq concurrent-create-external-sentinel "$6/sentinel"
+    /usr/bin/ruby Scripts/release/fs-helper.rb remove "$3" "$4" any
+    /usr/bin/ruby Scripts/release/fs-helper.rb remove "$3" "$5" any
+    /bin/rm -f -- "$3/.release/gates/release"
+    /bin/rmdir "$3/.release/gates" "$3/.release/tmp" "$3/.release" "$3"
+    [[ ! -e "$4" && ! -e "$5" ]]
+  ' _ "$repo_root" "$wrong_mode_dir" "$concurrent_create_repo" \
+    "$concurrent_create_one" "$concurrent_create_two" "$concurrent_create_external"
 umask_temp="$(bash -c 'umask 022; source Scripts/release/lib.sh; release_make_temp_dir "$1" umask-fixture' _ "$repo_root")"
 check "release temporary directories remain 0700 under caller umask 022" \
     test "$(/usr/bin/stat -f '%Lp' "$umask_temp")" = 700
@@ -1388,14 +1553,7 @@ check "temporary parent swap creates only in the originally anchored directory" 
     test -d "$repo_root/.release/tmp/$race_created_name"
 release_remove_path "$repo_root" "$repo_root/.release/tmp/$race_created_name"
 
-hostile_path="$test_root/hostile-path/bin"
-hostile_path_marker="$test_root/hostile-path/executed"
-/bin/mkdir -p "$hostile_path"
-for shadow_tool in bash git ruby swift swiftc xcrun lipo otool dsymutil dwarfdump ditto; do
-    printf '#!/bin/bash\nprintf "%%s\\n" "$0" >> %q\nexit 97\n' "$hostile_path_marker" \
-        > "$hostile_path/$shadow_tool"
-    /bin/chmod 0755 "$hostile_path/$shadow_tool"
-done
+prepare_hostile_path_fixture
 /usr/bin/ruby -rjson -e '
   identity = JSON.parse(ARGV.fetch(0))
   identity["kind"] = "Xcode"
@@ -1497,6 +1655,13 @@ check "final full assertion executes no unverified Xcode binary" \
     test ! -e "$fake_xcode_tool_marker"
 check "toolchain policy and authenticity failures leave no public current set" \
     test ! -e "$repo_root/.release/artifacts/current"
+
+fi
+if release_harness_runs build-artifact; then
+release_harness_phase build-artifact
+if [[ "$release_harness_shard" != all ]]; then
+    prepare_hostile_path_fixture
+fi
 /usr/bin/env PATH="$hostile_path:/usr/bin:/bin:/usr/sbin:/sbin" Scripts/release/build-app.sh
 check "closed production PATH and pinned interpreter execute no shadow build tool" \
     test ! -e "$hostile_path_marker"
@@ -1518,13 +1683,25 @@ fixture_toolchain_hash="$(/usr/bin/shasum -a 256 \
 check "release build records a canonical selected toolchain identity" \
     test "$fixture_toolchain_hash" = "$ERYLO_RELEASE_TOOLCHAIN_SHA256"
 check "Release build generates a separate dSYM" test -f "$staged_dsym/Contents/Resources/DWARF/Erylo"
+
+fi
+if release_harness_runs symbol-validation; then
+release_harness_phase symbol-validation
+if [[ "$release_harness_shard" != all ]]; then
+    prepare_compiled_symbol_fixture
+fi
 check "Release dSYM UUIDs match the executable" \
     Scripts/release/validate-symbols.sh --binary "$staged_binary" --dsym "$staged_dsym"
 expect_failure "missing dSYM validation fails closed" missing-dsym \
     Scripts/release/validate-symbols.sh --binary "$staged_binary" --dsym "$test_root/missing/Erylo.app.dSYM"
 mismatch_binary="$test_root/mismatch/Erylo"
 /bin/mkdir -p "$(dirname "$mismatch_binary")"
-/usr/bin/lipo .release/build/arm64/release/Tools/sign_update -thin arm64 -output "$mismatch_binary"
+if [[ "$release_harness_shard" == all ]]; then
+    mismatch_source="$repo_root/.release/build/arm64/release/Frameworks/Sparkle.framework/Versions/B/Autoupdate"
+else
+    mismatch_source="$fixture_framework/Versions/B/Autoupdate"
+fi
+/usr/bin/lipo "$mismatch_source" -thin arm64 -output "$mismatch_binary"
 /bin/chmod 0755 "$mismatch_binary"
 expect_failure "mismatched dSYM UUID validation fails closed" mismatched-dsym \
     Scripts/release/validate-symbols.sh --binary "$mismatch_binary" --dsym "$staged_dsym"
@@ -1533,16 +1710,30 @@ fi
 if release_harness_runs private-symbols; then
 release_harness_phase private-symbols
 if [[ "$release_harness_shard" != all ]]; then
-    prepare_release_build_fixture
+    prepare_compiled_symbol_fixture
 fi
 symbols_one="$repo_root/.release/private/Erylo-0.1.0-1-arm64.dSYM.zip"
 symbols_two="$test_root/symbols-two/Erylo.dSYM.zip"
-release_harness_start_background symbol-archive-one 720 \
-    Scripts/release/archive-symbols.sh --output "$symbols_one" --source-date-epoch 1700000000
+if [[ "$release_harness_shard" == all ]]; then
+    release_harness_start_background symbol-archive-one 720 \
+        Scripts/release/archive-symbols.sh \
+            --output "$symbols_one" --source-date-epoch 1700000000
+else
+    release_harness_start_background symbol-archive-one 720 \
+        Scripts/release/archive-symbols.sh --binary "$staged_binary" --dsym "$staged_dsym" \
+            --output "$symbols_one" --source-date-epoch 1700000000
+fi
 symbols_one_pid="$release_harness_background_pid"
 symbols_one_state="$release_harness_background_state"
-release_harness_start_background symbol-archive-two 720 \
-    Scripts/release/archive-symbols.sh --output "$symbols_two" --source-date-epoch 1700000000
+if [[ "$release_harness_shard" == all ]]; then
+    release_harness_start_background symbol-archive-two 720 \
+        Scripts/release/archive-symbols.sh \
+            --output "$symbols_two" --source-date-epoch 1700000000
+else
+    release_harness_start_background symbol-archive-two 720 \
+        Scripts/release/archive-symbols.sh --binary "$staged_binary" --dsym "$staged_dsym" \
+            --output "$symbols_two" --source-date-epoch 1700000000
+fi
 symbols_two_pid="$release_harness_background_pid"
 symbols_two_state="$release_harness_background_state"
 release_harness_require_background_success "$symbols_one_pid" "$symbols_one_state" \
@@ -1557,6 +1748,13 @@ symbols_manifest="$repo_root/.release/private/SHA256SUMS"
 Scripts/release/checksums.sh --output "$symbols_manifest" "$symbols_one"
 check "private symbol checksum manifest includes the retained dSYM archive" \
     /usr/bin/grep -Fq "$symbols_hash_one  Erylo-0.1.0-1-arm64.dSYM.zip" "$symbols_manifest"
+
+fi
+if release_harness_runs private-evidence; then
+release_harness_phase private-evidence
+if [[ "$release_harness_shard" != all ]]; then
+    prepare_private_evidence_fixture
+fi
 
 private_fixture_commit="$harness_private_commit"
 private_fixture_tree="2222222222222222222222222222222222222222"
@@ -1743,10 +1941,14 @@ fi
 if release_harness_runs bundle-default; then
 release_harness_phase bundle-default
 if [[ "$release_harness_shard" != all ]]; then
-    prepare_release_build_fixture
+    prepare_compiled_release_fixture
 fi
 default_app="$test_root/default/Erylo.app"
-Scripts/release/assemble-app.sh --output "$default_app"
+if [[ "$release_harness_shard" == all ]]; then
+    Scripts/release/assemble-app.sh --output "$default_app"
+else
+    assemble_compiled_fixture --output "$default_app"
+fi
 release_harness_queue_background_success \
     "default bundle passes deterministic validation" default-bundle-valid 720 \
     Scripts/release/validate-app.sh "$default_app"
@@ -1872,7 +2074,15 @@ fi
 if release_harness_runs updater-vectors; then
 release_harness_phase updater-vectors
 if [[ "$release_harness_shard" != all ]]; then
-    prepare_release_build_fixture
+    prepare_compiled_release_fixture
+fi
+updater_assembler=(Scripts/release/assemble-app.sh)
+if [[ "$release_harness_shard" != all ]]; then
+    updater_assembler+=(
+        --binary "$fixture_binary"
+        --framework "$fixture_framework"
+        --toolchain "$fixture_toolchain"
+    )
 fi
 test_appcast="$test_root/appcast.plist"
 /bin/cp Config/Appcast.example.plist "$test_appcast"
@@ -1880,7 +2090,7 @@ test_appcast="$test_root/appcast.plist"
 test_public_key="$(/usr/bin/ruby -rbase64 -e 'print Base64.strict_encode64("x" * 32)')"
 /usr/bin/plutil -replace SUPublicEDKey -string "$test_public_key" "$test_appcast"
 updater_app="$test_root/updater/Erylo.app"
-Scripts/release/assemble-app.sh --appcast-config "$test_appcast" --output "$updater_app"
+"${updater_assembler[@]}" --appcast-config "$test_appcast" --output "$updater_app"
 release_harness_queue_background_success \
     "explicit signed appcast metadata passes the production gate" updater-valid 720 \
     Scripts/release/validate-app.sh --require-updater "$updater_app"
@@ -1908,16 +2118,18 @@ for sparkle_defaults_variant in custom-domain persisted-profile string-automatic
         720 \
         Scripts/release/validate-app.sh --require-updater "$defaults_bundle"
 done
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "tracked example appcast placeholders are rejected" placeholder-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config Config/Appcast.example.plist --output "$test_root/rejected/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config Config/Appcast.example.plist --output "$test_root/rejected/Erylo.app"
 
 credential_appcast="$test_root/credential-appcast.plist"
 /bin/cp "$test_appcast" "$credential_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://user:password@updates.erylo.test/appcast.xml" "$credential_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "appcast URL credentials are rejected before Info.plist assembly" credential-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$credential_appcast" --output "$test_root/credential/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$credential_appcast" --output "$test_root/credential/Erylo.app"
 credential_bundle="$test_root/credential-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$credential_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://user:password@updates.erylo.test/appcast.xml" \
@@ -1929,9 +2141,10 @@ release_harness_queue_background_failure \
 empty_userinfo_appcast="$test_root/empty-userinfo-appcast.plist"
 /bin/cp "$test_appcast" "$empty_userinfo_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://@updates.erylo.test/appcast.xml" "$empty_userinfo_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "empty appcast URL userinfo is rejected before Info.plist assembly" empty-userinfo-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$empty_userinfo_appcast" --output "$test_root/empty-userinfo/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$empty_userinfo_appcast" --output "$test_root/empty-userinfo/Erylo.app"
 empty_userinfo_bundle="$test_root/empty-userinfo-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$empty_userinfo_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://@updates.erylo.test/appcast.xml" \
@@ -1943,9 +2156,10 @@ release_harness_queue_background_failure \
 default_port_appcast="$test_root/default-port-appcast.plist"
 /bin/cp "$test_appcast" "$default_port_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test:443/appcast.xml" "$default_port_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "explicit default appcast ports are rejected" default-port-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$default_port_appcast" --output "$test_root/default-port/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$default_port_appcast" --output "$test_root/default-port/Erylo.app"
 default_port_bundle="$test_root/default-port-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$default_port_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test:443/appcast.xml" \
@@ -1957,23 +2171,26 @@ release_harness_queue_background_failure \
 custom_port_appcast="$test_root/custom-port-appcast.plist"
 /bin/cp "$test_appcast" "$custom_port_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test:8443/appcast.xml" "$custom_port_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "nondefault appcast ports are rejected" custom-port-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$custom_port_appcast" --output "$test_root/custom-port/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$custom_port_appcast" --output "$test_root/custom-port/Erylo.app"
 
 uppercase_scheme_appcast="$test_root/uppercase-scheme-appcast.plist"
 /bin/cp "$test_appcast" "$uppercase_scheme_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "HTTPS://updates.erylo.test/appcast.xml" "$uppercase_scheme_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "noncanonical appcast scheme spelling is rejected" uppercase-scheme-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$uppercase_scheme_appcast" --output "$test_root/uppercase-scheme/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$uppercase_scheme_appcast" --output "$test_root/uppercase-scheme/Erylo.app"
 
 query_appcast="$test_root/query-appcast.plist"
 /bin/cp "$test_appcast" "$query_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml?channel=stable" "$query_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "noncanonical appcast URL queries are rejected" query-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$query_appcast" --output "$test_root/query/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$query_appcast" --output "$test_root/query/Erylo.app"
 query_bundle="$test_root/query-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$query_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml?channel=stable" \
@@ -1985,9 +2202,10 @@ release_harness_queue_background_failure \
 fragment_appcast="$test_root/fragment-appcast.plist"
 /bin/cp "$test_appcast" "$fragment_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml#latest" "$fragment_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "noncanonical appcast URL fragments are rejected" fragment-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$fragment_appcast" --output "$test_root/fragment/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$fragment_appcast" --output "$test_root/fragment/Erylo.app"
 fragment_bundle="$test_root/fragment-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$fragment_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml#latest" \
@@ -2000,9 +2218,6 @@ release_harness_drain_background_assertions
 fi
 if release_harness_runs output-boundaries; then
 release_harness_phase output-boundaries
-if [[ "$release_harness_shard" != all ]]; then
-    prepare_default_bundle_fixture
-fi
 bad_entitlements="$test_root/bad.entitlements"
 /bin/cp Resources/App/Erylo.entitlements "$bad_entitlements"
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.network.server bool true' "$bad_entitlements"
@@ -2011,21 +2226,26 @@ expect_failure "entitlement denylist rejects network server capability" bad-enti
 check "reviewed entitlements remain minimal" Scripts/release/validate-entitlements.sh Resources/App/Erylo.entitlements
 
 secret_app="$test_root/secret/Erylo.app"
-/usr/bin/ditto "$default_app" "$secret_app"
+/bin/mkdir -p "$secret_app/Contents/Resources"
+/bin/cp Resources/App/Info.plist.in "$secret_app/Contents/Info.plist"
 printf '%s%s\n' '-----BEGIN TEST ' 'PRIVATE KEY-----' > "$secret_app/Contents/Resources/secret-fixture.txt"
-expect_failure "bundle validation rejects private-key markers" private-key-marker \
+expect_failure_with_stderr "bundle validation rejects private-key markers" private-key-marker \
+    "placeholder or secret-marker validation failed" \
     Scripts/release/validate-app.sh "$secret_app"
 
 escape_path="$repo_root/release-harness-escape/Erylo.app"
-expect_failure "assembler rejects path traversal outside release staging" assemble-traversal \
+expect_failure_with_stderr "assembler rejects path traversal outside release staging" assemble-traversal \
+    "unsafe release output path: .release/../release-harness-escape/Erylo.app" \
     Scripts/release/assemble-app.sh --output ".release/../release-harness-escape/Erylo.app"
 check "path traversal attempt creates no external output" test ! -e "$escape_path"
-expect_failure "archiver rejects output traversal" archive-traversal \
-    Scripts/release/archive-app.sh --app "$default_app" --output ".release/../release-harness-escape.zip"
+expect_failure_with_stderr "archiver rejects output traversal" archive-traversal \
+    "unsafe release output path: .release/../release-harness-escape.zip" \
+    Scripts/release/archive-app.sh --app "$secret_app" --output ".release/../release-harness-escape.zip"
 
 /bin/mkdir -p "$test_root/real-parent"
 /bin/ln -s "$test_root/real-parent" "$test_root/symlink-parent"
-expect_failure "release output refuses symlink parents" symlink-parent \
+expect_failure_with_stderr "release output refuses symlink parents" symlink-parent \
+    "unsafe release output path: $test_root/symlink-parent/Erylo.app" \
     Scripts/release/assemble-app.sh --output "$test_root/symlink-parent/Erylo.app"
 external_output_target="$external_test_root/output-target.txt"
 printf 'external-output-sentinel\n' > "$external_output_target"
@@ -2111,6 +2331,14 @@ release_harness_phase feed-vectors
 if [[ "$release_harness_shard" != all ]]; then
     prepare_update_vector_fixtures
 fi
+feed_assembler=(Scripts/release/assemble-app.sh)
+if [[ "$release_harness_shard" != all ]]; then
+    feed_assembler+=(
+        --binary "$fixture_binary"
+        --framework "$fixture_framework"
+        --toolchain "$fixture_toolchain"
+    )
+fi
 feed_vector_index=0
 feed_ready_indices=()
 feed_ready_names=()
@@ -2129,11 +2357,19 @@ while IFS=$'\t' read -r feed_expected feed_name feed_url; do
             source Scripts/release/lib.sh
             release_validate_feed_url "$1"
           ' _ "$feed_url"
-        vector_app="$test_root/feed-vectors/${feed_vector_index}/Erylo.app"
-        release_harness_queue_background_success \
-            "assembler accepts shared feed vector $feed_name" \
-            "feed-vector-assemble-${feed_vector_index}" 720 \
-            Scripts/release/assemble-app.sh --appcast-config "$vector_config" --output "$vector_app"
+        if [[ "$feed_name" == canonical ]]; then
+            [[ "$feed_url" == "$(release_plist_value "$test_appcast" SUFeedURL)" ]] \
+                || release_die "canonical feed vector differs from the shared updater fixture"
+            vector_app="$updater_app"
+            check "assembler accepts shared feed vector $feed_name" \
+                "${feed_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        else
+            vector_app="$test_root/feed-vectors/${feed_vector_index}/Erylo.app"
+            release_harness_queue_background_success \
+                "assembler accepts shared feed vector $feed_name" \
+                "feed-vector-assemble-${feed_vector_index}" 720 \
+                "${feed_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        fi
         feed_ready_indices+=("$feed_vector_index")
         feed_ready_names+=("$feed_name")
         feed_ready_apps+=("$vector_app")
@@ -2143,21 +2379,25 @@ while IFS=$'\t' read -r feed_expected feed_name feed_url; do
                 source Scripts/release/lib.sh
                 release_validate_feed_url "$1"
               ' _ "$feed_url"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "assembler rejects shared feed vector $feed_name" \
-            "feed-vector-assemble-${feed_vector_index}" 720 Scripts/release/assemble-app.sh \
+            "feed-vector-assemble-${feed_vector_index}" 720 "appcast feed URL is invalid" \
+                "${feed_assembler[@]}" \
                 --appcast-config "$vector_config" \
                 --output "$test_root/feed-vectors/${feed_vector_index}/assembled/Erylo.app"
         vector_bundle="$test_root/feed-vectors/${feed_vector_index}/injected/Erylo.app"
+        [[ -d "$updater_app" ]] || release_die "canonical feed vector did not construct the updater fixture"
         /usr/bin/ditto "$updater_app" "$vector_bundle"
         /usr/bin/plutil -replace SUFeedURL -string "$feed_url" "$vector_bundle/Contents/Info.plist"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "bundle validator rejects shared feed vector $feed_name" \
-            "feed-vector-bundle-${feed_vector_index}" 720 Scripts/release/validate-app.sh \
+            "feed-vector-bundle-${feed_vector_index}" 720 "appcast feed URL is invalid" \
+                Scripts/release/validate-app.sh \
                 --require-updater "$vector_bundle"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "update signing rejects shared feed vector $feed_name at the URL gate" \
-            "feed-vector-sign-${feed_vector_index}" 720 Scripts/release/sign-update.sh \
+            "feed-vector-sign-${feed_vector_index}" 720 "appcast feed URL is invalid" \
+                Scripts/release/sign-update.sh \
                 --archive "$archive_one" --appcast-config "$vector_config"
         feed_invalid_indices+=("$feed_vector_index")
         feed_invalid_names+=("$feed_name")
@@ -2201,6 +2441,14 @@ release_harness_phase key-vectors
 if [[ "$release_harness_shard" != all ]]; then
     prepare_update_vector_fixtures
 fi
+key_assembler=(Scripts/release/assemble-app.sh)
+if [[ "$release_harness_shard" != all ]]; then
+    key_assembler+=(
+        --binary "$fixture_binary"
+        --framework "$fixture_framework"
+        --toolchain "$fixture_toolchain"
+    )
+fi
 key_vector_index=0
 key_ready_indices=()
 key_ready_names=()
@@ -2219,11 +2467,19 @@ while IFS=$'\t' read -r key_expected key_name public_key; do
             source Scripts/release/lib.sh
             release_validate_public_key "$1"
           ' _ "$public_key"
-        vector_app="$test_root/key-vectors/${key_vector_index}/Erylo.app"
-        release_harness_queue_background_success \
-            "assembler accepts shared public-key vector $key_name" \
-            "key-vector-assemble-${key_vector_index}" 720 \
-            Scripts/release/assemble-app.sh --appcast-config "$vector_config" --output "$vector_app"
+        if [[ "$key_name" == canonical-32-bytes ]]; then
+            [[ "$public_key" == "$(release_plist_value "$test_appcast" SUPublicEDKey)" ]] \
+                || release_die "canonical public-key vector differs from the shared updater fixture"
+            vector_app="$updater_app"
+            check "assembler accepts shared public-key vector $key_name" \
+                "${key_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        else
+            vector_app="$test_root/key-vectors/${key_vector_index}/Erylo.app"
+            release_harness_queue_background_success \
+                "assembler accepts shared public-key vector $key_name" \
+                "key-vector-assemble-${key_vector_index}" 720 \
+                "${key_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        fi
         key_ready_indices+=("$key_vector_index")
         key_ready_names+=("$key_name")
         key_ready_apps+=("$vector_app")
@@ -2233,21 +2489,25 @@ while IFS=$'\t' read -r key_expected key_name public_key; do
                 source Scripts/release/lib.sh
                 release_validate_public_key "$1"
               ' _ "$public_key"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "assembler rejects shared public-key vector $key_name" \
-            "key-vector-assemble-${key_vector_index}" 720 Scripts/release/assemble-app.sh \
+            "key-vector-assemble-${key_vector_index}" 720 "appcast public key is invalid" \
+                "${key_assembler[@]}" \
                 --appcast-config "$vector_config" \
                 --output "$test_root/key-vectors/${key_vector_index}/assembled/Erylo.app"
         vector_bundle="$test_root/key-vectors/${key_vector_index}/injected/Erylo.app"
+        [[ -d "$updater_app" ]] || release_die "canonical public-key vector did not construct the updater fixture"
         /usr/bin/ditto "$updater_app" "$vector_bundle"
         /usr/bin/plutil -replace SUPublicEDKey -string "$public_key" "$vector_bundle/Contents/Info.plist"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "bundle validator rejects shared public-key vector $key_name" \
-            "key-vector-bundle-${key_vector_index}" 720 Scripts/release/validate-app.sh \
+            "key-vector-bundle-${key_vector_index}" 720 "appcast public key is invalid" \
+                Scripts/release/validate-app.sh \
                 --require-updater "$vector_bundle"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "update signing rejects shared public-key vector $key_name at the key gate" \
-            "key-vector-sign-${key_vector_index}" 720 Scripts/release/sign-update.sh \
+            "key-vector-sign-${key_vector_index}" 720 "appcast public key is invalid" \
+                Scripts/release/sign-update.sh \
                 --archive "$archive_one" --appcast-config "$vector_config"
         key_invalid_indices+=("$key_vector_index")
         key_invalid_names+=("$key_name")
@@ -2289,7 +2549,7 @@ fi
 if release_harness_runs evidence-boundaries; then
 release_harness_phase evidence-boundaries
 if [[ "$release_harness_shard" != all ]]; then
-    prepare_evidence_fixtures
+    prepare_evidence_metadata_fixtures
 fi
 publishable_fixture="$test_root/publishable-boundary"
 publishable_final="$publishable_fixture/Erylo-0.1.0-1-arm64.zip"
@@ -2416,6 +2676,12 @@ expect_failure "pre-release publication boundary rejects every stale entry" none
     release_validate_publishable_artifacts "$1" 0.1.0 1 empty "$2"
   ' _ "$repo_root" "$empty_publishable_fixture"
 
+fi
+if release_harness_runs archive-evidence; then
+release_harness_phase archive-evidence
+if [[ "$release_harness_shard" != all ]]; then
+    prepare_archive_evidence_fixtures
+fi
 ticket_archive_root="$test_root/post-staple-archive/root"
 ticket_archive="$test_root/post-staple-archive/Erylo.zip"
 /bin/mkdir -p "$ticket_archive_root"
@@ -2427,24 +2693,30 @@ COPYFILE_DISABLE=1 /usr/bin/ditto "$ticket_app" "$ticket_archive_root/Erylo.app"
 )
 expect_failure "pre-staple archive validation rejects Contents/CodeResources" pre-staple-ticket-archive \
     Scripts/release/validate-archive.sh --archive "$ticket_archive" --app "$ticket_app"
-check "post-staple archive validation permits the one regular ticket file" \
-    Scripts/release/validate-archive.sh --post-staple --archive "$ticket_archive" --app "$ticket_app"
-
 archive_entries_external="$external_test_root/archive-entries-target.txt"
 printf 'archive-entries-sentinel\n' > "$archive_entries_external"
 archive_entries_path_record="$test_root/archive-entries-path.txt"
-check "archive validation ignores a planted predictable final symlink" bash -c '
+check "post-staple archive validation permits the ticket while ignoring a predictable symlink" bash -c '
     planted=".release/tmp/archive-entries.$$.txt"
     /bin/ln -s "$3" "$planted"
     printf "%s\n" "$planted" > "$4"
-    set -- --archive "$1" --app "$2"
+    set -- --post-staple --archive "$1" --app "$2"
     source Scripts/release/validate-archive.sh >/dev/null
-  ' _ "$archive_one" "$default_app" "$archive_entries_external" "$archive_entries_path_record"
+  ' _ "$ticket_archive" "$ticket_app" "$archive_entries_external" "$archive_entries_path_record"
+planted_entries_path="$(<"$archive_entries_path_record")"
+check "archive validation leaves the planted predictable symlink untouched" bash -c '
+    [[ -L "$1" && "$(/usr/bin/readlink "$1")" == "$2" ]]
+  ' _ "$planted_entries_path" "$archive_entries_external"
 check "archive entry validation leaves the external symlink target unchanged" \
     /usr/bin/grep -Fxq archive-entries-sentinel "$archive_entries_external"
-planted_entries_path="$(<"$archive_entries_path_record")"
 /bin/rm -f -- "$planted_entries_path"
 
+fi
+if release_harness_runs release-cleanup; then
+release_harness_phase release-cleanup
+if [[ "$release_harness_shard" != all ]]; then
+    prepare_release_cleanup_fixture
+fi
 fake_notary_external="$external_test_root/notary-target.json"
 printf 'external-notary-sentinel\n' > "$fake_notary_external"
 fake_notary_source="$test_root/fake-notary/submission.json"
@@ -2899,7 +3171,6 @@ release_remove_path "$repo_root" ".release/artifacts/current"
 check "transaction harness leaves no publishable current set" \
     bash -c 'source Scripts/release/lib.sh; release_validate_publishable_root "$1"' _ "$repo_root"
 
-Scripts/release/build-app.sh
 expect_failure "Sparkle signing rejects empty userinfo before tool or credential gates" signing-empty-userinfo \
     Scripts/release/sign-update.sh --archive "$archive_one" --appcast-config "$empty_userinfo_appcast"
 check "Sparkle signing failure identifies the shared appcast URL gate" \
@@ -2921,9 +3192,9 @@ check "Sparkle dependency is pinned exactly in Package.resolved" /usr/bin/ruby -
     abort unless sparkle && sparkle.fetch("state").fetch("version") == "2.9.6"
   ' Package.resolved
 
-check "a subsequent build retains the immutable commit-qualified private dSYM" \
+check "later publication gates retain the immutable commit-qualified private dSYM" \
     test -f "$private_published_dir/$private_fixture_name"
-check "a subsequent build retains the matching private checksum evidence" \
+check "later publication gates retain the matching private checksum evidence" \
     test -f "$private_published_dir/SHA256SUMS"
 release_remove_path "$repo_root" "$private_published_dir"
 check "private harness cleanup leaves no loose or partial private evidence" bash -c '

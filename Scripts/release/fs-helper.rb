@@ -719,7 +719,8 @@ class ReleaseFS
           return nil if allow_missing
           raise
         end
-        mkdirat(current.fileno, value, 0o700)
+        test_pause("before-create-directory-#{value}")
+        mkdirat(current.fileno, value, 0o700, allow_exists: true)
         open_dir_entry(current.fileno, value)
       end
       secure_directory(next_io, value)
@@ -734,7 +735,8 @@ class ReleaseFS
     secure_directory(directory, name)
     directory
   rescue Errno::ENOENT
-    mkdirat(parent_fd, name, mode)
+    test_pause("before-create-directory-#{name}")
+    mkdirat(parent_fd, name, mode, allow_exists: true)
     directory = open_dir_entry(parent_fd, name)
     secure_directory(directory, name)
     directory
@@ -1264,11 +1266,34 @@ class ReleaseFS
   def test_pause(stage)
     return unless ENV["ERYLO_RELEASE_FS_TESTING"] == "1"
     return unless ENV["ERYLO_RELEASE_FS_TEST_PAUSE_STAGE"] == stage
-    delay = Float(ENV.fetch("ERYLO_RELEASE_FS_TEST_DELAY", "0.5"))
-    abort("invalid release filesystem test delay") unless delay.positive? && delay <= 5
     STDERR.puts("RELEASE_FS_TEST_READY:#{stage}")
     STDERR.flush
-    sleep(delay)
+    gate = ENV["ERYLO_RELEASE_FS_TEST_GATE"]
+    if gate
+      gate = File.expand_path(gate, @repo)
+      gate = File.join(File.realpath(File.dirname(gate)), File.basename(gate))
+      release_prefix = File.join(@repo, ".release") + File::SEPARATOR
+      abort("release filesystem test gate must be below staging") unless gate.start_with?(release_prefix)
+      gate_timeout = Float(ENV.fetch("ERYLO_RELEASE_FS_TEST_GATE_TIMEOUT", "120"))
+      abort("invalid release filesystem test gate timeout") \
+        unless gate_timeout.positive? && gate_timeout <= 300
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + gate_timeout
+      loop do
+        gate_stat = begin
+          File.lstat(gate)
+        rescue Errno::ENOENT
+          nil
+        end
+        break if gate_stat&.file? && !gate_stat.symlink?
+        abort("release filesystem test gate timed out") \
+          if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        sleep(0.01)
+      end
+    else
+      delay = Float(ENV.fetch("ERYLO_RELEASE_FS_TEST_DELAY", "0.5"))
+      abort("invalid release filesystem test delay") unless delay.positive? && delay <= 5
+      sleep(delay)
+    end
   end
 end
 

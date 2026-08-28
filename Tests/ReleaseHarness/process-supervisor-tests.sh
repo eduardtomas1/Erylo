@@ -78,14 +78,34 @@ assert "missed readiness cancels and reaps its owned command" \
     test "$(state_field "$missed_state" classification)" = cancelled
 
 trickle_log="$test_root/logs/trickle-readiness.log"
+trickle_writer_gate="$test_root/logs/trickle-writer"
+trickle_reader_gate="$test_root/logs/trickle-reader"
 release_harness_start_background trickle-readiness 2 /bin/bash -c '
     printf "RELEASE_FS_TEST_" >&2
-    /bin/sleep 0.03
+    printf "ready\n" > "$1.ready"
+    while [[ ! -e "$1.release" ]]; do /bin/sleep 0.01; done
     printf "READY:trickled\n" >&2
-  ' 2>"$trickle_log"
+    while [[ ! -e "$1.complete" ]]; do /bin/sleep 0.01; done
+  ' _ "$trickle_writer_gate" 2>"$trickle_log"
 trickle_pid="$release_harness_background_pid"
 trickle_state="$release_harness_background_state"
-wait_for_fs_test_pause "$trickle_log" "$trickle_pid" "$trickle_state" trickle-readiness
+/usr/bin/ruby "$repo_root/Tests/ReleaseHarness/process-supervisor.rb" wait-log \
+    "$trickle_writer_gate.ready" 0.5 ready trickle-writer-prefix
+/usr/bin/env ERYLO_RELEASE_SUPERVISOR_TEST_READINESS_GATE="$trickle_reader_gate" \
+    /usr/bin/ruby "$repo_root/Tests/ReleaseHarness/process-supervisor.rb" wait-ready \
+        "$trickle_state" "$trickle_log" "$release_harness_readiness_timeout" \
+        '(RELEASE_FS|SOURCE_MOUNT)_TEST_READY:' trickle-readiness &
+trickle_reader_pid=$!
+/usr/bin/ruby "$repo_root/Tests/ReleaseHarness/process-supervisor.rb" wait-log \
+    "$trickle_reader_gate.ready" 0.5 ready trickle-reader-prefix
+assert "an incomplete readiness prefix cannot satisfy the observer" \
+    /bin/kill -0 "$trickle_reader_pid"
+/usr/bin/touch "$trickle_writer_gate.release"
+/usr/bin/ruby "$repo_root/Tests/ReleaseHarness/process-supervisor.rb" wait-log \
+    "$trickle_log" 0.5 'RELEASE_FS_TEST_READY:trickled' trickle-writer-suffix
+/usr/bin/touch "$trickle_reader_gate.release"
+wait "$trickle_reader_pid"
+/usr/bin/touch "$trickle_writer_gate.complete"
 release_harness_wait_status "$trickle_pid"
 assert "trickled readiness completes successfully" test "$release_harness_wait_result" = 0
 assert "trickled readiness requires the complete marker" \
@@ -477,4 +497,4 @@ assert "central cleanup marks every owned wrapper reaped" \
     /bin/bash -c 'for active in "$@"; do [[ "$active" == 0 ]]; done' \
     _ "${release_harness_process_active[@]}"
 
-printf 'Release process supervisor regressions passed 66 checks.\n'
+printf 'Release process supervisor regressions passed 67 checks.\n'

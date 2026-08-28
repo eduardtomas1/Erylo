@@ -88,7 +88,31 @@ archive_temp="$temp_dir/Erylo.dSYM.zip"
     end
   ' "$temp_dir/entries" || release_die "symbol archive entry validation failed"
 COPYFILE_DISABLE=1 /usr/bin/ditto -x -k "$archive_temp" "$temp_dir/extracted"
-"$script_dir/validate-symbols.sh" --binary "$binary" --dsym "$temp_dir/extracted/Erylo.app.dSYM" >/dev/null
+/usr/bin/ruby -rdigest -e '
+    require "find"
+
+    def manifest(root)
+      root = File.realpath(root)
+      prefix = root + File::SEPARATOR
+      Find.find(root).map do |path|
+        relative = path == root ? "." : path.delete_prefix(prefix)
+        stat = File.lstat(path)
+        mode = stat.mode & 0o777
+        case stat.ftype
+        when "directory"
+          [relative, "directory", mode, ""]
+        when "file"
+          [relative, "file", mode, Digest::SHA256.file(path).hexdigest]
+        else
+          abort("unsupported dSYM archive entry type: #{relative}")
+        end
+      end.sort
+    end
+
+    abort("symbol archive differs from the validated dSYM") \
+      unless manifest(ARGV.fetch(0)) == manifest(ARGV.fetch(1))
+  ' "$dsym" "$temp_dir/extracted/Erylo.app.dSYM" \
+    || release_die "symbol archive does not exactly represent the validated dSYM"
 
 release_publish_file "$repo_root" "$archive_temp" "$output"
 printf 'Private dSYM archive created at %s\n' "$output"

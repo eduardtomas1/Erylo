@@ -49,6 +49,10 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
+output="$(release_output_path "$repo_root" "$output_input")"
+[[ "$output" == *.app && "$(/usr/bin/basename "$output")" == "Erylo.app" ]] \
+    || release_die "assembled output must be a release-staged Erylo.app"
+
 release_require_command git
 release_require_command ditto
 release_require_command plutil
@@ -63,14 +67,11 @@ install_name_tool="$(release_developer_tool_path install_name_tool)"
 binary="$(release_existing_path "$repo_root" "$binary_input")"
 framework="$(release_existing_path "$repo_root" "$framework_input")"
 toolchain="$(release_existing_path "$repo_root" "$toolchain_input")"
-output="$(release_output_path "$repo_root" "$output_input")"
 metadata_file="$(release_repo_file "$repo_root" "$metadata_input")"
 template="$(release_repo_file "$repo_root" "Resources/App/Info.plist.in")"
 erylo_license="$(release_repo_file "$repo_root" "LICENSE")"
 third_party_notices="$(release_repo_file "$repo_root" "Resources/App/ThirdPartyNotices.txt")"
 
-[[ "$output" == *.app && "$(/usr/bin/basename "$output")" == "Erylo.app" ]] \
-    || release_die "assembled output must be a release-staged Erylo.app"
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || release_die "binary input must be a regular executable"
 [[ -d "$framework" && ! -L "$framework" ]] || release_die "framework input must be a real directory"
 [[ -f "$toolchain" && ! -L "$toolchain" ]] || release_die "toolchain provenance input is missing"

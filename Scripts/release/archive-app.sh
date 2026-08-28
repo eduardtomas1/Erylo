@@ -38,17 +38,6 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
-release_require_command ditto
-release_require_command git
-release_require_command zip
-release_require_command zipinfo
-
-app="$(release_existing_path "$repo_root" "$app_input")"
-if [[ "$post_staple" == true ]]; then
-    "$script_dir/verify-signature.sh" --notarized "$app" >/dev/null
-else
-    "$script_dir/validate-app.sh" "$app" >/dev/null
-fi
 metadata_file="$(release_repo_file "$repo_root" "Config/ReleaseVersion.env")"
 if [[ -z "$output_input" ]]; then
     marketing_version="$(release_metadata_value "$metadata_file" MARKETING_VERSION)"
@@ -57,6 +46,16 @@ if [[ -z "$output_input" ]]; then
 fi
 output="$(release_output_path "$repo_root" "$output_input")"
 [[ "$output" == *.zip ]] || release_die "archive output must use the .zip extension"
+
+release_require_command ditto
+release_require_command git
+release_require_command zip
+release_require_command zipinfo
+
+app="$(release_existing_path "$repo_root" "$app_input")"
+if [[ "$post_staple" == true ]]; then
+    "$script_dir/verify-signature.sh" --notarized "$app" >/dev/null
+fi
 
 if [[ -z "$source_date_epoch" ]]; then
     source_date_epoch="$(release_source_epoch "$repo_root")"

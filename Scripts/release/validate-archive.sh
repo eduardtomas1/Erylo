@@ -40,11 +40,6 @@ archive="$(release_existing_path "$repo_root" "$archive_input")"
 app="$(release_existing_path "$repo_root" "$app_input")"
 [[ -f "$archive" && "$archive" == *.zip && ! -L "$archive" ]] || release_die "archive input must be a staged ZIP file"
 [[ -d "$app" && "$(/usr/bin/basename "$app")" == "Erylo.app" && ! -L "$app" ]] || release_die "app input must be a staged Erylo.app"
-if [[ "$post_staple" == true ]]; then
-    "$script_dir/validate-app.sh" --post-staple "$app" >/dev/null
-else
-    "$script_dir/validate-app.sh" "$app" >/dev/null
-fi
 
 temp_dir="$(release_make_temp_dir "$repo_root" validate-archive)"
 trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
@@ -68,6 +63,8 @@ release_make_directory "$repo_root" "$temp_dir/extracted" >/dev/null
 COPYFILE_DISABLE=1 /usr/bin/ditto -x -k "$archive" "$temp_dir/extracted"
 extracted_app="$temp_dir/extracted/Erylo.app"
 [[ -d "$extracted_app" && ! -L "$extracted_app" ]] || release_die "archive did not extract one Erylo.app"
+# Validate the extracted publication candidate once. The exact type, mode,
+# link-target, and byte manifest below transfers that result back to the staged app.
 if [[ "$post_staple" == true ]]; then
     "$script_dir/validate-app.sh" --post-staple "$extracted_app" >/dev/null
 else

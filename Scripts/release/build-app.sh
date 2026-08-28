@@ -65,23 +65,13 @@ if [[ "${ERYLO_RELEASE_SNAPSHOT_ACTIVE:-0}" == "1" ]]; then
 fi
 
 triple="arm64-apple-macosx${minimum_system_version}"
-build_arguments=(
-    --package-path "$source_root"
-    --scratch-path "$scratch_path"
-    --configuration release
-    --product Erylo
-    --triple "$triple"
-    --disable-index-store
-    -Xswiftc -warnings-as-errors
-)
-
 if [[ "${#compiler_environment[@]}" -gt 0 ]]; then
-    /usr/bin/env "${compiler_environment[@]}" "$swift_tool" build "${build_arguments[@]}"
-    bin_path="$(/usr/bin/env "${compiler_environment[@]}" "$swift_tool" build "${build_arguments[@]}" --show-bin-path)"
+    release_build_swift_product "$swift_tool" "$source_root" "$scratch_path" Erylo "$triple" \
+        "${compiler_environment[@]}"
 else
-    "$swift_tool" build "${build_arguments[@]}"
-    bin_path="$("$swift_tool" build "${build_arguments[@]}" --show-bin-path)"
+    release_build_swift_product "$swift_tool" "$source_root" "$scratch_path" Erylo "$triple"
 fi
+bin_path="$release_swift_product_bin_path"
 binary="$bin_path/Erylo"
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || release_die "SwiftPM did not produce the expected Erylo executable"
 [[ "$("$lipo_tool" -archs "$binary")" == "arm64" ]] || release_die "release executable is not arm64-only"

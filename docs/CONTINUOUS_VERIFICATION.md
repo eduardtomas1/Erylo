@@ -52,7 +52,7 @@ contract.
 `nightly-verification.yml` runs daily at 03:17 UTC and supports manual dispatch.
 It proves that the release-shard manifest is the same ordered, duplicate-free
 set as the executable harness phases and that their expected counts sum to 548.
-The resulting 12-way matrix runs every phase in a separate clean checkout. Each
+The resulting 17-way matrix runs every phase in a separate clean checkout. Each
 release shard has a 900-second command deadline inside a 17-minute job deadline;
 the outer owner reports the exact timeout/cancellation classification and uses
 the remaining job time to TERM, KILL if needed, reap its direct child exactly
@@ -65,6 +65,18 @@ completion reports peak active (admitted but unreaped) owners. The focused
 regression separately measures physical child concurrency. The cap permits
 independent validators to overlap without creating an unbounded hosted
 process/FD load.
+
+The full production build and staging operation belongs only to
+`build-artifact`, whose assertions inspect that artifact. Bundle and vector
+shards instead compile the real arm64 release product with warnings as errors,
+retain the real Sparkle framework and selected-toolchain binding, and assemble
+only the bundle they validate. Metadata, cleanup, and publication shards use
+structural fixtures only where their assertions do not inspect executable
+contents. The contract checker locks those ownership boundaries. Archive
+equivalence is not assumed: the extracted application is validated and then
+compared with the staged application by exact entry type, mode, link target,
+and byte digest; private symbols similarly validate the source dSYM and prove
+the extracted archive has the exact same manifest.
 
 Nightly jobs are diagnostic follow-up, not protected-branch status checks. They
 have read-only source access and receive no signing, notarization, update, or
@@ -118,37 +130,55 @@ expensive operations rather than check counts: repeated archives are concurrent,
 metadata validations are capped batches, and each shard constructs only the
 fixtures its assertions require.
 
-Local measurements used Apple Swift 6.3.3 on an Apple silicon Mac. The original
-548-check harness took 453.89s. The bounded/sharded `all` mode passed the same
-548 checks in 370.85s with a 1.237GB maximum resident set; the
-post-ownership-amendment confirmation passed in 375.35s with a 1.134GB maximum
-resident set, the bounded-reap confirmation passed in 365.24s with a 1.249GB
-maximum resident set, and the final arbitrary-exception confirmation passed in
-371.98s with a 1.208GB maximum resident set.
-The exact independent shard run was:
+The first exact-main shard run is also failure evidence, not a green baseline.
+On exact `6e58c0406b20a3f319f8bb930fef2b43d6218c1b`, nightly
+[run 33173330593](https://github.com/eduardtomas1/Erylo/actions/runs/33173330593)
+passed the contract, both sanitizers, publication, and `bundle-default`.
+`bundle-default` nevertheless took 13m53s of job wall time. Nine shards reached
+their owned 900-second command deadline and settled cleanly:
+`output-boundaries`, `private-symbols`, `archive-core`, `key-vectors`,
+`feed-vectors`, `updater-vectors`, `bundle-ticket`, `evidence-boundaries`, and
+`build-validation`. `source-boundaries` failed because a deliberate split write
+used a scheduler-dependent 30ms delay inside an 80ms readiness window. The
+replacement test uses explicit writer and reader gates to prove that an
+incomplete prefix is not readiness, while a separate case retains exact missed-
+readiness timeout coverage. Production timeout values are unchanged.
+
+Current-topology local measurements used Apple Swift 6.3.3 on an Apple silicon
+Mac. Every row below is a separate isolated shard invocation with a clean
+fixture root and a clean warnings-as-errors Swift scratch directory where the
+concern requires compiled artifacts:
 
 | Shard | Checks | Local wall time |
 | --- | ---: | ---: |
-| `source-boundaries` | 114 | 172s |
-| `build-validation` | 43 | 44s |
-| `private-symbols` | 25 | 67s |
-| `bundle-default` | 19 | 41s |
-| `bundle-ticket` | 5 | 41s |
-| `updater-vectors` | 18 | 44s |
-| `output-boundaries` | 10 | 43s |
-| `archive-core` | 9 | 46s |
-| `feed-vectors` | 150 | 59s |
-| `key-vectors` | 35 | 47s |
-| `evidence-boundaries` | 36 | 60s |
-| `publication` | 84 | 77s |
+| `source-boundaries` | 114 | 170.32s |
+| `build-validation` | 34 | 4.41s |
+| `build-artifact` | 6 | 33.85s |
+| `symbol-validation` | 3 | 32.93s |
+| `private-symbols` | 2 | 33.85s |
+| `private-evidence` | 23 | 25.05s |
+| `bundle-default` | 19 | 35.07s |
+| `bundle-ticket` | 5 | 33.69s |
+| `updater-vectors` | 18 | 36.48s |
+| `output-boundaries` | 10 | 1.77s |
+| `archive-core` | 9 | 37.84s |
+| `feed-vectors` | 150 | 49.16s |
+| `key-vectors` | 35 | 39.60s |
+| `evidence-boundaries` | 14 | 4.80s |
+| `archive-evidence` | 4 | 39.50s |
+| `release-cleanup` | 18 | 5.55s |
+| `publication` | 84 | 37.06s |
 
-The counts sum mechanically to 548. With the recovered operation timings,
-`feed-vectors` has the longest relevant hosted critical path: staging 5m10s,
-the base app assembly 3m40s, and overlapping capped validator waves with the
-ready-vector assembly/validation path, estimated at about 14m20s. It therefore
-uses the same 900-second hard command deadline as every other shard rather than
-a larger blind timeout. Current-head hosted matrix URLs and actual durations
-must still be recorded in the pull request before independent review.
+The composed `all` mode then passed the same 548 checks in 310.64s with a
+1.221GB maximum resident set. The counts sum mechanically to 548.
+`source-boundaries` is the longest local shard at 170.32s; among compiled
+release concerns, `feed-vectors` is longest at 49.16s. These local results
+demonstrate topology and substantial local margin,
+not hosted success: the earlier 14.67x metadata-operation multiplier makes
+hosted inference unsafe. An exact-SHA hosted matrix and its actual durations
+must therefore be recorded before independent review. Every shard retains the
+same 900-second hard command deadline rather than masking fixture cost with a
+larger timeout.
 
 ## Exact-SHA evidence
 

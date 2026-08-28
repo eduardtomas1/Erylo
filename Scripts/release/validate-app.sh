@@ -26,6 +26,28 @@ app_input="$1"
 [[ ! -L "$app_input" ]] || release_die "application bundle input may not be a symlink"
 app="$(release_existing_path "$repo_root" "$app_input")"
 [[ -d "$app" && "$(/usr/bin/basename "$app")" == "Erylo.app" ]] || release_die "input is not a staged Erylo.app bundle"
+plist="$app/Contents/Info.plist"
+
+/usr/bin/ruby -e '
+    require "find"
+    roots = [ARGV.fetch(0), ARGV.fetch(1)]
+    patterns = [
+      /REPLACE[_-]?ME/i,
+      /YOUR[_-](?:KEY|TOKEN|SECRET|VALUE)/i,
+      /example\.invalid/i,
+      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
+      /AKIA[0-9A-Z]{16}/,
+      /gh[pousr]_[A-Za-z0-9_]{30,}/
+    ]
+    roots.each do |root|
+      next unless File.exist?(root)
+      Find.find(root) do |path|
+        next unless File.file?(path) && !File.symlink?(path)
+        data = File.binread(path)
+        abort("placeholder or secret marker in #{path}") if patterns.any? { |pattern| data.match?(pattern) }
+      end
+    end
+  ' "$plist" "$app/Contents/Resources" || release_die "placeholder or secret-marker validation failed"
 
 release_require_command file
 release_require_command git
@@ -41,7 +63,6 @@ metadata_file="$(release_repo_file "$repo_root" "Config/ReleaseVersion.env")"
 entitlements_file="$(release_repo_file "$repo_root" "Resources/App/Erylo.entitlements")"
 erylo_license="$(release_repo_file "$repo_root" "LICENSE")"
 third_party_notices="$(release_repo_file "$repo_root" "Resources/App/ThirdPartyNotices.txt")"
-plist="$app/Contents/Info.plist"
 executable_name="$(release_metadata_value "$metadata_file" EXECUTABLE_NAME)"
 binary="$app/Contents/MacOS/$executable_name"
 framework="$app/Contents/Frameworks/Sparkle.framework"
@@ -235,26 +256,5 @@ if [[ -n "$icon_name" ]]; then
 elif [[ -e "$app/Contents/Resources/AppIcon.icns" ]]; then
     release_die "AppIcon.icns exists without CFBundleIconFile metadata"
 fi
-
-/usr/bin/ruby -e '
-    require "find"
-    roots = [ARGV.fetch(0), ARGV.fetch(1)]
-    patterns = [
-      /REPLACE[_-]?ME/i,
-      /YOUR[_-](?:KEY|TOKEN|SECRET|VALUE)/i,
-      /example\.invalid/i,
-      /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/,
-      /AKIA[0-9A-Z]{16}/,
-      /gh[pousr]_[A-Za-z0-9_]{30,}/
-    ]
-    roots.each do |root|
-      next unless File.exist?(root)
-      Find.find(root) do |path|
-        next unless File.file?(path) && !File.symlink?(path)
-        data = File.binread(path)
-        abort("placeholder or secret marker in #{path}") if patterns.any? { |pattern| data.match?(pattern) }
-      end
-    end
-  ' "$plist" "$app/Contents/Resources" || release_die "placeholder or secret-marker validation failed"
 
 printf 'Application bundle validation passed: %s\n' "$app"

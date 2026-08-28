@@ -993,6 +993,51 @@ release_developer_tool_path() {
     printf '%s\n' "$path"
 }
 
+release_build_swift_product() {
+    local swift_tool="$1"
+    local source_root="$2"
+    local scratch_path="$3"
+    local product="$4"
+    local triple="$5"
+    shift 5
+    local build_arguments
+
+    [[ "$swift_tool" == /* && -x "$swift_tool" ]] \
+        || release_die "release Swift tool path is unsafe"
+    [[ "$source_root" == /* && -d "$source_root" && ! -L "$source_root" ]] \
+        || release_die "release Swift source root is unsafe"
+    [[ "$scratch_path" == /* && ! -L "$scratch_path" ]] \
+        || release_die "release Swift scratch path is unsafe"
+    [[ "$product" =~ ^[A-Za-z][A-Za-z0-9_-]*$ ]] \
+        || release_die "release Swift product is invalid"
+    [[ "$triple" =~ ^arm64-apple-macosx[0-9]+\.[0-9]+$ ]] \
+        || release_die "release Swift target triple is invalid"
+    build_arguments=(
+        --package-path "$source_root"
+        --scratch-path "$scratch_path"
+        --configuration release
+        --product "$product"
+        --triple "$triple"
+        --disable-index-store
+        -Xswiftc -warnings-as-errors
+    )
+    if [[ "$#" -gt 0 ]]; then
+        /usr/bin/env "$@" "$swift_tool" build "${build_arguments[@]}"
+        release_swift_product_bin_path="$(
+            /usr/bin/env "$@" "$swift_tool" build "${build_arguments[@]}" --show-bin-path
+        )"
+    else
+        "$swift_tool" build "${build_arguments[@]}"
+        release_swift_product_bin_path="$(
+            "$swift_tool" build "${build_arguments[@]}" --show-bin-path
+        )"
+    fi
+    [[ "$release_swift_product_bin_path" == "$scratch_path"/* \
+        && -d "$release_swift_product_bin_path" \
+        && ! -L "$release_swift_product_bin_path" ]] \
+        || release_die "release Swift product directory is unsafe"
+}
+
 release_xcrun() {
     if [[ -n "${ERYLO_RELEASE_TOOLCHAIN_JSON:-}" ]]; then
         [[ "${DEVELOPER_DIR:-}" == "${ERYLO_RELEASE_DEVELOPER_DIR:-}" ]] \

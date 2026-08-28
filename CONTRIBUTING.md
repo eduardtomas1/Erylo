@@ -5,14 +5,20 @@ Erylo is a native macOS 14+ utility whose quality bar is defined by reliability 
 ## Before opening a pull request
 
 1. Work on a focused branch and do not mix generated artifacts or local diagnostics with source changes.
-2. Run `.github/scripts/check-repository.sh`.
+2. Run `.github/scripts/check-repository.sh` and
+   `.github/scripts/test-check-repository.sh`.
 3. Run the repository build/test entry point when present:
    - `Scripts/ci.sh` is canonical when it exists and is executable.
    - Until then, a root `Package.swift` is verified with `swift test --parallel`.
    - An Xcode project must provide `Scripts/ci.sh`; CI deliberately will not guess a shared scheme or destination.
 4. Describe exact verification, untested hardware/lifecycle cases, permissions, background work, and rollback impact in the pull request.
 
-The repository currently uses a Swift 6 package and executable `Scripts/ci.sh`; both build and harness verification are required. On older or future revisions without a package, project, or CI script, the workflow reports that build/tests were not run and verifies repository controls only.
+The repository currently uses a Swift 6 package and executable `Scripts/ci.sh`;
+both build and harness verification are required. Pull requests split the build,
+API-surface checks, and every Swift test executable into independent required
+jobs; exhaustive release and sanitizer coverage runs nightly. The required
+contexts and protected-main configuration are documented in
+[`docs/CONTINUOUS_VERIFICATION.md`](docs/CONTINUOUS_VERIFICATION.md).
 
 ## Engineering expectations
 

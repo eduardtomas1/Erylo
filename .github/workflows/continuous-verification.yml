@@ -7,8 +7,8 @@ on:
       - main
   workflow_dispatch:
 
-permissions:
-  contents: read
+# GitHub starts with no token access. Each job grants checkout-only access.
+permissions: {}
 
 concurrency:
   group: verification-${{ github.workflow }}-${{ github.ref }}
@@ -17,77 +17,78 @@ concurrency:
 jobs:
   repository-controls:
     name: Repository controls
-    runs-on: macos-14
-    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Verify repository hygiene
-        run: .github/scripts/check-repository.sh
+        run: |
+          .github/scripts/check-repository.sh
+          .github/scripts/test-check-repository.sh
 
-  build-and-test:
-    name: Build and test (when configured)
+  swift-build:
+    name: Swift build
     # macos-14 defaults to Swift 5.10; the package is intentionally Swift 6.
     # The deployment target remains macOS 14 in Package.swift.
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 14
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Discover the canonical build route
-        id: build-route
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Build every product with warnings as errors
+        run: .github/scripts/run-ci-shard.sh build
 
-          if [[ -x Scripts/ci.sh ]]; then
-            echo "route=script" >> "$GITHUB_OUTPUT"
-            echo "Using the repository-owned Scripts/ci.sh entry point."
-          elif [[ -f Package.swift ]]; then
-            echo "route=swiftpm" >> "$GITHUB_OUTPUT"
-            echo "Using Swift Package Manager because Package.swift is present."
-          elif find . -maxdepth 3 \( -name '*.xcworkspace' -o -name '*.xcodeproj' \) -print -quit | grep -q .; then
-            echo "route=xcode-unconfigured" >> "$GITHUB_OUTPUT"
-            echo "An Xcode project exists, but no repository-owned CI entry point defines its scheme and destination."
-          else
-            echo "route=none" >> "$GITHUB_OUTPUT"
-            echo "::warning title=Build/test not run::No Package.swift, Xcode project, or executable Scripts/ci.sh exists yet."
-            {
-              echo "### Build/test status"
-              echo
-              echo "Not run: this revision does not contain a buildable foundation. Repository controls still ran."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+  api-surface:
+    name: API surface
+    runs-on: macos-15
+    timeout-minutes: 14
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Run repository-owned CI entry point
-        if: steps.build-route.outputs.route == 'script'
-        run: Scripts/ci.sh
+      - name: Verify public API boundaries
+        run: .github/scripts/run-ci-shard.sh api-surface
 
-      - name: Require Swift 6
-        if: steps.build-route.outputs.route == 'swiftpm'
-        shell: bash
-        run: |
-          set -euo pipefail
-          swift --version
-          swift_major="$(swift --version | sed -nE 's/.*Swift version ([0-9]+).*/\1/p' | head -n 1)"
-          if [[ -z "$swift_major" || "$swift_major" -lt 6 ]]; then
-            echo "::error::Swift 6 or newer is required; select an appropriate Xcode toolchain."
-            exit 1
-          fi
+  target:
+    name: PR target / ${{ matrix.target }}
+    runs-on: macos-15
+    timeout-minutes: 14
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - EryloActivityTests
+          - EryloFoundationTests
+          - EryloFileHoldTests
+          - EryloGlanceTests
+          - EryloMediaTests
+          - EryloTrustTests
+          - EryloIntegrationTests
+          - EryloSurfaceTests
+          - EryloUpdateTests
+          - EryloAppRuntimeTests
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Build and test Swift package
-        if: steps.build-route.outputs.route == 'swiftpm'
-        run: swift test --parallel
-
-      - name: Require an explicit Xcode CI command
-        if: steps.build-route.outputs.route == 'xcode-unconfigured'
-        shell: bash
-        run: |
-          echo "::error title=CI alignment required::Add an executable Scripts/ci.sh that selects the shared scheme and macOS destination. The workflow will not guess an Xcode build command."
-          exit 1
+      - name: Run ${{ matrix.target }}
+        run: .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"

@@ -131,12 +131,27 @@ printf '%s\n' \
     ')' \
     > "$public_probe_dir/Package.swift"
 
-swift run --package-path "$public_probe_dir" \
-    --scratch-path "$check_dir/public-debug-build" \
-    -c debug PublicSurfaceProbe
-swift run --package-path "$public_probe_dir" \
-    --scratch-path "$check_dir/public-release-build" \
-    -c release PublicSurfaceProbe
+run_public_probe() {
+    local configuration="$1"
+    local scratch_path="$2"
+    local bin_path
+
+    swift build --package-path "$public_probe_dir" \
+        --scratch-path "$scratch_path" \
+        --jobs 2 \
+        -c "$configuration" \
+        --product PublicSurfaceProbe
+    bin_path="$(
+        swift build --package-path "$public_probe_dir" \
+            --scratch-path "$scratch_path" \
+            -c "$configuration" \
+            --show-bin-path
+    )"
+    "$bin_path/PublicSurfaceProbe"
+}
+
+run_public_probe debug "$check_dir/public-debug-build"
+run_public_probe release "$check_dir/public-release-build"
 
 printf 'Arbitrary-basename dependency identity check passed.\n'
 printf 'Activity API surface check passed.\n'

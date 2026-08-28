@@ -2,15 +2,24 @@
 
 ## Current state
 
-This repository contains a Swift 6, macOS 14+ SwiftPM foundation. `Scripts/ci.sh` is the canonical entry point: it builds with warnings as errors, runs the activity, foundation, File Hold, Glance, Media, Trust, Local Integrations, surface, updater, application-runtime, and release harnesses, and uses `shellcheck` when that optional local tool is installed.
+This repository contains a Swift 6, macOS 14+ SwiftPM foundation. `Scripts/ci.sh` is the complete canonical local entry point: it builds with warnings as errors, runs the activity, foundation, File Hold, Glance, Media, Trust, Local Integrations, surface, updater, application-runtime, and release harnesses, and uses `shellcheck` when that optional local tool is installed.
 
-Continuous verification uses the following discovery order:
+Pull-request CI runs the build, API-surface controls, and each Swift executable
+test target as independent fast jobs. The exhaustive deterministic release
+harness and AddressSanitizer/ThreadSanitizer coverage run nightly, separately
+from signing and notarization. See [Continuous verification](CONTINUOUS_VERIFICATION.md)
+for the exact check contract, protected-main ruleset, and measured budgets.
+
+The historical generic workflow used the following discovery order:
 
 1. Add an executable `Scripts/ci.sh` for an Xcode workspace/project. It must select a shared scheme and an explicit macOS destination and must run the project's real build and test commands.
 2. If `Scripts/ci.sh` is absent and the repository remains SwiftPM-only, the workflow falls back to `swift test --parallel` and requires Swift 6 or newer.
 3. Record the chosen Xcode/toolchain version in a tracked project file and update the runner only when that requirement differs from the public `macos-14` runner image.
 
-An Xcode project without `Scripts/ci.sh` fails CI deliberately. This avoids a green check based on a guessed scheme, destination, or incomplete test set.
+The current SwiftPM workflow no longer performs runtime discovery: its explicit
+build, API, and target matrix is the reviewed contract. A future migration to an
+Xcode project must update both `Scripts/ci.sh` and the workflow with a shared
+scheme and explicit macOS destination; CI must not guess either value.
 
 ## Local checks
 

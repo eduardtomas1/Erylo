@@ -4,6 +4,18 @@ import EryloCore
 @_spi(Testing) import EryloIntegrations
 import Foundation
 
+#if ERYLO_THREAD_SANITIZER
+private let mediaProcessFunctionalTimeoutNanoseconds: UInt64 = 10_000_000_000
+private let mediaProcessEscalationTimeoutNanoseconds: UInt64 = 5_000_000_000
+private let mediaProcessPostExitDurationLimit: Duration = .seconds(8)
+private let mediaProcessObservationAttempts = 15_000
+#else
+private let mediaProcessFunctionalTimeoutNanoseconds: UInt64 = 2_000_000_000
+private let mediaProcessEscalationTimeoutNanoseconds: UInt64 = 500_000_000
+private let mediaProcessPostExitDurationLimit: Duration = .seconds(1)
+private let mediaProcessObservationAttempts = 1_000
+#endif
+
 @main
 enum MediaHarnessMain {
     static func main() async {
@@ -1024,7 +1036,7 @@ private final class MediaHarness {
             runner: processRunner,
             readinessPath: readinessPath,
             limits: MediaScriptProcessLimits(
-                timeoutNanoseconds: 2_000_000_000,
+                timeoutNanoseconds: mediaProcessFunctionalTimeoutNanoseconds,
                 terminationGraceNanoseconds: 30_000_000,
                 postTerminationDrainNanoseconds: 30_000_000
             )
@@ -1464,7 +1476,7 @@ private final class MediaHarness {
         let normalLimits = MediaScriptProcessLimits(
             maximumStandardOutputBytes: 512 * 1_024,
             maximumStandardErrorBytes: 512 * 1_024,
-            timeoutNanoseconds: 2_000_000_000,
+            timeoutNanoseconds: mediaProcessFunctionalTimeoutNanoseconds,
             terminationGraceNanoseconds: 50_000_000
         )
 
@@ -1560,7 +1572,7 @@ private final class MediaHarness {
                 limits: MediaScriptProcessLimits(
                     maximumStandardOutputBytes: 4_096,
                     maximumStandardErrorBytes: 4_096,
-                    timeoutNanoseconds: 2_000_000_000
+                    timeoutNanoseconds: mediaProcessFunctionalTimeoutNanoseconds
                 )
             )
         }
@@ -1578,7 +1590,7 @@ private final class MediaHarness {
                 limits: MediaScriptProcessLimits(
                     maximumStandardOutputBytes: 4_096,
                     maximumStandardErrorBytes: 4_096,
-                    timeoutNanoseconds: 2_000_000_000
+                    timeoutNanoseconds: mediaProcessFunctionalTimeoutNanoseconds
                 )
             )
         }
@@ -1615,7 +1627,7 @@ private final class MediaHarness {
             ],
             operationID: MediaOperationID(),
             limits: MediaScriptProcessLimits(
-                timeoutNanoseconds: 2_000_000_000,
+                timeoutNanoseconds: mediaProcessFunctionalTimeoutNanoseconds,
                 postTerminationDrainNanoseconds: 30_000_000
             )
         )
@@ -1624,7 +1636,7 @@ private final class MediaHarness {
         let inheritedReaders = await inheritedPipeRunner.activeReaderCount
         check(inheritedPipeResult.exitCode == 0, "direct child exit is retained with inherited pipes")
         check(
-            inheritedPipeDuration < .seconds(1),
+            inheritedPipeDuration < mediaProcessPostExitDurationLimit,
             "descendant-held pipes use the configured deadline, not ten-second EOF"
         )
         check(
@@ -1664,12 +1676,12 @@ private final class MediaHarness {
             limits: MediaScriptProcessLimits(
                 maximumStandardOutputBytes: 512 * 1_024,
                 maximumStandardErrorBytes: 512 * 1_024,
-                timeoutNanoseconds: 2_000_000_000,
+                timeoutNanoseconds: mediaProcessFunctionalTimeoutNanoseconds,
                 postTerminationDrainNanoseconds: 30_000_000
             )
         )
         check(
-            trickleStart.duration(to: .now) < .seconds(1),
+            trickleStart.duration(to: .now) < mediaProcessPostExitDurationLimit,
             "post-exit absolute deadline bounds successful-read trickle before ten-second EOF"
         )
         let trickleReady = await waitForFile(atPath: trickleReadyPath)
@@ -1715,7 +1727,7 @@ private final class MediaHarness {
                 ],
                 operationID: MediaOperationID(),
                 limits: MediaScriptProcessLimits(
-                    timeoutNanoseconds: 500_000_000,
+                    timeoutNanoseconds: mediaProcessEscalationTimeoutNanoseconds,
                     terminationGraceNanoseconds: 30_000_000
                 )
             )
@@ -3108,7 +3120,7 @@ private enum MediaProcessHelper {
                 limits: MediaScriptProcessLimits(
                     maximumStandardOutputBytes: 1_024,
                     maximumStandardErrorBytes: 1_024,
-                    timeoutNanoseconds: 2_000_000_000
+                    timeoutNanoseconds: mediaProcessFunctionalTimeoutNanoseconds
                 )
             )
             let report = [
@@ -3228,7 +3240,7 @@ private func removeMediaHelperFiles(_ paths: [String]) {
 }
 
 private func waitForFile(atPath path: String) async -> Bool {
-    for _ in 0 ..< 1_000 {
+    for _ in 0 ..< mediaProcessObservationAttempts {
         if FileManager.default.fileExists(atPath: path) { return true }
         try? await Task.sleep(nanoseconds: 1_000_000)
     }
@@ -3243,7 +3255,7 @@ private func waitForRecordedProcessesToExit(atPath path: String) async -> Bool {
     }
     guard processIdentifiers.count == 2 else { return false }
 
-    for _ in 0 ..< 1_000 {
+    for _ in 0 ..< mediaProcessObservationAttempts {
         let allExited = processIdentifiers.allSatisfy { processIdentifier in
             errno = 0
             return Darwin.kill(processIdentifier, 0) < 0 && errno == ESRCH
@@ -3257,7 +3269,7 @@ private func waitForRecordedProcessesToExit(atPath path: String) async -> Bool {
 private func waitForActiveProcess(
     in runner: FoundationMediaScriptProcessRunner
 ) async {
-    for _ in 0 ..< 1_000 {
+    for _ in 0 ..< mediaProcessObservationAttempts {
         if await runner.activeProcessCount > 0 { return }
         try? await Task.sleep(nanoseconds: 1_000_000)
     }

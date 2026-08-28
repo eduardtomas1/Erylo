@@ -1,0 +1,13 @@
+# shard	expected_checks	command_timeout_seconds
+source-boundaries	114	900
+build-validation	43	900
+private-symbols	25	900
+bundle-default	19	900
+bundle-ticket	5	900
+updater-vectors	18	900
+output-boundaries	10	900
+archive-core	9	900
+feed-vectors	150	900
+key-vectors	35	900
+evidence-boundaries	36	900
+publication	84	900

@@ -13,20 +13,46 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release-harness:
-    name: Deterministic release harness
-    runs-on: macos-15
-    timeout-minutes: 120
+  release-harness-contract:
+    name: Deterministic release harness / contract
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       contents: read
+    outputs:
+      matrix: ${{ steps.contract.outputs.matrix }}
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Run exhaustive deterministic release harness
-        run: bash Tests/ReleaseHarness/run.sh
+      - name: Prove the shard contract covers exactly 548 checks
+        id: contract
+        run: /usr/bin/ruby Tests/ReleaseHarness/check-shards.rb --github-output "$GITHUB_OUTPUT"
+
+  release-harness:
+    name: Deterministic release harness / ${{ matrix.shard }}
+    needs: release-harness-contract
+    runs-on: macos-15
+    timeout-minutes: 17
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.release-harness-contract.outputs.matrix) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run bounded deterministic release shard
+        run: >-
+          .github/scripts/run-release-harness-shard.sh
+          "${{ matrix.shard }}"
+          "${{ matrix.expected_checks }}"
+          "${{ matrix.command_timeout_seconds }}"
 
   sanitizer:
     name: Sanitizer / ${{ matrix.sanitizer }}

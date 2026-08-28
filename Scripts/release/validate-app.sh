@@ -28,6 +28,28 @@ app="$(release_existing_path "$repo_root" "$app_input")"
 [[ -d "$app" && "$(/usr/bin/basename "$app")" == "Erylo.app" ]] || release_die "input is not a staged Erylo.app bundle"
 plist="$app/Contents/Info.plist"
 
+release_require_command plutil
+[[ -f "$plist" && ! -L "$plist" ]] || release_die "Info.plist is missing or unsafe"
+/usr/bin/plutil -lint "$plist" >/dev/null || release_die "Info.plist is invalid"
+feed_url="$(release_plist_value "$plist" SUFeedURL || true)"
+public_key="$(release_plist_value "$plist" SUPublicEDKey || true)"
+if [[ -n "$feed_url" || -n "$public_key" ]]; then
+    [[ -n "$feed_url" && -n "$public_key" ]] || release_die "Sparkle feed metadata is incomplete"
+    signed_feed="$(release_plist_value "$plist" SURequireSignedFeed || true)"
+    verify_before_extraction="$(release_plist_value "$plist" SUVerifyUpdateBeforeExtraction || true)"
+    release_validate_signed_appcast_metadata \
+        "$feed_url" "$public_key" "$signed_feed" "$verify_before_extraction"
+    appcast_config_sha256="$(release_plist_value "$plist" EryloReleaseConfigSHA256 || true)"
+    [[ "$appcast_config_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        || release_die "signed appcast configuration hash is missing or invalid"
+    if [[ -n "${ERYLO_RELEASE_APPCAST_SHA256:-}" ]]; then
+        [[ "$appcast_config_sha256" == "$ERYLO_RELEASE_APPCAST_SHA256" ]] \
+            || release_die "bundle appcast configuration hash differs from the pinned snapshot"
+    fi
+elif [[ "$require_updater" == true ]]; then
+    release_die "production validation requires explicit signed appcast metadata"
+fi
+
 /usr/bin/ruby -e '
     require "find"
     roots = [ARGV.fetch(0), ARGV.fetch(1)]
@@ -51,7 +73,6 @@ plist="$app/Contents/Info.plist"
 
 release_require_command file
 release_require_command git
-release_require_command plutil
 release_configure_developer_dir 0
 if [[ -n "${ERYLO_RELEASE_TOOLCHAIN_JSON:-}" ]]; then
     release_assert_toolchain
@@ -68,7 +89,6 @@ binary="$app/Contents/MacOS/$executable_name"
 framework="$app/Contents/Frameworks/Sparkle.framework"
 toolchain_manifest="$app/Contents/Resources/Toolchain.json"
 
-[[ -f "$plist" && ! -L "$plist" ]] || release_die "Info.plist is missing or unsafe"
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || release_die "main executable is missing or unsafe"
 [[ -d "$app/Contents/Resources" && ! -L "$app/Contents/Resources" ]] || release_die "Resources directory is missing or unsafe"
 [[ -d "$framework" && ! -L "$framework" ]] || release_die "Sparkle framework is missing or unsafe"
@@ -132,7 +152,6 @@ for required_notice_line in "${required_notice_lines[@]}"; do
         || release_die "bundled third-party notices omit required Sparkle content"
 done
 
-/usr/bin/plutil -lint "$plist" >/dev/null || release_die "Info.plist is invalid"
 toolchain_sha256="$(/usr/bin/shasum -a 256 "$toolchain_manifest" | /usr/bin/awk '{print $1}')"
 /usr/bin/ruby -rjson -e '
     payload = JSON.parse(File.read(ARGV.fetch(0)))
@@ -227,25 +246,6 @@ framework_version="$(release_plist_value "$framework/Resources/Info.plist" CFBun
     || release_die "embedded Sparkle framework does not support arm64"
 
 "$script_dir/validate-entitlements.sh" "$entitlements_file" >/dev/null
-
-feed_url="$(release_plist_value "$plist" SUFeedURL || true)"
-public_key="$(release_plist_value "$plist" SUPublicEDKey || true)"
-if [[ -n "$feed_url" || -n "$public_key" ]]; then
-    [[ -n "$feed_url" && -n "$public_key" ]] || release_die "Sparkle feed metadata is incomplete"
-    assert_plist_equals SURequireSignedFeed true
-    assert_plist_equals SUVerifyUpdateBeforeExtraction true
-    release_validate_feed_url "$feed_url" || release_die "Sparkle feed URL is invalid"
-    release_validate_public_key "$public_key" || release_die "Sparkle public key metadata is invalid"
-    appcast_config_sha256="$(release_plist_value "$plist" EryloReleaseConfigSHA256 || true)"
-    [[ "$appcast_config_sha256" =~ ^[0-9a-f]{64}$ ]] \
-        || release_die "signed appcast configuration hash is missing or invalid"
-    if [[ -n "${ERYLO_RELEASE_APPCAST_SHA256:-}" ]]; then
-        [[ "$appcast_config_sha256" == "$ERYLO_RELEASE_APPCAST_SHA256" ]] \
-            || release_die "bundle appcast configuration hash differs from the pinned snapshot"
-    fi
-elif [[ "$require_updater" == true ]]; then
-    release_die "production validation requires explicit signed appcast metadata"
-fi
 
 icon_name="$(release_plist_value "$plist" CFBundleIconFile || true)"
 if [[ -n "$icon_name" ]]; then

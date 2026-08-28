@@ -600,6 +600,19 @@ release_validate_public_key() {
     ' "$public_key"
 }
 
+release_validate_signed_appcast_metadata() {
+    local feed_url="$1"
+    local public_key="$2"
+    local signed_feed="$3"
+    local verify_before_extraction="$4"
+
+    [[ "$signed_feed" == "true" && "$verify_before_extraction" == "true" ]] \
+        || release_die "appcast config must require a signed feed and pre-extraction verification"
+    release_validate_feed_url "$feed_url" || release_die "appcast feed URL is invalid"
+    release_validate_public_key "$public_key" \
+        || release_die "appcast public key is invalid or noncanonical"
+}
+
 release_submission_archive_path() {
     local marketing_version="$1"
     local build_version="$2"

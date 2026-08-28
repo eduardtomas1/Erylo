@@ -263,7 +263,6 @@ prepare_update_vector_fixtures() {
     prepare_compiled_release_fixture
     prepare_appcast_fixture
     updater_app="$test_root/updater/Erylo.app"
-    assemble_compiled_fixture --appcast-config "$test_appcast" --output "$updater_app"
     archive_one="$test_root/signing-fixture/Erylo.zip"
     /bin/mkdir -p "$(dirname "$archive_one")"
     printf 'structural signing archive fixture\n' > "$archive_one"
@@ -2017,17 +2016,21 @@ release_harness_phase updater-vectors
 if [[ "$release_harness_shard" != all ]]; then
     prepare_compiled_release_fixture
 fi
+updater_assembler=(Scripts/release/assemble-app.sh)
+if [[ "$release_harness_shard" != all ]]; then
+    updater_assembler+=(
+        --binary "$fixture_binary"
+        --framework "$fixture_framework"
+        --toolchain "$fixture_toolchain"
+    )
+fi
 test_appcast="$test_root/appcast.plist"
 /bin/cp Config/Appcast.example.plist "$test_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml" "$test_appcast"
 test_public_key="$(/usr/bin/ruby -rbase64 -e 'print Base64.strict_encode64("x" * 32)')"
 /usr/bin/plutil -replace SUPublicEDKey -string "$test_public_key" "$test_appcast"
 updater_app="$test_root/updater/Erylo.app"
-if [[ "$release_harness_shard" == all ]]; then
-    Scripts/release/assemble-app.sh --appcast-config "$test_appcast" --output "$updater_app"
-else
-    assemble_compiled_fixture --appcast-config "$test_appcast" --output "$updater_app"
-fi
+"${updater_assembler[@]}" --appcast-config "$test_appcast" --output "$updater_app"
 release_harness_queue_background_success \
     "explicit signed appcast metadata passes the production gate" updater-valid 720 \
     Scripts/release/validate-app.sh --require-updater "$updater_app"
@@ -2055,16 +2058,18 @@ for sparkle_defaults_variant in custom-domain persisted-profile string-automatic
         720 \
         Scripts/release/validate-app.sh --require-updater "$defaults_bundle"
 done
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "tracked example appcast placeholders are rejected" placeholder-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config Config/Appcast.example.plist --output "$test_root/rejected/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config Config/Appcast.example.plist --output "$test_root/rejected/Erylo.app"
 
 credential_appcast="$test_root/credential-appcast.plist"
 /bin/cp "$test_appcast" "$credential_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://user:password@updates.erylo.test/appcast.xml" "$credential_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "appcast URL credentials are rejected before Info.plist assembly" credential-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$credential_appcast" --output "$test_root/credential/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$credential_appcast" --output "$test_root/credential/Erylo.app"
 credential_bundle="$test_root/credential-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$credential_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://user:password@updates.erylo.test/appcast.xml" \
@@ -2076,9 +2081,10 @@ release_harness_queue_background_failure \
 empty_userinfo_appcast="$test_root/empty-userinfo-appcast.plist"
 /bin/cp "$test_appcast" "$empty_userinfo_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://@updates.erylo.test/appcast.xml" "$empty_userinfo_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "empty appcast URL userinfo is rejected before Info.plist assembly" empty-userinfo-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$empty_userinfo_appcast" --output "$test_root/empty-userinfo/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$empty_userinfo_appcast" --output "$test_root/empty-userinfo/Erylo.app"
 empty_userinfo_bundle="$test_root/empty-userinfo-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$empty_userinfo_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://@updates.erylo.test/appcast.xml" \
@@ -2090,9 +2096,10 @@ release_harness_queue_background_failure \
 default_port_appcast="$test_root/default-port-appcast.plist"
 /bin/cp "$test_appcast" "$default_port_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test:443/appcast.xml" "$default_port_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "explicit default appcast ports are rejected" default-port-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$default_port_appcast" --output "$test_root/default-port/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$default_port_appcast" --output "$test_root/default-port/Erylo.app"
 default_port_bundle="$test_root/default-port-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$default_port_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test:443/appcast.xml" \
@@ -2104,23 +2111,26 @@ release_harness_queue_background_failure \
 custom_port_appcast="$test_root/custom-port-appcast.plist"
 /bin/cp "$test_appcast" "$custom_port_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test:8443/appcast.xml" "$custom_port_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "nondefault appcast ports are rejected" custom-port-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$custom_port_appcast" --output "$test_root/custom-port/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$custom_port_appcast" --output "$test_root/custom-port/Erylo.app"
 
 uppercase_scheme_appcast="$test_root/uppercase-scheme-appcast.plist"
 /bin/cp "$test_appcast" "$uppercase_scheme_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "HTTPS://updates.erylo.test/appcast.xml" "$uppercase_scheme_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "noncanonical appcast scheme spelling is rejected" uppercase-scheme-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$uppercase_scheme_appcast" --output "$test_root/uppercase-scheme/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$uppercase_scheme_appcast" --output "$test_root/uppercase-scheme/Erylo.app"
 
 query_appcast="$test_root/query-appcast.plist"
 /bin/cp "$test_appcast" "$query_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml?channel=stable" "$query_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "noncanonical appcast URL queries are rejected" query-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$query_appcast" --output "$test_root/query/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$query_appcast" --output "$test_root/query/Erylo.app"
 query_bundle="$test_root/query-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$query_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml?channel=stable" \
@@ -2132,9 +2142,10 @@ release_harness_queue_background_failure \
 fragment_appcast="$test_root/fragment-appcast.plist"
 /bin/cp "$test_appcast" "$fragment_appcast"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml#latest" "$fragment_appcast"
-release_harness_queue_background_failure \
+release_harness_queue_background_failure_with_stderr \
     "noncanonical appcast URL fragments are rejected" fragment-appcast 720 \
-    Scripts/release/assemble-app.sh --appcast-config "$fragment_appcast" --output "$test_root/fragment/Erylo.app"
+    "appcast feed URL is invalid" "${updater_assembler[@]}" \
+    --appcast-config "$fragment_appcast" --output "$test_root/fragment/Erylo.app"
 fragment_bundle="$test_root/fragment-bundle/Erylo.app"
 /usr/bin/ditto "$updater_app" "$fragment_bundle"
 /usr/bin/plutil -replace SUFeedURL -string "https://updates.erylo.test/appcast.xml#latest" \
@@ -2156,6 +2167,7 @@ check "reviewed entitlements remain minimal" Scripts/release/validate-entitlemen
 
 secret_app="$test_root/secret/Erylo.app"
 /bin/mkdir -p "$secret_app/Contents/Resources"
+/bin/cp Resources/App/Info.plist.in "$secret_app/Contents/Info.plist"
 printf '%s%s\n' '-----BEGIN TEST ' 'PRIVATE KEY-----' > "$secret_app/Contents/Resources/secret-fixture.txt"
 expect_failure_with_stderr "bundle validation rejects private-key markers" private-key-marker \
     "placeholder or secret-marker validation failed" \
@@ -2259,6 +2271,14 @@ release_harness_phase feed-vectors
 if [[ "$release_harness_shard" != all ]]; then
     prepare_update_vector_fixtures
 fi
+feed_assembler=(Scripts/release/assemble-app.sh)
+if [[ "$release_harness_shard" != all ]]; then
+    feed_assembler+=(
+        --binary "$fixture_binary"
+        --framework "$fixture_framework"
+        --toolchain "$fixture_toolchain"
+    )
+fi
 feed_vector_index=0
 feed_ready_indices=()
 feed_ready_names=()
@@ -2277,11 +2297,19 @@ while IFS=$'\t' read -r feed_expected feed_name feed_url; do
             source Scripts/release/lib.sh
             release_validate_feed_url "$1"
           ' _ "$feed_url"
-        vector_app="$test_root/feed-vectors/${feed_vector_index}/Erylo.app"
-        release_harness_queue_background_success \
-            "assembler accepts shared feed vector $feed_name" \
-            "feed-vector-assemble-${feed_vector_index}" 720 \
-            Scripts/release/assemble-app.sh --appcast-config "$vector_config" --output "$vector_app"
+        if [[ "$feed_name" == canonical ]]; then
+            [[ "$feed_url" == "$(release_plist_value "$test_appcast" SUFeedURL)" ]] \
+                || release_die "canonical feed vector differs from the shared updater fixture"
+            vector_app="$updater_app"
+            check "assembler accepts shared feed vector $feed_name" \
+                "${feed_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        else
+            vector_app="$test_root/feed-vectors/${feed_vector_index}/Erylo.app"
+            release_harness_queue_background_success \
+                "assembler accepts shared feed vector $feed_name" \
+                "feed-vector-assemble-${feed_vector_index}" 720 \
+                "${feed_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        fi
         feed_ready_indices+=("$feed_vector_index")
         feed_ready_names+=("$feed_name")
         feed_ready_apps+=("$vector_app")
@@ -2291,21 +2319,25 @@ while IFS=$'\t' read -r feed_expected feed_name feed_url; do
                 source Scripts/release/lib.sh
                 release_validate_feed_url "$1"
               ' _ "$feed_url"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "assembler rejects shared feed vector $feed_name" \
-            "feed-vector-assemble-${feed_vector_index}" 720 Scripts/release/assemble-app.sh \
+            "feed-vector-assemble-${feed_vector_index}" 720 "appcast feed URL is invalid" \
+                "${feed_assembler[@]}" \
                 --appcast-config "$vector_config" \
                 --output "$test_root/feed-vectors/${feed_vector_index}/assembled/Erylo.app"
         vector_bundle="$test_root/feed-vectors/${feed_vector_index}/injected/Erylo.app"
+        [[ -d "$updater_app" ]] || release_die "canonical feed vector did not construct the updater fixture"
         /usr/bin/ditto "$updater_app" "$vector_bundle"
         /usr/bin/plutil -replace SUFeedURL -string "$feed_url" "$vector_bundle/Contents/Info.plist"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "bundle validator rejects shared feed vector $feed_name" \
-            "feed-vector-bundle-${feed_vector_index}" 720 Scripts/release/validate-app.sh \
+            "feed-vector-bundle-${feed_vector_index}" 720 "appcast feed URL is invalid" \
+                Scripts/release/validate-app.sh \
                 --require-updater "$vector_bundle"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "update signing rejects shared feed vector $feed_name at the URL gate" \
-            "feed-vector-sign-${feed_vector_index}" 720 Scripts/release/sign-update.sh \
+            "feed-vector-sign-${feed_vector_index}" 720 "appcast feed URL is invalid" \
+                Scripts/release/sign-update.sh \
                 --archive "$archive_one" --appcast-config "$vector_config"
         feed_invalid_indices+=("$feed_vector_index")
         feed_invalid_names+=("$feed_name")
@@ -2349,6 +2381,14 @@ release_harness_phase key-vectors
 if [[ "$release_harness_shard" != all ]]; then
     prepare_update_vector_fixtures
 fi
+key_assembler=(Scripts/release/assemble-app.sh)
+if [[ "$release_harness_shard" != all ]]; then
+    key_assembler+=(
+        --binary "$fixture_binary"
+        --framework "$fixture_framework"
+        --toolchain "$fixture_toolchain"
+    )
+fi
 key_vector_index=0
 key_ready_indices=()
 key_ready_names=()
@@ -2367,11 +2407,19 @@ while IFS=$'\t' read -r key_expected key_name public_key; do
             source Scripts/release/lib.sh
             release_validate_public_key "$1"
           ' _ "$public_key"
-        vector_app="$test_root/key-vectors/${key_vector_index}/Erylo.app"
-        release_harness_queue_background_success \
-            "assembler accepts shared public-key vector $key_name" \
-            "key-vector-assemble-${key_vector_index}" 720 \
-            Scripts/release/assemble-app.sh --appcast-config "$vector_config" --output "$vector_app"
+        if [[ "$key_name" == canonical-32-bytes ]]; then
+            [[ "$public_key" == "$(release_plist_value "$test_appcast" SUPublicEDKey)" ]] \
+                || release_die "canonical public-key vector differs from the shared updater fixture"
+            vector_app="$updater_app"
+            check "assembler accepts shared public-key vector $key_name" \
+                "${key_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        else
+            vector_app="$test_root/key-vectors/${key_vector_index}/Erylo.app"
+            release_harness_queue_background_success \
+                "assembler accepts shared public-key vector $key_name" \
+                "key-vector-assemble-${key_vector_index}" 720 \
+                "${key_assembler[@]}" --appcast-config "$vector_config" --output "$vector_app"
+        fi
         key_ready_indices+=("$key_vector_index")
         key_ready_names+=("$key_name")
         key_ready_apps+=("$vector_app")
@@ -2381,21 +2429,25 @@ while IFS=$'\t' read -r key_expected key_name public_key; do
                 source Scripts/release/lib.sh
                 release_validate_public_key "$1"
               ' _ "$public_key"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "assembler rejects shared public-key vector $key_name" \
-            "key-vector-assemble-${key_vector_index}" 720 Scripts/release/assemble-app.sh \
+            "key-vector-assemble-${key_vector_index}" 720 "appcast public key is invalid" \
+                "${key_assembler[@]}" \
                 --appcast-config "$vector_config" \
                 --output "$test_root/key-vectors/${key_vector_index}/assembled/Erylo.app"
         vector_bundle="$test_root/key-vectors/${key_vector_index}/injected/Erylo.app"
+        [[ -d "$updater_app" ]] || release_die "canonical public-key vector did not construct the updater fixture"
         /usr/bin/ditto "$updater_app" "$vector_bundle"
         /usr/bin/plutil -replace SUPublicEDKey -string "$public_key" "$vector_bundle/Contents/Info.plist"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "bundle validator rejects shared public-key vector $key_name" \
-            "key-vector-bundle-${key_vector_index}" 720 Scripts/release/validate-app.sh \
+            "key-vector-bundle-${key_vector_index}" 720 "appcast public key is invalid" \
+                Scripts/release/validate-app.sh \
                 --require-updater "$vector_bundle"
-        release_harness_queue_background_failure \
+        release_harness_queue_background_failure_with_stderr \
             "update signing rejects shared public-key vector $key_name at the key gate" \
-            "key-vector-sign-${key_vector_index}" 720 Scripts/release/sign-update.sh \
+            "key-vector-sign-${key_vector_index}" 720 "appcast public key is invalid" \
+                Scripts/release/sign-update.sh \
                 --archive "$archive_one" --appcast-config "$vector_config"
         key_invalid_indices+=("$key_vector_index")
         key_invalid_names+=("$key_name")

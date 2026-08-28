@@ -38,6 +38,25 @@ done
 [[ -n "$archive_input" && -n "$appcast_input" ]] || release_die "--archive and --appcast-config are required"
 [[ "$account" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || release_die "invalid Sparkle Keychain account name"
 
+appcast_file="$(release_repo_file "$repo_root" "$appcast_input")"
+/usr/bin/plutil -lint "$appcast_file" >/dev/null || release_die "appcast config is not a valid plist"
+feed_url="$(release_plist_value "$appcast_file" SUFeedURL)" || release_die "appcast config is missing SUFeedURL"
+configured_public_key="$(release_plist_value "$appcast_file" SUPublicEDKey)" \
+    || release_die "appcast config is missing SUPublicEDKey"
+signed_feed="$(release_plist_value "$appcast_file" SURequireSignedFeed)" \
+    || release_die "appcast config is missing SURequireSignedFeed"
+verify_before_extraction="$(release_plist_value "$appcast_file" SUVerifyUpdateBeforeExtraction)" \
+    || release_die "appcast config is missing SUVerifyUpdateBeforeExtraction"
+release_validate_signed_appcast_metadata \
+    "$feed_url" "$configured_public_key" "$signed_feed" "$verify_before_extraction"
+appcast_config_sha256="$(/usr/bin/shasum -a 256 "$appcast_file" | /usr/bin/awk '{print $1}')"
+[[ "$appcast_config_sha256" =~ ^[0-9a-f]{64}$ ]] || release_die "could not hash appcast configuration"
+if [[ -n "${ERYLO_RELEASE_APPCAST_SHA256:-}" ]]; then
+    [[ "$appcast_config_sha256" == "$ERYLO_RELEASE_APPCAST_SHA256" ]] \
+        || release_die "appcast configuration differs from the pinned release snapshot"
+fi
+release_require_full_xcode
+
 archive="$(release_existing_path "$repo_root" "$archive_input")"
 [[ -f "$archive" && "$archive" == *.zip && ! -L "$archive" ]] || release_die "update archive must be a staged ZIP file"
 archive_identity="$(release_file_identity "$repo_root" "$archive")"
@@ -56,27 +75,8 @@ if [[ -n "${ERYLO_RELEASE_TOOLCHAIN_SHA256:-}" ]]; then
         && "$(/bin/cat "$toolchain_manifest")" == "$ERYLO_RELEASE_TOOLCHAIN_JSON" ]] \
         || release_die "build toolchain provenance differs from the pinned release toolchain"
 fi
-appcast_file="$(release_repo_file "$repo_root" "$appcast_input")"
 source_commit="$(release_source_commit "$repo_root")"
 source_tree="$(release_source_tree "$repo_root")"
-appcast_config_sha256="$(/usr/bin/shasum -a 256 "$appcast_file" | /usr/bin/awk '{print $1}')"
-[[ "$appcast_config_sha256" =~ ^[0-9a-f]{64}$ ]] || release_die "could not hash appcast configuration"
-if [[ -n "${ERYLO_RELEASE_APPCAST_SHA256:-}" ]]; then
-    [[ "$appcast_config_sha256" == "$ERYLO_RELEASE_APPCAST_SHA256" ]] \
-        || release_die "appcast configuration differs from the pinned release snapshot"
-fi
-feed_url="$(release_plist_value "$appcast_file" SUFeedURL)" || release_die "appcast config is missing SUFeedURL"
-configured_public_key="$(release_plist_value "$appcast_file" SUPublicEDKey)" \
-    || release_die "appcast config is missing SUPublicEDKey"
-signed_feed="$(release_plist_value "$appcast_file" SURequireSignedFeed)" \
-    || release_die "appcast config is missing SURequireSignedFeed"
-verify_before_extraction="$(release_plist_value "$appcast_file" SUVerifyUpdateBeforeExtraction)" \
-    || release_die "appcast config is missing SUVerifyUpdateBeforeExtraction"
-[[ "$signed_feed" == "true" && "$verify_before_extraction" == "true" ]] \
-    || release_die "appcast config must require a signed feed and pre-extraction verification"
-release_validate_feed_url "$feed_url" || release_die "appcast feed URL is invalid"
-release_validate_public_key "$configured_public_key" || release_die "appcast public key is invalid or noncanonical"
-release_require_full_xcode
 if [[ -z "$output_input" ]]; then
     output_input="${archive}.sparkle-signature.json"
 fi

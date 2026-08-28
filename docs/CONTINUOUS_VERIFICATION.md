@@ -144,6 +144,35 @@ replacement test uses explicit writer and reader gates to prove that an
 incomplete prefix is not readiness, while a separate case retains exact missed-
 readiness timeout coverage. Production timeout values are unchanged.
 
+The first hosted run of the 17-shard topology is further failure evidence, not
+a green baseline. On exact `b9e56f428af98b99908f5fa831a957cf9d52b036`,
+nightly [run 33182298163](https://github.com/eduardtomas1/Erylo/actions/runs/33182298163)
+passed the contract, both sanitizers, and 15 of 17 release shards. Hosted shard
+wall times were: `build-validation` 23s, `private-evidence` 44s,
+`evidence-boundaries` 28s, `output-boundaries` 16s, `source-boundaries` 5m15s,
+`private-symbols` 6m17s, `bundle-ticket` 6m04s, `bundle-default` 7m43s,
+`updater-vectors` 11m45s, `release-cleanup` 10m52s, `archive-core` 9m56s,
+`build-artifact` 8m40s, `symbol-validation` 7m38s, `archive-evidence` 11m06s,
+and `publication` 1m15s. `feed-vectors` reached its owned deadline in
+[job 98886359148](https://github.com/eduardtomas1/Erylo/actions/runs/33182298163/job/98886359148),
+settled its owned process group, and exited 124 after 15m11s of job wall time
+and 901.579s of owned command time. `key-vectors` completed in 10m53s in
+[job 98886359282](https://github.com/eduardtomas1/Erylo/actions/runs/33182298163/job/98886359282)
+but failed 9 of 35 assertions.
+
+That run exposed one isolated-fixture routing defect rather than invalid vector
+semantics. The counted canonical appcast values matched the updater fixture that
+had just assembled successfully, but vector assemblers omitted the compiled
+fixture arguments and therefore looked for absent production defaults under
+`.release/build`. Update signing likewise looked for default staged tools before
+reaching the appcast diagnostic or full-Xcode boundary. Meanwhile malformed
+bundle vectors paid almost the complete validator path before rejection. The
+amendment binds every isolated vector assembler to the real warnings-as-errors
+compiled fixture, validates signed appcast metadata before unrelated artifact
+work, and reuses the counted canonical assembly as the updater fixture. The
+17-shard, 548-check union and both timeout levels remain unchanged. Hosted proof
+of the amended commit is pending; local timing cannot substitute for it.
+
 Current-topology local measurements used Apple Swift 6.3.3 on an Apple silicon
 Mac. Every row below is a separate isolated shard invocation with a clean
 fixture root and a clean warnings-as-errors Swift scratch directory where the
@@ -151,29 +180,29 @@ concern requires compiled artifacts:
 
 | Shard | Checks | Local wall time |
 | --- | ---: | ---: |
-| `source-boundaries` | 114 | 170.32s |
-| `build-validation` | 34 | 4.41s |
-| `build-artifact` | 6 | 33.85s |
-| `symbol-validation` | 3 | 32.93s |
-| `private-symbols` | 2 | 33.85s |
-| `private-evidence` | 23 | 25.05s |
-| `bundle-default` | 19 | 35.07s |
-| `bundle-ticket` | 5 | 33.69s |
-| `updater-vectors` | 18 | 36.48s |
-| `output-boundaries` | 10 | 1.77s |
-| `archive-core` | 9 | 37.84s |
-| `feed-vectors` | 150 | 49.16s |
-| `key-vectors` | 35 | 39.60s |
-| `evidence-boundaries` | 14 | 4.80s |
-| `archive-evidence` | 4 | 39.50s |
-| `release-cleanup` | 18 | 5.55s |
-| `publication` | 84 | 37.06s |
+| `source-boundaries` | 114 | 167.72s |
+| `build-validation` | 34 | 4.68s |
+| `build-artifact` | 6 | 38.58s |
+| `symbol-validation` | 3 | 47.10s |
+| `private-symbols` | 2 | 61.61s |
+| `private-evidence` | 23 | 26.19s |
+| `bundle-default` | 19 | 38.00s |
+| `bundle-ticket` | 5 | 38.09s |
+| `updater-vectors` | 18 | 39.79s |
+| `output-boundaries` | 10 | 2.51s |
+| `archive-core` | 9 | 42.37s |
+| `feed-vectors` | 150 | 53.08s |
+| `key-vectors` | 35 | 40.62s |
+| `evidence-boundaries` | 14 | 5.63s |
+| `archive-evidence` | 4 | 42.75s |
+| `release-cleanup` | 18 | 6.34s |
+| `publication` | 84 | 39.02s |
 
-The composed `all` mode then passed the same 548 checks in 310.64s with a
-1.221GB maximum resident set. The counts sum mechanically to 548.
-`source-boundaries` is the longest local shard at 170.32s; among compiled
-release concerns, `feed-vectors` is longest at 49.16s. These local results
-demonstrate topology and substantial local margin,
+The composed `all` mode then passed the same 548 checks in 320.93s. This
+amendment sweep did not capture maximum resident set. The counts sum
+mechanically to 548. `source-boundaries` is the longest local shard at 167.72s;
+among compiled release concerns, `private-symbols` is longest at 61.61s. These
+local results demonstrate topology and substantial local margin,
 not hosted success: the earlier 14.67x metadata-operation multiplier makes
 hosted inference unsafe. An exact-SHA hosted matrix and its actual durations
 must therefore be recorded before independent review. Every shard retains the

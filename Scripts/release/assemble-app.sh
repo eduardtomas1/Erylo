@@ -56,6 +56,31 @@ output="$(release_output_path "$repo_root" "$output_input")"
 release_require_command git
 release_require_command ditto
 release_require_command plutil
+appcast_file=""
+feed_url=""
+public_key=""
+appcast_config_sha256=""
+if [[ -n "$appcast_input" ]]; then
+    appcast_file="$(release_repo_file "$repo_root" "$appcast_input")"
+    /usr/bin/plutil -lint "$appcast_file" >/dev/null || release_die "appcast config is not a valid plist"
+    feed_url="$(release_plist_value "$appcast_file" SUFeedURL)" \
+        || release_die "appcast config is missing SUFeedURL"
+    public_key="$(release_plist_value "$appcast_file" SUPublicEDKey)" \
+        || release_die "appcast config is missing SUPublicEDKey"
+    signed_feed="$(release_plist_value "$appcast_file" SURequireSignedFeed)" \
+        || release_die "appcast config is missing SURequireSignedFeed"
+    verify_before_extraction="$(release_plist_value "$appcast_file" SUVerifyUpdateBeforeExtraction)" \
+        || release_die "appcast config is missing SUVerifyUpdateBeforeExtraction"
+    release_validate_signed_appcast_metadata \
+        "$feed_url" "$public_key" "$signed_feed" "$verify_before_extraction"
+    appcast_config_sha256="$(/usr/bin/shasum -a 256 "$appcast_file" | /usr/bin/awk '{print $1}')"
+    [[ "$appcast_config_sha256" =~ ^[0-9a-f]{64}$ ]] \
+        || release_die "could not hash signed appcast configuration"
+    if [[ -n "${ERYLO_RELEASE_APPCAST_SHA256:-}" ]]; then
+        [[ "$appcast_config_sha256" == "$ERYLO_RELEASE_APPCAST_SHA256" ]] \
+            || release_die "appcast configuration differs from the pinned release snapshot"
+    fi
+fi
 if [[ -z "${ERYLO_RELEASE_TOOLCHAIN_JSON:-}" ]]; then
     release_capture_toolchain 0
 fi
@@ -161,23 +186,6 @@ plist="$temp_app/Contents/Info.plist"
 /usr/bin/plutil -replace LSMinimumSystemVersion -string "$minimum_system_version" "$plist"
 
 if [[ -n "$appcast_input" ]]; then
-    appcast_file="$(release_repo_file "$repo_root" "$appcast_input")"
-    /usr/bin/plutil -lint "$appcast_file" >/dev/null || release_die "appcast config is not a valid plist"
-    feed_url="$(release_plist_value "$appcast_file" SUFeedURL)" || release_die "appcast config is missing SUFeedURL"
-    public_key="$(release_plist_value "$appcast_file" SUPublicEDKey)" || release_die "appcast config is missing SUPublicEDKey"
-    signed_feed="$(release_plist_value "$appcast_file" SURequireSignedFeed)" || release_die "appcast config is missing SURequireSignedFeed"
-    verify_before_extraction="$(release_plist_value "$appcast_file" SUVerifyUpdateBeforeExtraction)" \
-        || release_die "appcast config is missing SUVerifyUpdateBeforeExtraction"
-    [[ "$signed_feed" == "true" && "$verify_before_extraction" == "true" ]] \
-        || release_die "appcast config must require a signed feed and pre-extraction verification"
-    release_validate_feed_url "$feed_url" || release_die "invalid appcast feed URL"
-    release_validate_public_key "$public_key" || release_die "invalid signed appcast public key"
-    appcast_config_sha256="$(/usr/bin/shasum -a 256 "$appcast_file" | /usr/bin/awk '{print $1}')"
-    [[ "$appcast_config_sha256" =~ ^[0-9a-f]{64}$ ]] || release_die "could not hash signed appcast configuration"
-    if [[ -n "${ERYLO_RELEASE_APPCAST_SHA256:-}" ]]; then
-        [[ "$appcast_config_sha256" == "$ERYLO_RELEASE_APPCAST_SHA256" ]] \
-            || release_die "appcast configuration differs from the pinned release snapshot"
-    fi
     /usr/bin/plutil -insert SUFeedURL -string "$feed_url" "$plist"
     /usr/bin/plutil -insert SUPublicEDKey -string "$public_key" "$plist"
     /usr/bin/plutil -insert SURequireSignedFeed -bool true "$plist"

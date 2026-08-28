@@ -65,6 +65,41 @@ abort "the shared compiled fixture must preserve release mode, target, and warni
     release_library.include?('--triple "$triple"') &&
     release_library.include?("-Xswiftc -warnings-as-errors")
 
+%w[updater-vectors feed-vectors key-vectors].each do |name|
+  body = phase_sections.fetch(name)
+  prefix = name.split("-").first
+  assembler = "#{prefix}_assembler"
+  abort "#{name} must route isolated assembly through the compiled release fixture" \
+    unless body.include?("#{assembler}+=(") &&
+      body.include?('--binary "$fixture_binary"') &&
+      body.include?('--framework "$fixture_framework"') &&
+      body.include?('--toolchain "$fixture_toolchain"') &&
+      body.include?('"${' + assembler + '[@]}"')
+end
+feed_body = phase_sections.fetch("feed-vectors")
+key_body = phase_sections.fetch("key-vectors")
+abort "feed-vectors must reuse its counted canonical assembly as the updater fixture" \
+  unless feed_body.include?('if [[ "$feed_name" == canonical ]]') &&
+    feed_body.include?('vector_app="$updater_app"')
+abort "key-vectors must reuse its counted canonical assembly as the updater fixture" \
+  unless key_body.include?('if [[ "$key_name" == canonical-32-bytes ]]') &&
+    key_body.include?('vector_app="$updater_app"')
+
+assembler_script = File.read(File.expand_path("../../Scripts/release/assemble-app.sh", __dir__))
+bundle_validator = File.read(File.expand_path("../../Scripts/release/validate-app.sh", __dir__))
+signer = File.read(File.expand_path("../../Scripts/release/sign-update.sh", __dir__))
+shared_gate = "release_validate_signed_appcast_metadata"
+abort "the assembler must reject malformed appcast metadata before toolchain or artifact work" \
+  unless assembler_script.index(shared_gate) < assembler_script.index("release_capture_toolchain")
+abort "the bundle validator must reject malformed appcast metadata before toolchain or artifact work" \
+  unless bundle_validator.index(shared_gate) < bundle_validator.index("release_configure_developer_dir")
+abort "update signing must reach the full-Xcode boundary immediately after appcast validation" \
+  unless signer.index(shared_gate) < signer.index("release_require_full_xcode") &&
+    signer.index("release_require_full_xcode") < signer.index('.release/build/arm64/release/Tools/sign_update')
+abort "the vector harness must bind malformed consumer assertions to canonical diagnostics" \
+  unless feed_body.scan("release_harness_queue_background_failure_with_stderr").length >= 3 &&
+    key_body.scan("release_harness_queue_background_failure_with_stderr").length >= 3
+
 archive_validator = File.read(File.expand_path("../../Scripts/release/validate-archive.sh", __dir__))
 abort "archive fixture equivalence is not proven after extracted-app validation" \
   unless archive_validator.include?("unless actual == expected") &&

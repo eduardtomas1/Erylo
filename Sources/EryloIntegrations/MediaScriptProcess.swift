@@ -469,15 +469,6 @@ private struct DarwinMediaPOSIXProcessSystem: MediaPOSIXProcessSystem {
         standardOutput: Int32,
         standardError: Int32
     ) throws -> pid_t {
-        var actions: posix_spawn_file_actions_t?
-        guard posix_spawn_file_actions_init(&actions) == 0 else { throw MediaScriptProcessError.launchFailed }
-        defer { posix_spawn_file_actions_destroy(&actions) }
-        guard posix_spawn_file_actions_adddup2(&actions, standardOutput, STDOUT_FILENO) == 0,
-              posix_spawn_file_actions_adddup2(&actions, standardError, STDERR_FILENO) == 0,
-              posix_spawn_file_actions_addclose(&actions, standardOutput) == 0,
-              posix_spawn_file_actions_addclose(&actions, standardError) == 0 else {
-            throw MediaScriptProcessError.launchFailed
-        }
         let storage = ([executablePath] + arguments).map { strdup($0) }
         guard storage.allSatisfy({ $0 != nil }) else {
             for pointer in storage { free(pointer) }
@@ -492,6 +483,45 @@ private struct DarwinMediaPOSIXProcessSystem: MediaPOSIXProcessSystem {
             throw MediaScriptProcessError.launchFailed
         }
         defer { for pointer in environmentStorage { free(pointer) } }
+
+        var attributes: posix_spawnattr_t?
+        guard posix_spawnattr_init(&attributes) == 0 else {
+            throw MediaScriptProcessError.launchFailed
+        }
+        guard posix_spawnattr_setflags(
+            &attributes,
+            Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+        ) == 0 else {
+            _ = posix_spawnattr_destroy(&attributes)
+            throw MediaScriptProcessError.launchFailed
+        }
+
+        // Darwin's close-on-exec default makes the file actions below the
+        // complete descriptor allowlist for the child. In particular, host
+        // files, sockets, and locks that forgot FD_CLOEXEC cannot cross this
+        // process boundary.
+        var actions: posix_spawn_file_actions_t?
+        guard posix_spawn_file_actions_init(&actions) == 0 else {
+            _ = posix_spawnattr_destroy(&attributes)
+            throw MediaScriptProcessError.launchFailed
+        }
+        guard posix_spawn_file_actions_adddup2(
+            &actions,
+            standardOutput,
+            STDOUT_FILENO
+        ) == 0,
+        posix_spawn_file_actions_adddup2(
+            &actions,
+            standardError,
+            STDERR_FILENO
+        ) == 0,
+        posix_spawn_file_actions_addclose(&actions, standardOutput) == 0,
+        posix_spawn_file_actions_addclose(&actions, standardError) == 0 else {
+            _ = posix_spawn_file_actions_destroy(&actions)
+            _ = posix_spawnattr_destroy(&attributes)
+            throw MediaScriptProcessError.launchFailed
+        }
+
         var argv = storage + [nil]
         var environment = environmentStorage + [nil]
         var processIdentifier: pid_t = 0
@@ -501,14 +531,28 @@ private struct DarwinMediaPOSIXProcessSystem: MediaPOSIXProcessSystem {
                     &processIdentifier,
                     executablePath,
                     &actions,
-                    nil,
+                    &attributes,
                     buffer.baseAddress,
                     environmentBuffer.baseAddress
                 )
             }
         }
+        let actionsDestroyResult = posix_spawn_file_actions_destroy(&actions)
+        let attributesDestroyResult = posix_spawnattr_destroy(&attributes)
         guard result == 0 else { throw MediaScriptProcessError.launchFailed }
+        guard actionsDestroyResult == 0, attributesDestroyResult == 0 else {
+            Self.hardStopAndReap(processIdentifier)
+            throw MediaScriptProcessError.launchFailed
+        }
         return processIdentifier
+    }
+
+    private static func hardStopAndReap(_ processIdentifier: pid_t) {
+        _ = Darwin.kill(processIdentifier, SIGKILL)
+        var status: Int32 = 0
+        while Darwin.waitpid(processIdentifier, &status, 0) < 0 {
+            if errno != EINTR { return }
+        }
     }
 
     func sendSignal(_ signal: Int32, to processIdentifier: pid_t) -> Int32 {

@@ -170,8 +170,49 @@ bundle vectors paid almost the complete validator path before rejection. The
 amendment binds every isolated vector assembler to the real warnings-as-errors
 compiled fixture, validates signed appcast metadata before unrelated artifact
 work, and reuses the counted canonical assembly as the updater fixture. The
-17-shard, 548-check union and both timeout levels remain unchanged. Hosted proof
-of the amended commit is pending; local timing cannot substitute for it.
+17-shard, 548-check union and both timeout levels remained unchanged. Exact-SHA
+hosted proof was still required because local timing cannot substitute for it.
+
+The next exact-SHA nightly exposed one remaining shared-parent race rather than
+a shard-topology failure. On exact
+`89231cd039470a2bbd6ddcf88bb997be6b7b7d9e`, nightly
+[run 33188560029](https://github.com/eduardtomas1/Erylo/actions/runs/33188560029)
+passed the contract, both sanitizers, and 16 of 17 release shards. Hosted shard
+wall times were: `bundle-ticket` 6m18s, `updater-vectors` 7m31s,
+`bundle-default` 6m15s, `source-boundaries` 3m56s, `build-artifact` 10m02s,
+`archive-evidence` 14m24s, `output-boundaries` 23s, `archive-core` 11m59s,
+`key-vectors` 8m09s, `build-validation` 22s, `symbol-validation` 9m25s,
+`feed-vectors` 13m19s, `publication` 1m18s, `evidence-boundaries` 31s,
+`release-cleanup` 10m25s, and `private-evidence` 47s. The sole failure,
+[`private-symbols`](https://github.com/eduardtomas1/Erylo/actions/runs/33188560029/job/98907861455),
+completed its product build in 33.48s, then two concurrent symbol archivers both
+observed a missing descriptor-anchored `tmp` parent. One creator won; the other
+reported fatal `EEXIST`, while its peer reported `ENOENT` reopening `tmp`.
+
+The filesystem amendment uses the existing `mkdirat` allow-exists result at
+both descriptor-anchored parent-creation sites, then immediately reopens the
+observed child with `O_DIRECTORY|O_NOFOLLOW` and applies the existing ownership
+and 0700-mode validation. It adds no retry loop or tolerance for a symlink,
+wrong owner, wrong type, or failed reopen. A test-only gate releases two real
+helpers only after both report the same missing `tmp`; the existing counted
+filesystem assertion proves distinct 0700 children under one real 0700 parent,
+no external writes, and safe anchored cleanup. The existing parent-swap and
+symlink fail-closed assertions remain alongside it.
+
+The same hosted run also showed that green was not sufficient for
+[`archive-evidence`](https://github.com/eduardtomas1/Erylo/actions/runs/33188560029/job/98907861499):
+its phase completed at elapsed 840s, leaving only 60s of the owned command
+budget. The exact log records default app assembly at 16:14:20, an uncounted
+default archive creation plus its internal validation completing at 16:16:36,
+the counted post-staple validation at 16:20:59, and a second validation used
+only for the predictable-path symlink assertion before phase completion at
+16:23:13. The amendment removes that uncounted archive and combines the planted
+symlink defense with the already-counted post-staple validation. Separate
+counted assertions still prove that the planted symlink and its external target
+are unchanged; pre-staple rejection, post-staple acceptance, archive production,
+and extracted-app equivalence remain covered. This removes about 4m29s of work
+measured directly in the hosted critical path without relaxing either timeout.
+Exact-SHA hosted proof of the resulting commit is pending.
 
 Current-topology local measurements used Apple Swift 6.3.3 on an Apple silicon
 Mac. Every row below is a separate isolated shard invocation with a clean
@@ -180,28 +221,31 @@ concern requires compiled artifacts:
 
 | Shard | Checks | Local wall time |
 | --- | ---: | ---: |
-| `source-boundaries` | 114 | 167.72s |
-| `build-validation` | 34 | 4.68s |
-| `build-artifact` | 6 | 38.58s |
-| `symbol-validation` | 3 | 47.10s |
-| `private-symbols` | 2 | 61.61s |
-| `private-evidence` | 23 | 26.19s |
-| `bundle-default` | 19 | 38.00s |
-| `bundle-ticket` | 5 | 38.09s |
-| `updater-vectors` | 18 | 39.79s |
-| `output-boundaries` | 10 | 2.51s |
-| `archive-core` | 9 | 42.37s |
-| `feed-vectors` | 150 | 53.08s |
-| `key-vectors` | 35 | 40.62s |
-| `evidence-boundaries` | 14 | 5.63s |
-| `archive-evidence` | 4 | 42.75s |
-| `release-cleanup` | 18 | 6.34s |
-| `publication` | 84 | 39.02s |
+| `source-boundaries` | 114 | 163s |
+| `build-validation` | 34 | 6s |
+| `build-artifact` | 6 | 34s |
+| `symbol-validation` | 3 | 32s |
+| `private-symbols` | 2 | 37s |
+| `private-evidence` | 23 | 26s |
+| `bundle-default` | 19 | 48s |
+| `bundle-ticket` | 5 | 50s |
+| `updater-vectors` | 18 | 46s |
+| `output-boundaries` | 10 | 4s |
+| `archive-core` | 9 | 73s |
+| `feed-vectors` | 150 | 57s |
+| `key-vectors` | 35 | 68s |
+| `evidence-boundaries` | 14 | 7s |
+| `archive-evidence` | 4 | 41s |
+| `release-cleanup` | 18 | 6s |
+| `publication` | 84 | 40s |
 
-The composed `all` mode then passed the same 548 checks in 320.93s. This
-amendment sweep did not capture maximum resident set. The counts sum
-mechanically to 548. `source-boundaries` is the longest local shard at 167.72s;
-among compiled release concerns, `private-symbols` is longest at 61.61s. These
+The composed `all` mode then passed the same 548 checks in 371.71s with a
+1,137,065,984-byte maximum resident set. The counts sum mechanically to 548.
+The deterministic two-creator filesystem regression also passed ten consecutive
+34-check `build-validation` runs in 5–6s each, and the process-supervisor suite
+passed five consecutive 67-check runs in 13–14s each. `source-boundaries` is the
+longest local shard at 163s; among compiled release concerns, `archive-core` is
+longest at 73s. These
 local results demonstrate topology and substantial local margin,
 not hosted success: the earlier 14.67x metadata-operation multiplier makes
 hosted inference unsafe. An exact-SHA hosted matrix and its actual durations

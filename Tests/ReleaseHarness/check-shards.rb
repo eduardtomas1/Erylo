@@ -104,9 +104,27 @@ archive_validator = File.read(File.expand_path("../../Scripts/release/validate-a
 abort "archive fixture equivalence is not proven after extracted-app validation" \
   unless archive_validator.include?("unless actual == expected") &&
     archive_validator.include?("validate-app.sh\" \"$extracted_app")
+archive_evidence_body = phase_sections.fetch("archive-evidence")
+archive_evidence_fixture = harness.match(
+  /^prepare_archive_evidence_fixtures\(\) \{\n(.*?)^\}/m
+)&.captures&.first || abort("archive-evidence fixture is missing")
+abort "archive-evidence must not build and validate an uncounted duplicate archive" \
+  if archive_evidence_fixture.include?("archive-app.sh")
+abort "archive-evidence must combine the predictable-symlink defense with counted post-staple validation" \
+  unless archive_evidence_body.include?('set -- --post-staple --archive "$1" --app "$2"') &&
+    archive_evidence_body.include?("archive validation leaves the planted predictable symlink untouched")
 symbol_archiver = File.read(File.expand_path("../../Scripts/release/archive-symbols.sh", __dir__))
 abort "symbol fixture equivalence is not proven after source dSYM validation" \
   unless symbol_archiver.include?("symbol archive differs from the validated dSYM")
+filesystem_helper = File.read(File.expand_path("../../Scripts/release/fs-helper.rb", __dir__))
+build_validation_body = phase_sections.fetch("build-validation")
+abort "descriptor-anchored parent creation must reopen and validate a concurrent winner" \
+  unless filesystem_helper.include?('mkdirat(current.fileno, value, 0o700, allow_exists: true)') &&
+    filesystem_helper.include?('mkdirat(parent_fd, name, mode, allow_exists: true)')
+abort "the concurrent temp-parent regression must gate two helpers after the same missing observation" \
+  unless build_validation_body.scan("ERYLO_RELEASE_FS_TEST_PAUSE_STAGE=before-create-directory-tmp").length == 2 &&
+    build_validation_body.include?('ERYLO_RELEASE_FS_TEST_GATE="$concurrent_create_gate"') &&
+    build_validation_body.include?("anchored directory creation repairs unsafe modes and admits concurrent creators")
 supervisor = File.read(File.expand_path("process-supervisor.rb", __dir__))
 supervisor_tests = File.read(File.expand_path("process-supervisor-tests.sh", __dir__))
 gate_name = "ERYLO_RELEASE_SUPERVISOR_TEST_READINESS_GATE"

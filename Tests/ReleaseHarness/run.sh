@@ -285,10 +285,6 @@ prepare_evidence_metadata_fixtures() {
 prepare_archive_evidence_fixtures() {
     prepare_default_bundle_fixture
     prepare_ticket_fixture
-    archive_one="$test_root/archive-one/Erylo.zip"
-    Scripts/release/archive-app.sh --app "$default_app" --output "$archive_one" \
-        --source-date-epoch 1700000000
-    hash_one="$(shasum -a 256 "$archive_one" | awk '{print $1}')"
 }
 
 prepare_release_cleanup_fixture() {
@@ -1398,14 +1394,78 @@ done
 wrong_mode_dir="$test_root/wrong-mode-parent"
 release_make_directory "$repo_root" "$wrong_mode_dir" >/dev/null
 /bin/chmod 0777 "$wrong_mode_dir"
-check "anchored directory creation repairs an unsafe pre-existing mode under umask 000" bash -c '
+
+concurrent_create_repo="$external_test_root/concurrent-create-repo"
+concurrent_create_external="$external_test_root/concurrent-create-external"
+/bin/mkdir "$concurrent_create_repo" "$concurrent_create_external"
+concurrent_create_repo="$(cd "$concurrent_create_repo" && pwd -P)"
+concurrent_create_external="$(cd "$concurrent_create_external" && pwd -P)"
+printf 'concurrent-create-external-sentinel\n' > "$concurrent_create_external/sentinel"
+/usr/bin/ruby Scripts/release/fs-helper.rb make-directory \
+    "$concurrent_create_repo" .release/gates >/dev/null
+concurrent_create_gate="$concurrent_create_repo/.release/gates/release"
+concurrent_create_one_log="$test_root/logs/concurrent-create-one.err"
+concurrent_create_two_log="$test_root/logs/concurrent-create-two.err"
+concurrent_create_one_output="$test_root/logs/concurrent-create-one.out"
+concurrent_create_two_output="$test_root/logs/concurrent-create-two.out"
+release_harness_start_background concurrent-create-one \
+    "$release_harness_background_timeout" /usr/bin/env \
+    ERYLO_RELEASE_FS_TESTING=1 \
+    ERYLO_RELEASE_FS_TEST_PAUSE_STAGE=before-create-directory-tmp \
+    ERYLO_RELEASE_FS_TEST_GATE="$concurrent_create_gate" \
+    /usr/bin/ruby Scripts/release/fs-helper.rb make-temp \
+        "$concurrent_create_repo" concurrent-one \
+    >"$concurrent_create_one_output" 2>"$concurrent_create_one_log"
+concurrent_create_one_pid="$release_harness_background_pid"
+concurrent_create_one_state="$release_harness_background_state"
+release_harness_start_background concurrent-create-two \
+    "$release_harness_background_timeout" /usr/bin/env \
+    ERYLO_RELEASE_FS_TESTING=1 \
+    ERYLO_RELEASE_FS_TEST_PAUSE_STAGE=before-create-directory-tmp \
+    ERYLO_RELEASE_FS_TEST_GATE="$concurrent_create_gate" \
+    /usr/bin/ruby Scripts/release/fs-helper.rb make-temp \
+        "$concurrent_create_repo" concurrent-two \
+    >"$concurrent_create_two_output" 2>"$concurrent_create_two_log"
+concurrent_create_two_pid="$release_harness_background_pid"
+concurrent_create_two_state="$release_harness_background_state"
+wait_for_fs_test_pause "$concurrent_create_one_log" "$concurrent_create_one_pid" \
+    "$concurrent_create_one_state" concurrent-create-one
+wait_for_fs_test_pause "$concurrent_create_two_log" "$concurrent_create_two_pid" \
+    "$concurrent_create_two_state" concurrent-create-two
+printf 'release\n' > "$concurrent_create_gate"
+/bin/chmod 0600 "$concurrent_create_gate"
+release_harness_require_background_success "$concurrent_create_one_pid" \
+    "$concurrent_create_one_state" concurrent-create-one
+release_harness_require_background_success "$concurrent_create_two_pid" \
+    "$concurrent_create_two_state" concurrent-create-two
+concurrent_create_one="$(<"$concurrent_create_one_output")"
+concurrent_create_two="$(<"$concurrent_create_two_output")"
+
+check "anchored directory creation repairs unsafe modes and admits concurrent creators" bash -c '
+    set -euo pipefail
     umask 000
     source Scripts/release/lib.sh
     release_make_directory "$1" "$2/child" >/dev/null
     [[ "$(/usr/bin/stat -f "%Lp" "$1/.release")" == 700 ]]
     [[ "$(/usr/bin/stat -f "%Lp" "$2")" == 700 ]]
     [[ "$(/usr/bin/stat -f "%Lp" "$2/child")" == 700 ]]
-  ' _ "$repo_root" "$wrong_mode_dir"
+    [[ "$(/usr/bin/stat -f "%Lp" "$3/.release")" == 700 ]]
+    [[ -d "$3/.release/tmp" && ! -L "$3/.release/tmp" ]]
+    [[ "$(/usr/bin/stat -f "%Lp" "$3/.release/tmp")" == 700 ]]
+    [[ "$4" != "$5" ]]
+    case "$4" in "$3/.release/tmp/"*) ;; *) exit 1 ;; esac
+    case "$5" in "$3/.release/tmp/"*) ;; *) exit 1 ;; esac
+    [[ -d "$4" && ! -L "$4" && "$(/usr/bin/stat -f "%Lp" "$4")" == 700 ]]
+    [[ -d "$5" && ! -L "$5" && "$(/usr/bin/stat -f "%Lp" "$5")" == 700 ]]
+    [[ "$(/usr/bin/find "$6" -mindepth 1 -maxdepth 1 -print | /usr/bin/wc -l | /usr/bin/tr -d " ")" == 1 ]]
+    /usr/bin/grep -Fxq concurrent-create-external-sentinel "$6/sentinel"
+    /usr/bin/ruby Scripts/release/fs-helper.rb remove "$3" "$4" any
+    /usr/bin/ruby Scripts/release/fs-helper.rb remove "$3" "$5" any
+    /bin/rm -f -- "$3/.release/gates/release"
+    /bin/rmdir "$3/.release/gates" "$3/.release/tmp" "$3/.release" "$3"
+    [[ ! -e "$4" && ! -e "$5" ]]
+  ' _ "$repo_root" "$wrong_mode_dir" "$concurrent_create_repo" \
+    "$concurrent_create_one" "$concurrent_create_two" "$concurrent_create_external"
 umask_temp="$(bash -c 'umask 022; source Scripts/release/lib.sh; release_make_temp_dir "$1" umask-fixture' _ "$repo_root")"
 check "release temporary directories remain 0700 under caller umask 022" \
     test "$(/usr/bin/stat -f '%Lp' "$umask_temp")" = 700
@@ -2633,22 +2693,22 @@ COPYFILE_DISABLE=1 /usr/bin/ditto "$ticket_app" "$ticket_archive_root/Erylo.app"
 )
 expect_failure "pre-staple archive validation rejects Contents/CodeResources" pre-staple-ticket-archive \
     Scripts/release/validate-archive.sh --archive "$ticket_archive" --app "$ticket_app"
-check "post-staple archive validation permits the one regular ticket file" \
-    Scripts/release/validate-archive.sh --post-staple --archive "$ticket_archive" --app "$ticket_app"
-
 archive_entries_external="$external_test_root/archive-entries-target.txt"
 printf 'archive-entries-sentinel\n' > "$archive_entries_external"
 archive_entries_path_record="$test_root/archive-entries-path.txt"
-check "archive validation ignores a planted predictable final symlink" bash -c '
+check "post-staple archive validation permits the ticket while ignoring a predictable symlink" bash -c '
     planted=".release/tmp/archive-entries.$$.txt"
     /bin/ln -s "$3" "$planted"
     printf "%s\n" "$planted" > "$4"
-    set -- --archive "$1" --app "$2"
+    set -- --post-staple --archive "$1" --app "$2"
     source Scripts/release/validate-archive.sh >/dev/null
-  ' _ "$archive_one" "$default_app" "$archive_entries_external" "$archive_entries_path_record"
+  ' _ "$ticket_archive" "$ticket_app" "$archive_entries_external" "$archive_entries_path_record"
+planted_entries_path="$(<"$archive_entries_path_record")"
+check "archive validation leaves the planted predictable symlink untouched" bash -c '
+    [[ -L "$1" && "$(/usr/bin/readlink "$1")" == "$2" ]]
+  ' _ "$planted_entries_path" "$archive_entries_external"
 check "archive entry validation leaves the external symlink target unchanged" \
     /usr/bin/grep -Fxq archive-entries-sentinel "$archive_entries_external"
-planted_entries_path="$(<"$archive_entries_path_record")"
 /bin/rm -f -- "$planted_entries_path"
 
 fi

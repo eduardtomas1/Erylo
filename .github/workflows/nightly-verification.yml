@@ -1,0 +1,50 @@
+name: Nightly exhaustive verification
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# Nightly verification never receives write access or release credentials.
+permissions: {}
+
+concurrency:
+  group: nightly-verification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-harness:
+    name: Deterministic release harness
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run exhaustive deterministic release harness
+        run: bash Tests/ReleaseHarness/run.sh
+
+  sanitizer:
+    name: Sanitizer / ${{ matrix.sanitizer }}
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer:
+          - address
+          - thread
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and run every Swift harness with ${{ matrix.sanitizer }} sanitizer
+        run: .github/scripts/run-ci-shard.sh sanitizer "${{ matrix.sanitizer }}"

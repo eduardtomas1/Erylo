@@ -1497,8 +1497,39 @@ private final class MediaHarness {
         check(exitOne.exitCode == 1, "process runner decodes wait status into an exit code")
 
         let collisionDescriptorsBefore = openFileDescriptorCount()
+        let inheritedDescriptorSentinels = try? MediaInheritedDescriptorSentinels(
+            minimumDescriptors: [9, 512]
+        )
+        let inheritedDescriptors = inheritedDescriptorSentinels?.descriptors ?? []
+        check(
+            inheritedDescriptors.count == 2
+                && inheritedDescriptors[0] >= 9
+                && inheritedDescriptors[1] >= 512
+                && inheritedDescriptors.allSatisfy { descriptor in
+                    let flags = fcntl(descriptor, F_GETFD)
+                    return flags >= 0 && flags & FD_CLOEXEC == 0
+                },
+            "fd-boundary regression opens unrelated low and high inheritable sentinels"
+        )
+        let collisionDescriptorsWithSentinels = openFileDescriptorCount()
+        var directDescriptorAuditIsSafe = false
+        do {
+            let result = try await normalRunner.run(
+                arguments: [MediaProcessHelper.flag, "fd-audit"],
+                operationID: MediaOperationID(),
+                limits: normalLimits
+            )
+            directDescriptorAuditIsSafe = result.exitCode == 23
+                && result.standardOutput == Data("stdout|fds=0".utf8)
+                && result.standardError == Data("stderr".utf8)
+        } catch {}
+        check(
+            directDescriptorAuditIsSafe,
+            "spawn descriptor allowlist preserves exact output and exit decoding"
+        )
+
         var collisionRunsAreSafe = true
-        for mask in ["0", "1", "2", "01", "02", "12", "012"] {
+        for mask in ["", "0", "1", "2", "01", "02", "12", "012"] {
             do {
                 let result = try await normalRunner.run(
                     arguments: [MediaProcessHelper.flag, "stdio-collision", mask],
@@ -1515,16 +1546,21 @@ private final class MediaHarness {
         }
         check(
             collisionRunsAreSafe,
-            "closed or remapped host stdio cannot collide with child pipe actions"
+            "closed or remapped host stdio cannot collide or leak unrelated descriptors"
         )
-        let collisionDescriptorsAfter = openFileDescriptorCount()
+        let collisionDescriptorsAfterRuns = openFileDescriptorCount()
         let collisionProcesses = await normalRunner.activeProcessCount
         let collisionReaders = await normalRunner.activeReaderCount
         check(
-            collisionDescriptorsAfter == collisionDescriptorsBefore
+            collisionDescriptorsAfterRuns == collisionDescriptorsWithSentinels
                 && collisionProcesses == 0
                 && collisionReaders == 0,
-            "all low-descriptor collision runs close pipes, readers, and processes"
+            "all fd-boundary runs preserve host sentinels and settle pipes, readers, and processes"
+        )
+        inheritedDescriptorSentinels?.closeAll()
+        check(
+            openFileDescriptorCount() == collisionDescriptorsBefore,
+            "fd-boundary regression restores the exact host descriptor count"
         )
         await normalRunner.cancel(normalID)
         let normalRemaining = await normalRunner.activeProcessCount
@@ -3079,7 +3115,7 @@ private enum MediaProcessHelper {
                 _ = Darwin.usleep(1_000)
             }
         case "fd-audit":
-            let inherited = (STDERR_FILENO + 1 ..< 256).filter {
+            let inherited = (STDERR_FILENO + 1 ..< Darwin.getdtablesize()).filter {
                 fcntl($0, F_GETFD) >= 0
             }
             output.write(Data("stdout|fds=\(inherited.count)".utf8))
@@ -3219,9 +3255,51 @@ private func mediaHelperExecutableURL() -> URL {
     ).standardizedFileURL
 }
 
+private final class MediaInheritedDescriptorSentinels {
+    private(set) var descriptors: [Int32] = []
+
+    init(minimumDescriptors: [Int32]) throws {
+        let sourceDescriptor = Darwin.open("/dev/null", O_RDONLY)
+        guard sourceDescriptor >= 0 else { throw MediaDescriptorSentinelError.setupFailed }
+        defer { _ = Darwin.close(sourceDescriptor) }
+
+        do {
+            for minimumDescriptor in minimumDescriptors {
+                let descriptor = fcntl(sourceDescriptor, F_DUPFD, minimumDescriptor)
+                guard descriptor >= minimumDescriptor else {
+                    throw MediaDescriptorSentinelError.setupFailed
+                }
+                descriptors.append(descriptor)
+
+                let flags = fcntl(descriptor, F_GETFD)
+                guard flags >= 0,
+                      fcntl(descriptor, F_SETFD, flags & ~FD_CLOEXEC) == 0 else {
+                    throw MediaDescriptorSentinelError.setupFailed
+                }
+            }
+        } catch {
+            closeAll()
+            throw error
+        }
+    }
+
+    deinit { closeAll() }
+
+    func closeAll() {
+        for descriptor in descriptors {
+            _ = Darwin.close(descriptor)
+        }
+        descriptors.removeAll(keepingCapacity: false)
+    }
+}
+
+private enum MediaDescriptorSentinelError: Error {
+    case setupFailed
+}
+
 private func openFileDescriptorCount() -> Int {
-    (0 ..< 1_024).reduce(into: 0) { count, descriptor in
-        if fcntl(Int32(descriptor), F_GETFD) >= 0 {
+    (0 ..< Darwin.getdtablesize()).reduce(into: 0) { count, descriptor in
+        if fcntl(descriptor, F_GETFD) >= 0 {
             count += 1
         }
     }

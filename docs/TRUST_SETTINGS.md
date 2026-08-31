@@ -38,12 +38,13 @@ the actual Focus Timer, Battery, and Volume composition. The production
 `Info.plist` has no privacy usage-description key and the reviewed entitlement
 file is empty. Repository, assembly, bundle, and signed-entitlement validation
 reject declaration drift. The policy also binds canonical source-tree hashes for
-the capability-bearing Glance and media modules; a helper or source addition in
-either module therefore requires an explicit policy review. Mounting Calendar or
-media requires an allowlist, declaration, and reviewed-module hash update in the
-same change. Production composition must use the reviewed media adapters; direct
-script request, executor, runner, or protocol seams are rejected even though the
-media module exposes them for library clients.
+the complete production composition and the capability-bearing Glance and media
+modules; a helper, consumer, or source addition therefore requires an explicit
+policy review. Mounting Calendar or media requires an allowlist, declaration,
+and reviewed-source hash update in the same change. Production composition must
+use the reviewed media adapters; direct script request, executor, runner, or
+protocol seams are rejected even though the media module exposes them for library
+clients.
 
 Opening or loading the settings view only reads settings and `SMAppService` status. It never constructs a provider, starts work, or asks permission.
 

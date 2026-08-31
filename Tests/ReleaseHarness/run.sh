@@ -14,7 +14,7 @@ release_capture_toolchain 0
 release_harness_shard="${1:-all}"
 release_harness_manifest="Tests/ReleaseHarness/shards.tsv"
 if [[ "$release_harness_shard" == all ]]; then
-    release_harness_expected_checks=587
+    release_harness_expected_checks=593
 else
     release_harness_expected_checks="$(/usr/bin/awk -F '\t' -v shard="$release_harness_shard" \
         '$1 == shard { print $2 }' "$release_harness_manifest")"
@@ -118,6 +118,40 @@ expect_failure_with_stderr() {
         printf 'FAIL: %s (unexpected failure boundary)\n' "$message" >&2
         failure_count=$((failure_count + 1))
     fi
+}
+
+refresh_permission_composition_digest() {
+    /usr/bin/ruby -rjson -rdigest -rpathname -e '
+      root = Pathname.new(ARGV.fetch(0)).realpath
+      policy_path = root.join("Config/ProductionCapabilities.json")
+      policy = JSON.parse(File.read(policy_path))
+      paths = File.readlines(root.join("Config/ReleaseCompilerInputs.txt"), chomp: true)
+        .select { |path| path != "Package.swift" && path.end_with?(".swift") }
+        .map { |path| root.join(path) }
+      %w[Sources/EryloApp Sources/EryloAppRuntime].each do |directory|
+        Dir.glob(root.join(directory, "**/*.swift")).sort.each { |path| paths << Pathname.new(path) }
+      end
+      reviewed = %w[Sources/EryloGlance Sources/EryloIntegrations].flat_map do |directory|
+        Dir.glob(root.join(directory, "**/*.swift")).map { |path| Pathname.new(path).realpath.to_s }
+      end.to_h { |path| [path, true] }
+      paths = paths.map(&:realpath).uniq.reject { |path| reviewed.key?(path.to_s) }
+      digest = Digest::SHA256.new
+      paths.sort_by(&:to_s).each do |path|
+        relative = path.relative_path_from(root).to_s
+        bytes = File.binread(path)
+        digest.update([relative.bytesize].pack("Q>"))
+        digest.update(relative.b)
+        digest.update([bytes.bytesize].pack("Q>"))
+        digest.update(bytes)
+      end
+      policy["productionCompositionSourceSHA256"] = digest.hexdigest
+      File.write(policy_path, JSON.pretty_generate(policy) + "\n")
+    ' "$1"
+}
+
+typecheck_then_validate_permission_fixture() {
+    /usr/bin/xcrun swiftc -typecheck -swift-version 6 "$1"
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb repository "$2"
 }
 
 release_set_digest() {
@@ -2043,7 +2077,7 @@ permission_manifest_backup="$test_root/ProductionCapabilities.valid.swift"
 expect_failure_with_stderr \
     "regex literals cannot impersonate the runtime capability manifest" \
     regex-production-capability-manifest \
-    "production mounted-utility declaration must be one static let" \
+    "regex literals are forbidden in production composition" \
     /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
         repository "$permission_policy_fixture"
 /bin/cp "$permission_manifest_backup" "$permission_manifest"
@@ -2052,19 +2086,47 @@ expect_failure_with_stderr \
     data = File.binread(path)
     canonical = "package static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer, .volume]"
     replacement = <<~SWIFT.chomp
-      #if false
-          #{canonical}
-          package static let inactiveSentinel = 0
+      package static var mountedUtilities: Set<ProductionUtility> { #if os(macOS)
+          [.battery, .focusTimer, .volume]
+          #else
+          [.battery, .volume]
           #endif
-          package static var mountedUtilities: Set<ProductionUtility> { [.battery, .volume] }
+      }
     SWIFT
     data.sub!(canonical, replacement) or abort("typed manifest fixture marker missing")
     File.binwrite(path, data)
   ' "$permission_manifest"
 expect_failure_with_stderr \
-    "inactive conditional declarations cannot impersonate the runtime capability manifest" \
+    "inline conditional declarations cannot impersonate the runtime capability manifest" \
     inactive-production-capability-manifest \
-    "production mounted-utility declaration" \
+    "conditional compilation is forbidden" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_manifest_backup" "$permission_manifest"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    enum_marker = "package enum ProductionCapabilities {"
+    canonical = "package static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer, .volume]"
+    decoy = <<~SWIFT.chomp
+      private enum ValidatorScope {
+          enum ProductionCapabilities {
+              static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer, .volume]
+          }
+      }
+
+      package typealias ProductionCapabilities = RuntimeCapabilities
+      package enum RuntimeCapabilities {
+    SWIFT
+    data.sub!(enum_marker, decoy) or abort("capability enum fixture marker missing")
+    data.sub!(canonical, "package static let mountedUtilities: Set<ProductionUtility> = [.battery, .calendar, .focusTimer, .volume]") \
+      or abort("typed manifest fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_manifest"
+expect_failure_with_stderr \
+    "a nested canonical enum and top-level alias cannot impersonate the runtime manifest" \
+    out-of-scope-production-capability-manifest \
+    "must contain one ProductionCapabilities enum" \
     /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
         repository "$permission_policy_fixture"
 /bin/cp "$permission_manifest_backup" "$permission_manifest"
@@ -2083,6 +2145,39 @@ expect_failure_with_stderr \
     /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
         repository "$permission_policy_fixture"
 /bin/cp "$permission_manifest_backup" "$permission_manifest"
+permission_control_plane="$permission_policy_fixture/Sources/EryloAppRuntime/ApplicationControlPlane.swift"
+permission_control_plane_backup="$test_root/ApplicationControlPlane.valid.swift"
+/bin/cp "$permission_control_plane" "$permission_control_plane_backup"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    canonical = "Set(mountedUtilities.compactMap(\\.settingsModule))"
+    data.sub!(canonical, "Set([EryloModule.calendar])") \
+      or abort("settings-module fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_manifest"
+expect_failure_with_stderr \
+    "the reviewed source digest binds the mounted-utility settings projection" \
+    unreviewed-settings-projection \
+    "production composition source digest differs" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_manifest_backup" "$permission_manifest"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    canonical = "availableModules: ProductionCapabilities.settingsModules,"
+    data.sub!(canonical, "availableModules: [.calendar],") \
+      or abort("production available-modules fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_control_plane"
+expect_failure_with_stderr \
+    "the reviewed source digest binds the production settings consumer" \
+    unreviewed-settings-consumer \
+    "production composition source digest differs" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_control_plane_backup" "$permission_control_plane"
 bracket_permission_fixture="$test_root/production-permission-policy[review]"
 /usr/bin/ditto "$permission_policy_fixture" "$bracket_permission_fixture"
 check "permission validation treats glob metacharacters in a valid root literally" \
@@ -2093,7 +2188,7 @@ permission_policy_backup="$test_root/ProductionCapabilities.valid.json"
 /usr/bin/ruby -e '
     path = ARGV.fetch(0)
     data = File.binread(path)
-    data.sub!(%Q{"schemaVersion": 2}, %Q{"schemaVersion": 0,\n  "schemaVersion": 2}) \
+    data.sub!(%Q{"schemaVersion": 3}, %Q{"schemaVersion": 0,\n  "schemaVersion": 3}) \
       or abort("schema fixture marker missing")
     File.binwrite(path, data)
   ' "$permission_policy_fixture/Config/ProductionCapabilities.json"
@@ -2107,7 +2202,7 @@ expect_failure_with_stderr \
 /usr/bin/ruby -e '
     path = ARGV.fetch(0)
     data = File.binread(path)
-    data.sub!(%Q{"schemaVersion": 2}, %Q{"schemaVersion": 2.0}) \
+    data.sub!(%Q{"schemaVersion": 3}, %Q{"schemaVersion": 3.0}) \
       or abort("schema fixture marker missing")
     File.binwrite(path, data)
   ' "$permission_policy_fixture/Config/ProductionCapabilities.json"
@@ -2125,6 +2220,7 @@ printf '\n// CalendarGlanceProvider and EventKitCalendarEventSource are inert pr
     "$permission_runtime"
 printf 'private let inertCalendarCopy = "CalendarGlanceProvider EventKitCalendarEventSource"\n' >> \
     "$permission_runtime"
+refresh_permission_composition_digest "$permission_policy_fixture"
 check "comments and strings cannot impersonate a mounted utility" \
     /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
         repository "$permission_policy_fixture"
@@ -2143,6 +2239,7 @@ expect_failure_with_stderr \
     /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
         repository "$permission_policy_fixture"
 /bin/cp "$permission_runtime_backup" "$permission_runtime"
+refresh_permission_composition_digest "$permission_policy_fixture"
 printf '\n#if os(macOS)\nprivate func conditionalCalendarWrapperBypass() {\n' >> \
     "$permission_runtime"
 printf '    _ = EryloGlance.self\n}\n#endif\n' >> "$permission_runtime"
@@ -2152,6 +2249,79 @@ expect_failure_with_stderr \
     "mounted utility set differs from the reviewed allowlist" \
     /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
         repository "$permission_policy_fixture"
+/bin/cp "$permission_runtime_backup" "$permission_runtime"
+conditional_regex_typecheck="$test_root/typechecked-conditional-regex.swift"
+printf '%s\n' \
+    'private let activityBroker = 0' \
+    'private struct EryloGlance {' \
+    '    let calendar = 0' \
+    '    init(broker: Int) { _ = broker }' \
+    '}' \
+    '#if os(macOS)' \
+    'private func typecheckedConditionalRegexBypass() {' \
+    '    switch /"/ {' \
+    '    case _:' \
+    '        let glance = EryloGlance(broker: activityBroker)' \
+    '        _ = glance.calendar' \
+    '    }' \
+    '}' \
+    '#endif' > "$conditional_regex_typecheck"
+printf '%s\n' \
+    '#if os(macOS)' \
+    'private func conditionalRegexCalendarWrapperBypass() {' \
+    '    switch /"/ {' \
+    '    case _:' \
+    '        let glance = EryloGlance(broker: activityBroker)' \
+    '        _ = glance.calendar' \
+    '    }' \
+    '}' \
+    '#endif' >> "$permission_runtime"
+expect_failure_with_stderr \
+    "conditional compilation cannot hide a typechecked regex or Calendar wrapper" \
+    conditional-regex-calendar-wrapper \
+    "regex literals are forbidden in production composition" \
+    typecheck_then_validate_permission_fixture \
+        "$conditional_regex_typecheck" "$permission_policy_fixture"
+/bin/cp "$permission_runtime_backup" "$permission_runtime"
+printf '\nprivate let extendedRegexDecoy = #//#; private let hiddenCalendarWrapper = EryloGlance.self\n' >> \
+    "$permission_runtime"
+expect_failure_with_stderr \
+    "extended regex delimiters cannot impersonate line comments" \
+    extended-regex-calendar-wrapper \
+    "regex literals are forbidden in production composition" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_runtime_backup" "$permission_runtime"
+bare_regex_typecheck="$test_root/typechecked-switch-regex.swift"
+printf '%s\n' \
+    'private let activityBroker = 0' \
+    'private struct EryloGlance {' \
+    '    let calendar = 0' \
+    '    init(broker: Int) { _ = broker }' \
+    '}' \
+    'private func typecheckedSwitchRegexBypass() {' \
+    '    switch /"/ {' \
+    '    case _:' \
+    '        let glance = EryloGlance(broker: activityBroker)' \
+    '        _ = glance.calendar' \
+    '        _ = /"x/' \
+    '    }' \
+    '}' > "$bare_regex_typecheck"
+printf '%s\n' \
+    'private func switchRegexCalendarWrapperBypass() {' \
+    '    switch /"/ {' \
+    '    case _:' \
+    '        let glance = EryloGlance(broker: activityBroker)' \
+    '        _ = glance.calendar' \
+    '        _ = /"x/' \
+    '    }' \
+    '}' >> "$permission_runtime"
+expect_failure_with_stderr \
+    "a typechecked switch regex cannot mask the Calendar wrapper" \
+    bare-regex-calendar-wrapper \
+    "regex literals are forbidden in production composition" \
+    typecheck_then_validate_permission_fixture \
+        "$bare_regex_typecheck" "$permission_policy_fixture"
 /bin/cp "$permission_runtime_backup" "$permission_runtime"
 printf '\nprivate func directMediaExecutionBypass() async {\n' >> \
     "$permission_runtime"

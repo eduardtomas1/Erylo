@@ -278,11 +278,7 @@ public final class PanelSurfaceModel {
     private func updateActivityAvailability(_ hasActivity: Bool) {
         cancelPendingHover()
         let oldState = state
-        if !hasActivity, state == .expanded {
-            stateMachine.send(.hide)
-        } else {
-            stateMachine.updateActivityAvailability(hasActivity)
-        }
+        stateMachine.updateActivityAvailability(hasActivity)
         if state != oldState {
             if !hasActivity {
                 hoverRequiresExit = true

@@ -27,6 +27,19 @@ package protocol PanelActivityVisibilityReporting: AnyObject {
     )
 }
 
+/// Package-only state demand from a panel model to its native window owner.
+/// A hidden model keeps its already-constructed tree ordered out and owns no
+/// pointer monitors; a visible model asks the coordinator to prepare pointer
+/// delivery before ordering the window in.
+@MainActor
+package protocol PanelPresentationDemandReporting: AnyObject {
+    var wantsSurfacePresentation: Bool { get }
+
+    func setPresentationDemandHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    )
+}
+
 public extension PanelPresenting {
     /// Compatibility fallback for injected presenters that only implement the original action.
     /// The native presenter overrides this with a strict hidden/visible surface toggle.

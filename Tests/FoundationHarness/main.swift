@@ -16,6 +16,8 @@ enum FoundationHarnessMain {
         harness.verifyDisplayPolicy()
         harness.verifyHoverHysteresisAndMotionInterruption()
         await harness.verifyCoordinatorLifecycle()
+        await harness.verifyDemandDrivenPanelLifecycle()
+        await harness.verifyComposedDemandPreservation()
         await harness.verifyDisabledProvider()
         harness.finish()
     }
@@ -440,7 +442,8 @@ private struct FoundationHarness {
         let provider = FakeDisplayProvider(displays: [main, external, external, mirrored])
         let eventSource = FakeLifecycleEventSource()
         let registry = FakePanelRegistry()
-        let activityModel = SurfaceActivityModel(broker: ActivityBroker())
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
         let coordinator = PanelCoordinator(
             displayProvider: provider,
             policy: DisplayPolicy(selectedDisplayIdentity: external.identity),
@@ -452,10 +455,32 @@ private struct FoundationHarness {
         await coordinator.startAndWait()
         await coordinator.startAndWait()
         check(eventSource.startCount == 1, "repeated coordinator start owns one event source")
-        check(registry.creationCount == 2, "repeated start creates exactly one panel per display ID")
+        check(registry.creationCount == 0, "idle startup constructs zero hidden panel trees")
+        check(!eventSource.isPointerMonitoringEnabled, "idle startup installs zero pointer monitors")
+        check(
+            coordinator.activeDisplayIdentities.isEmpty,
+            "idle display discovery retains topology without native panels"
+        )
+
+        do {
+            _ = try await broker.submit(
+                ActivityRequest(
+                    identifier: "lazy-first-reveal",
+                    source: ActivitySource.timer.rawValue,
+                    kind: ActivityKind.timer.rawValue,
+                    priority: 50,
+                    title: "First reveal"
+                )
+            )
+        } catch {
+            check(false, "first reveal activity validates")
+        }
+        for _ in 0..<2_000 where registry.creationCount != 2 { await Task.yield() }
+        check(registry.creationCount == 2, "first activity constructs one bounded panel path per enabled display")
+        check(eventSource.isPointerMonitoringEnabled, "first activity enables pointer monitors before presentation")
         check(
             coordinator.activeDisplayIdentities == [main.identity, external.identity],
-            "coordinator excludes duplicate and mirrored displays"
+            "first reveal excludes duplicate and mirrored displays"
         )
 
         eventSource.emit(.pointerMoved(CGPoint(x: -100, y: -100)))
@@ -520,6 +545,7 @@ private struct FoundationHarness {
 
         eventSource.emit(.workspaceWillSleep)
         check(registry.latestPanel(for: main.identity)?.hideCount == 1, "sleep hides existing panels")
+        check(!eventSource.isPointerMonitoringEnabled, "sleep retires pointer monitoring while panels are hidden")
         let shortcutCountBeforeSleep = registry.totalPrimaryActionCount
         eventSource.emit(.primaryShortcut)
         check(
@@ -527,7 +553,25 @@ private struct FoundationHarness {
             "shortcut is inert while workspace sleeps"
         )
         eventSource.emit(.workspaceDidWake)
-        check(registry.latestPanel(for: main.identity)?.showCount == 4, "wake reconciles and reveals retained panel")
+        check(registry.latestPanel(for: main.identity)?.showCount == 2, "wake reconciles and reveals retained panel once")
+        check(eventSource.isPointerMonitoringEnabled, "wake restores pointer monitoring before visible panels")
+
+        if let identity = await broker.snapshot().current?.activity.identity {
+            _ = await broker.cancel(identity)
+        }
+        for _ in 0..<2_000 where eventSource.isPointerMonitoringEnabled { await Task.yield() }
+        check(!eventSource.isPointerMonitoringEnabled, "final activity hide tears down pointer monitors")
+        check(registry.creationCount == 3, "final hide retains the bounded constructed panel set")
+        let retainedMainPanel = registry.latestPanel(for: main.identity)
+        let retainedShowCount = retainedMainPanel?.showCount
+        eventSource.emit(.primaryShortcut)
+        check(
+            retainedMainPanel?.showCount == retainedShowCount.map { $0 + 1 },
+            "one shortcut re-presents a retained plain presenter after final activity hide"
+        )
+        check(eventSource.isPointerMonitoringEnabled, "plain-presenter shortcut restores pointer monitoring")
+        eventSource.emit(.primaryShortcut)
+        check(!eventSource.isPointerMonitoringEnabled, "second empty shortcut hides the plain presenter once")
 
         await coordinator.updateAndWait(policy: DisplayPolicy(isEnabled: false))
         check(eventSource.stopCount == 1, "disabled policy removes observers, monitors, and shortcut")
@@ -541,7 +585,12 @@ private struct FoundationHarness {
 
         await coordinator.updateAndWait(policy: .safeDefault)
         check(eventSource.startCount == 2, "re-enabled policy installs one fresh event source")
-        check(registry.creationCount == 5, "re-enabled policy recreates one panel per available display")
+        check(registry.creationCount == 3, "idle re-enable constructs no hidden panels")
+        check(!eventSource.isPointerMonitoringEnabled, "idle re-enable retains zero pointer monitors")
+        eventSource.emit(.primaryShortcut)
+        check(registry.creationCount == 4, "idle global shortcut constructs only the selected display panel")
+        check(registry.latestPanel(for: main.identity)?.primaryActionCount == 1, "idle shortcut reveals the resolved selected display")
+        check(eventSource.isPointerMonitoringEnabled, "idle shortcut prepares pointer monitoring before reveal")
 
         await coordinator.stopAndWait()
         await coordinator.stopAndWait()
@@ -550,7 +599,10 @@ private struct FoundationHarness {
 
         await coordinator.startAndWait()
         check(eventSource.startCount == 3, "coordinator can restart after stop")
-        check(registry.creationCount == 7, "restart recreates exactly one panel per display")
+        check(registry.creationCount == 4, "idle restart constructs no panel trees")
+        check(!eventSource.isPointerMonitoringEnabled, "idle restart owns zero pointer monitors")
+        eventSource.emit(.primaryShortcut)
+        check(registry.creationCount == 5, "post-restart shortcut owns one fresh selected-display construction")
         await coordinator.stopAndWait()
         check(eventSource.stopCount == 3, "restart lifecycle remains symmetrically removable")
     }
@@ -562,6 +614,157 @@ private struct FoundationHarness {
             events.append(event)
         }
         check(events.isEmpty, "disabled provider finishes without events")
+    }
+
+    mutating func verifyDemandDrivenPanelLifecycle() async {
+        let main = makeSnapshot(identity: 50, isMain: true)
+        let selected = makeSnapshot(identity: 60, originX: 1_440)
+        let events = FakeLifecycleEventSource()
+        let registry = DemandPanelRegistry()
+        let model = SurfaceActivityModel(broker: ActivityBroker())
+        let coordinator = PanelCoordinator(
+            displayProvider: FakeDisplayProvider(displays: [main, selected]),
+            policy: DisplayPolicy(selectedDisplayIdentity: selected.identity),
+            lifecycleEventSource: events,
+            activityModel: model,
+            panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
+        )
+
+        await coordinator.startAndWait()
+        check(registry.creationCount == 0, "demand lifecycle starts with zero panel constructions")
+        check(!events.isPointerMonitoringEnabled, "demand lifecycle starts with zero pointer monitors")
+
+        events.emit(.primaryShortcut)
+        let firstPanel = registry.latestPanel
+        check(registry.creationCount == 1, "first shortcut has one bounded construction path")
+        check(firstPanel?.displayIdentity == selected.identity, "first shortcut constructs only the selected display")
+        check(firstPanel?.showCount == 1, "pointer monitoring precedes the first demanded show")
+        check(events.isPointerMonitoringEnabled, "first shortcut enables pointer monitoring")
+
+        for _ in 0..<100 {
+            events.emit(.primaryShortcut)
+            events.emit(.primaryShortcut)
+        }
+        check(registry.creationCount == 1, "rapid hide/show reuses one panel without duplicates")
+        check(firstPanel?.showCount == 101 && firstPanel?.hideCount == 100, "rapid hide/show applies every latest demand exactly once")
+        check(events.isPointerMonitoringEnabled, "rapid hide/show settles visible with monitoring active")
+
+        events.emit(.primaryShortcut)
+        check(firstPanel?.hideCount == 101, "final hide orders the demanded panel out once")
+        check(!events.isPointerMonitoringEnabled, "final hide removes pointer monitoring")
+
+        await coordinator.stopAndWait()
+        let stoppedMutations = firstPanel?.mutationCount
+        firstPanel?.replayDemandRegistration(0, isDemanded: true)
+        check(firstPanel?.mutationCount == stoppedMutations, "retired panel demand cannot mutate after stop")
+        check(!events.isPointerMonitoringEnabled, "retired demand cannot reinstall pointer monitoring")
+
+        await coordinator.startAndWait()
+        check(registry.creationCount == 1, "idle restart creates no replacement panel")
+        events.emit(.primaryShortcut)
+        let replacementPanel = registry.latestPanel
+        check(registry.creationCount == 2, "post-restart shortcut creates one replacement panel")
+        let replacementMutations = replacementPanel?.mutationCount
+        firstPanel?.replayDemandRegistration(0, isDemanded: false)
+        check(replacementPanel?.mutationCount == replacementMutations, "stale panel lease cannot hide its replacement")
+        check(events.isPointerMonitoringEnabled, "replacement remains monitored after stale demand")
+
+        await coordinator.shutdown()
+        replacementPanel?.replayDemandRegistration(0, isDemanded: true)
+        check(!events.isRunning && !events.isPointerMonitoringEnabled, "shutdown rejects pending or replayed presentation demand")
+    }
+
+    mutating func verifyComposedDemandPreservation() async {
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
+        let events = FakeLifecycleEventSource()
+        let registry = ModelDemandPanelRegistry()
+        let coordinator = PanelCoordinator(
+            displayProvider: FakeDisplayProvider(
+                displays: [makeSnapshot(identity: 70, isMain: true)]
+            ),
+            policy: .safeDefault,
+            lifecycleEventSource: events,
+            activityModel: activityModel,
+            panelFactory: { snapshot, model in
+                registry.makePanel(snapshot: snapshot, activityModel: model)
+            }
+        )
+        let request: (String) -> ActivityRequest = { identifier in
+            ActivityRequest(
+                identifier: identifier,
+                source: ActivitySource.timer.rawValue,
+                kind: ActivityKind.timer.rawValue,
+                priority: 50,
+                title: identifier
+            )
+        }
+
+        await coordinator.startAndWait()
+        do {
+            _ = try await broker.submit(request("expanded-expiry"))
+        } catch {
+            check(false, "expanded-expiry activity validates")
+        }
+        for _ in 0..<2_000 where registry.latestPanel?.state != .compact {
+            await Task.yield()
+        }
+        guard let panel = registry.latestPanel else {
+            check(false, "composed demand panel is constructed by first activity")
+            await coordinator.shutdown()
+            return
+        }
+
+        events.emit(.primaryShortcut)
+        check(panel.state == .expanded, "activity surface deliberately expands through the coordinator")
+        if let identity = await broker.snapshot().current?.activity.identity {
+            _ = await broker.cancel(identity)
+        }
+        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
+        check(panel.state == .expanded, "activity expiry preserves deliberate expanded demand")
+        check(panel.isPresented && panel.hideCount == 0, "coordinator does not order out an expanded empty surface")
+        check(events.isPointerMonitoringEnabled, "expanded empty surface retains pointer monitoring")
+        events.emit(.primaryShortcut)
+        check(panel.state == .hidden && !panel.isPresented, "one shortcut hides the still-present expanded empty surface")
+        check(!events.isPointerMonitoringEnabled, "expanded contraction removes final pointer monitoring")
+
+        do {
+            _ = try await broker.submit(request("drop-exit"))
+        } catch {
+            check(false, "drop-exit activity validates")
+        }
+        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
+        panel.send(.dragEntered)
+        check(panel.state == .dropTarget, "drag entry demands the composed drop target")
+        if let identity = await broker.snapshot().current?.activity.identity {
+            _ = await broker.cancel(identity)
+        }
+        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
+        check(panel.state == .dropTarget && panel.isPresented, "activity loss preserves active drop-target demand")
+        check(events.isPointerMonitoringEnabled, "active drop target retains pointer monitoring after activity loss")
+        panel.send(.dragExited)
+        check(panel.state == .hidden && !panel.isPresented, "drag exit restores hidden after activity loss")
+        check(!events.isPointerMonitoringEnabled, "drag exit removes final pointer monitoring")
+
+        do {
+            _ = try await broker.submit(request("drop-complete"))
+        } catch {
+            check(false, "drop-complete activity validates")
+        }
+        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
+        panel.send(.dragEntered)
+        if let identity = await broker.snapshot().current?.activity.identity {
+            _ = await broker.cancel(identity)
+        }
+        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
+        panel.send(.dropCompleted)
+        check(panel.state == .expanded && panel.isPresented, "drop completion settles into demanded expanded state")
+        check(events.isPointerMonitoringEnabled, "completed empty drop remains monitored while expanded")
+        events.emit(.primaryShortcut)
+        check(panel.state == .hidden && !events.isPointerMonitoringEnabled, "one shortcut contracts the completed empty drop")
+
+        await coordinator.shutdown()
+        check(!events.isRunning && !events.isPointerMonitoringEnabled, "composed demand fixture shuts down with zero event work")
     }
 
     private mutating func check(_ condition: @autoclosure () -> Bool, _ name: String) {
@@ -690,6 +893,7 @@ private final class FakeDisplayProvider: EnabledDisplayProviding {
 @MainActor
 private final class FakeLifecycleEventSource: PanelLifecycleEventSourcing {
     private(set) var isRunning = false
+    private(set) var isPointerMonitoringEnabled = false
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private var handler: (@MainActor @Sendable (PanelLifecycleEvent) -> Void)?
@@ -701,9 +905,14 @@ private final class FakeLifecycleEventSource: PanelLifecycleEventSourcing {
         self.handler = handler
     }
 
+    func setPointerMonitoringEnabled(_ isEnabled: Bool) {
+        isPointerMonitoringEnabled = isRunning && isEnabled
+    }
+
     func stop() {
         guard isRunning else { return }
         isRunning = false
+        isPointerMonitoringEnabled = false
         stopCount += 1
         handler = nil
     }
@@ -777,5 +986,193 @@ private final class FakePanel: PanelPresenting {
 
     func cancelPendingInteractions() {
         cancellationCount += 1
+    }
+}
+
+@MainActor
+private final class DemandPanelRegistry {
+    private(set) var panels: [DemandPanel] = []
+
+    var creationCount: Int {
+        panels.count
+    }
+
+    var latestPanel: DemandPanel? {
+        panels.last
+    }
+
+    func makePanel(snapshot: DisplaySnapshot) -> any PanelPresenting {
+        let panel = DemandPanel(displayIdentity: snapshot.identity)
+        panels.append(panel)
+        return panel
+    }
+}
+
+@MainActor
+private final class DemandPanel: PanelPresenting, PanelPresentationDemandReporting {
+    let displayIdentity: DisplayIdentity
+    private(set) var showCount = 0
+    private(set) var hideCount = 0
+    private(set) var closeCount = 0
+    private var isDemanded = false
+    private var demandHandler: (@MainActor @Sendable (Bool) -> Void)?
+    private var demandRegistrations: [@MainActor @Sendable (Bool) -> Void] = []
+
+    var wantsSurfacePresentation: Bool {
+        isDemanded
+    }
+
+    var mutationCount: Int {
+        showCount + hideCount + closeCount
+    }
+
+    init(displayIdentity: DisplayIdentity) {
+        self.displayIdentity = displayIdentity
+    }
+
+    func setPresentationDemandHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    ) {
+        demandHandler = handler
+        if let handler {
+            demandRegistrations.append(handler)
+            handler(isDemanded)
+        }
+    }
+
+    func replayDemandRegistration(_ registration: Int, isDemanded: Bool) {
+        guard demandRegistrations.indices.contains(registration) else { return }
+        demandRegistrations[registration](isDemanded)
+    }
+
+    func show() {
+        showCount += 1
+    }
+
+    func hide() {
+        hideCount += 1
+    }
+
+    func close() {
+        closeCount += 1
+    }
+
+    func update(snapshot: DisplaySnapshot) {
+        _ = snapshot
+    }
+
+    func updatePointer(screenPoint: CGPoint) {
+        _ = screenPoint
+    }
+
+    func performPrimaryAction() {
+        isDemanded.toggle()
+        demandHandler?(isDemanded)
+    }
+
+    func performVisibilityToggle() {
+        performPrimaryAction()
+    }
+
+    func cancelPendingInteractions() {}
+}
+
+@MainActor
+private final class ModelDemandPanelRegistry {
+    private(set) var panels: [ModelDemandPanel] = []
+
+    var latestPanel: ModelDemandPanel? {
+        panels.last
+    }
+
+    func makePanel(
+        snapshot: DisplaySnapshot,
+        activityModel: SurfaceActivityModel
+    ) -> any PanelPresenting {
+        let panel = ModelDemandPanel(
+            snapshot: snapshot,
+            activityModel: activityModel
+        )
+        panels.append(panel)
+        return panel
+    }
+}
+
+@MainActor
+private final class ModelDemandPanel: PanelPresenting, PanelPresentationDemandReporting {
+    let displayIdentity: DisplayIdentity
+    private let model: PanelSurfaceModel
+    private var demandHandler: (@MainActor @Sendable (Bool) -> Void)?
+    private(set) var isPresented = false
+    private(set) var showCount = 0
+    private(set) var hideCount = 0
+    private(set) var closeCount = 0
+
+    var wantsSurfacePresentation: Bool {
+        model.state != .hidden
+    }
+
+    var state: PanelPresentationState {
+        model.state
+    }
+
+    init(snapshot: DisplaySnapshot, activityModel: SurfaceActivityModel) {
+        displayIdentity = snapshot.identity
+        model = PanelSurfaceModel(
+            displayGeometry: snapshot.geometry,
+            activityModel: activityModel
+        )
+        model.didChange = { [weak self] in
+            guard let self else { return }
+            self.demandHandler?(self.wantsSurfacePresentation)
+        }
+    }
+
+    func setPresentationDemandHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    ) {
+        demandHandler = handler
+        handler?(wantsSurfacePresentation)
+    }
+
+    func show() {
+        isPresented = true
+        showCount += 1
+    }
+
+    func hide() {
+        isPresented = false
+        hideCount += 1
+        model.cancelPendingInteractions()
+    }
+
+    func close() {
+        isPresented = false
+        closeCount += 1
+        model.cancelPendingInteractions()
+    }
+
+    func update(snapshot: DisplaySnapshot) {
+        model.update(displayGeometry: snapshot.geometry)
+    }
+
+    func updatePointer(screenPoint: CGPoint) {
+        _ = screenPoint
+    }
+
+    func performPrimaryAction() {
+        model.send(.primaryAction)
+    }
+
+    func performVisibilityToggle() {
+        model.send(model.state == .hidden ? .show : .hide)
+    }
+
+    func cancelPendingInteractions() {
+        model.cancelPendingInteractions()
+    }
+
+    func send(_ event: PanelEvent) {
+        model.send(event)
     }
 }

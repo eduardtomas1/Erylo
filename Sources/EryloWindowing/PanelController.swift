@@ -4,7 +4,8 @@ import EryloSurface
 import SwiftUI
 
 @MainActor
-final class PanelController: PanelPresenting, PanelActivityVisibilityReporting {
+final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
+    PanelPresentationDemandReporting {
     let directDisplayID: CGDirectDisplayID
 
     var displayIdentity: DisplayIdentity {
@@ -17,9 +18,15 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting {
     private var isVisible = false
     private var lastReportedActivityVisibility = false
     private var activityVisibilityHandler: (@MainActor @Sendable (Bool) -> Void)?
+    private var lastReportedPresentationDemand = false
+    private var presentationDemandHandler: (@MainActor @Sendable (Bool) -> Void)?
 
     var isActivitySurfaceVisible: Bool {
         isVisible && model.state != .hidden
+    }
+
+    var wantsSurfacePresentation: Bool {
+        model.state != .hidden
     }
 
     init(
@@ -56,6 +63,13 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting {
     ) {
         activityVisibilityHandler = handler
         reportActivityVisibilityIfNeeded(force: true)
+    }
+
+    func setPresentationDemandHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    ) {
+        presentationDemandHandler = handler
+        reportPresentationDemandIfNeeded(force: true)
     }
 
     func show() {
@@ -141,10 +155,18 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting {
         panel.setFrame(layout.fixedFrame, display: true, animate: false)
         rootView.frame = CGRect(origin: .zero, size: layout.fixedFrame.size)
         rootView.hitRegion = model.interactionHitRegion
+        reportPresentationDemandIfNeeded()
         if isVisible {
             updatePointer(screenPoint: NSEvent.mouseLocation)
         }
         reportActivityVisibilityIfNeeded()
+    }
+
+    private func reportPresentationDemandIfNeeded(force: Bool = false) {
+        let isDemanded = wantsSurfacePresentation
+        guard force || isDemanded != lastReportedPresentationDemand else { return }
+        lastReportedPresentationDemand = isDemanded
+        presentationDemandHandler?(isDemanded)
     }
 
     private func reportActivityVisibilityIfNeeded(force: Bool = false) {

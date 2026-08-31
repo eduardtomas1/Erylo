@@ -110,6 +110,10 @@ private struct AppRuntimeHarness {
             await waitUntil { await broker.workState().subscriberCount == 1 },
             "surface owns one shared broker subscription"
         )
+        check(
+            await waitUntil { panelReference.value != nil },
+            "preloaded first activity constructs its panel after startup subscription"
+        )
 
         first = nil
         second = nil
@@ -133,15 +137,15 @@ private struct AppRuntimeHarness {
             events.values == [
                 "update.start",
                 "panel-events.start",
-                "panel.show",
                 "first.start",
                 "second.start",
+                "panel.show",
                 "second.shutdown",
                 "first.shutdown",
                 "panel-events.stop",
                 "panel.close",
             ],
-            "startup and reverse-dependency shutdown order is deterministic"
+            "startup and reverse-dependency shutdown order is deterministic: \(events.values)"
         )
 
         do {

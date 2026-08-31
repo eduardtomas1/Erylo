@@ -25,7 +25,7 @@ package struct FocusTimerRuntimeWorkState: Equatable, Sendable {
     package let isProviderEnabled: Bool
 
     package var isIdle: Bool {
-        !hasWorkerTask && pendingOperationCount == 0
+        !hasWorkerTask && pendingOperationCount == 0 && !isProviderEnabled
     }
 }
 
@@ -53,6 +53,11 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         let operation: Operation
     }
 
+    private struct ActiveTimer {
+        let countdown: CountdownTimer
+        let operationIdentity: CountdownOperationIdentity
+    }
+
     package let provider: CountdownGlanceProvider
 
     private let clock: any GlanceClock
@@ -65,6 +70,7 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     private var shutdownTask: Task<Void, Never>?
     private var isProviderEnabled = false
     private var isSurfaceVisible = false
+    private var activeTimer: ActiveTimer?
 
     package init(
         provider: CountdownGlanceProvider,
@@ -86,6 +92,9 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
 
     package func start() async {
         guard phase == .initialized else { return }
+        await provider.setNaturalCompletionHandler { [weak self] completedTimer in
+            await self?.naturalCompletionDidFinish(completedTimer)
+        }
         phase = .running
     }
 
@@ -109,7 +118,8 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
 
     @discardableResult
     package func requestCancel() -> Bool {
-        guard phase == .running else { return false }
+        guard phase == .running,
+              activeTimer != nil || pendingUserOperation != nil else { return false }
         pendingUserOperation = sequenced(.cancel)
         startWorkerIfNeeded()
         return true
@@ -152,6 +162,13 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         )
     }
 
+    package func menuContext(at date: Date) -> ApplicationFocusTimerMenuContext {
+        guard phase == .running, let activeTimer else { return .idle }
+        let rawRemaining = activeTimer.countdown.endsAt.timeIntervalSince(date)
+        let seconds = rawRemaining.isFinite ? Int(max(rawRemaining, 0).rounded(.up)) : 0
+        return .active(remainingText: Self.durationText(seconds: seconds))
+    }
+
     package func shutdown() async {
         if let shutdownTask {
             _ = await shutdownTask.value
@@ -172,7 +189,9 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
             await provider.setPresentationDemand(.hidden)
             await provider.cancelCountdown()
             await provider.disable()
+            await provider.setNaturalCompletionHandler(nil)
             isProviderEnabled = false
+            activeTimer = nil
             self.workerTask = nil
             phase = .stopped
             shutdownTask = nil
@@ -257,24 +276,47 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         }
 
         let demand: CountdownPresentationDemand = isSurfaceVisible ? .visible : .hidden
-        if isProviderEnabled {
+        let operationIdentity = CountdownOperationIdentity()
+        activeTimer = ActiveTimer(
+            countdown: timer,
+            operationIdentity: operationIdentity
+        )
+        if await provider.status().isEnabled {
             await provider.setPresentationDemand(demand)
         }
-        await provider.setCountdown(timer)
-        if !isProviderEnabled {
+        await provider.setCountdown(
+            timer,
+            operationIdentity: operationIdentity
+        )
+        if !(await provider.status().isEnabled) {
             await provider.enable()
-            isProviderEnabled = await provider.status().isEnabled
         }
+        isProviderEnabled = await provider.status().isEnabled
         if isProviderEnabled {
             await provider.setPresentationDemand(demand)
         }
     }
 
+    private func naturalCompletionDidFinish(
+        _ completion: CountdownNaturalCompletion
+    ) async {
+        guard phase == .running else { return }
+        isProviderEnabled = await provider.status().isEnabled
+        if !isProviderEnabled,
+           activeTimer?.operationIdentity == completion.operationIdentity {
+            activeTimer = nil
+        }
+    }
+
     private func cancelTimer() async {
-        guard isProviderEnabled else { return }
+        guard isProviderEnabled else {
+            activeTimer = nil
+            return
+        }
         await provider.cancelCountdown()
         await provider.disable()
         isProviderEnabled = false
+        activeTimer = nil
     }
 
     private func cancelTimer(ifPublishedRevision revision: UInt64) async -> FocusTimerRouteResult {
@@ -288,7 +330,19 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         }
         await provider.disable()
         isProviderEnabled = false
+        activeTimer = nil
         return .cancelled
+    }
+
+    private static func durationText(seconds: Int) -> String {
+        let bounded = max(seconds, 0)
+        let hours = bounded / 3_600
+        let minutes = (bounded % 3_600) / 60
+        let seconds = bounded % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 }
 

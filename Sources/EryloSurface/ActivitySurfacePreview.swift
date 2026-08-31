@@ -6,17 +6,20 @@ public struct ActivitySurfacePreviewScenario: Equatable, Sendable {
     public let state: PanelPresentationState
     public let current: ActivityRequest?
     public let queued: [ActivityRequest]
+    public let showsFocusTimerLauncher: Bool
 
     public init(
         name: String,
         state: PanelPresentationState,
         current: ActivityRequest?,
-        queued: [ActivityRequest] = []
+        queued: [ActivityRequest] = [],
+        showsFocusTimerLauncher: Bool = false
     ) {
         self.name = name
         self.state = state
         self.current = current
         self.queued = Array(queued.prefix(ActivityQueueContext.maximumVisibleItems))
+        self.showsFocusTimerLauncher = showsFocusTimerLauncher
     }
 
     public func snapshot() throws(ActivityValidationError) -> ActivityBrokerSnapshot {
@@ -43,6 +46,13 @@ public struct ActivitySurfacePreviewScenario: Equatable, Sendable {
 /// Deterministic, bounded data for native previews and a later real screenshot host.
 /// It performs no provider, network, file, timer, or broker subscription work.
 public enum ActivitySurfacePreviewCatalog {
+    public static let focusTimerLauncher = ActivitySurfacePreviewScenario(
+        name: "Focus Timer launcher",
+        state: .compact,
+        current: nil,
+        showsFocusTimerLauncher: true
+    )
+
     public static let generic = ActivitySurfacePreviewScenario(
         name: "Generic compact",
         state: .compact,
@@ -94,6 +104,29 @@ public enum ActivitySurfacePreviewCatalog {
             actionIdentifier: "preview.timer.cancel",
             actionLabel: "Cancel timer",
             actionIntent: .cancel
+        )
+    )
+
+    public static let timerCompact = ActivitySurfacePreviewScenario(
+        name: "Timer compact",
+        state: .compact,
+        current: request(
+            identifier: "preview.timer.compact",
+            source: .timer,
+            kind: .timer,
+            title: "Focus Timer",
+            detail: "12:40"
+        )
+    )
+
+    public static let timerCompletion = ActivitySurfacePreviewScenario(
+        name: "Timer completion",
+        state: .peek,
+        current: request(
+            identifier: "preview.timer.complete",
+            source: .timer,
+            kind: .timer,
+            title: "Focus complete"
         )
     )
 
@@ -167,10 +200,13 @@ public enum ActivitySurfacePreviewCatalog {
     )
 
     public static let representative: [ActivitySurfacePreviewScenario] = [
+        focusTimerLauncher,
         generic,
         battery,
         charging,
         timer,
+        timerCompact,
+        timerCompletion,
         meeting,
         volume,
         media,
@@ -187,13 +223,17 @@ public enum ActivitySurfacePreviewCatalog {
         scheduler: any OneShotScheduling = TaskOneShotScheduler()
     ) throws(ActivityValidationError) -> PanelSurfaceModel {
         let activityModel = SurfaceActivityModel(previewSnapshot: try scenario.snapshot())
-        return PanelSurfaceModel(
+        let model = PanelSurfaceModel(
             displayGeometry: displayGeometry,
             initialState: scenario.state,
             metrics: metrics,
             scheduler: scheduler,
             activityModel: activityModel
         )
+        if scenario.showsFocusTimerLauncher {
+            model.setFocusTimerStartHandler { _ in true }
+        }
+        return model
     }
 
     private static func request(

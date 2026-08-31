@@ -62,18 +62,43 @@ public final class PanelSurfaceModel {
 
     package private(set) var isPointerInside = false
 
+    /// Physical NSPanel presentation, independent of the logical surface state.
+    /// An ordered-out panel must not retain a SwiftUI timeline schedule.
+    package private(set) var isWindowPresented = true
+
     @ObservationIgnored
     private var hoverRequiresExit = false
 
     @ObservationIgnored
     private var reduceMotion = false
 
+    @ObservationIgnored
+    private var focusTimerStartHandler: (@MainActor @Sendable (Int) -> Bool)?
+
     public var state: PanelPresentationState {
         stateMachine.state
     }
 
     public var layout: PanelLayout {
-        PanelLayout(display: displayGeometry, state: state, metrics: metrics)
+        PanelLayout(
+            display: displayGeometry,
+            state: state,
+            metrics: metrics,
+            showsFocusTimerLauncher: showsFocusTimerLauncher,
+            minimumNotchWingWidth: showsTemporalTimer ? 48 : 0
+        )
+    }
+
+    public var showsFocusTimerLauncher: Bool {
+        state == .compact && activityModel.current == nil && focusTimerStartHandler != nil
+    }
+
+    private var showsTemporalTimer: Bool {
+        activityModel.current?.activity.presentation.temporalProgress != nil
+    }
+
+    package var isTemporalProjectionActive: Bool {
+        isWindowPresented && state != .hidden && showsTemporalTimer
     }
 
     public var content: ActivitySurfaceContent {
@@ -83,7 +108,8 @@ public final class PanelSurfaceModel {
             current: activityModel.current,
             queueContext: activityModel.queueContext,
             action: activityModel.currentAction,
-            actionDispatchState: activityModel.actionDispatchState
+            actionDispatchState: activityModel.actionDispatchState,
+            showsFocusTimerLauncher: showsFocusTimerLauncher
         )
     }
 
@@ -206,6 +232,33 @@ public final class PanelSurfaceModel {
         self.reduceMotion = reduceMotion
     }
 
+    package func setWindowPresented(_ isPresented: Bool) {
+        guard isWindowPresented != isPresented else { return }
+        isWindowPresented = isPresented
+    }
+
+    package func setFocusTimerStartHandler(
+        _ handler: (@MainActor @Sendable (Int) -> Bool)?
+    ) {
+        guard (focusTimerStartHandler == nil) != (handler == nil) else {
+            focusTimerStartHandler = handler
+            return
+        }
+        focusTimerStartHandler = handler
+        beginHitRegionTransition(to: layout.hitRegion)
+        didChange?()
+    }
+
+    @discardableResult
+    package func startFocusTimer(minutes: Int) -> Bool {
+        guard [15, 25, 50].contains(minutes),
+              showsFocusTimerLauncher,
+              let focusTimerStartHandler else {
+            return false
+        }
+        return focusTimerStartHandler(minutes)
+    }
+
     public func pointerDisposition(at localPoint: CGPoint) -> PanelPointerDisposition {
         let currentLayout = layout
         let isInsideHoverTarget = currentLayout.hoverAnchorRegion.contains(localPoint)
@@ -273,6 +326,15 @@ public final class PanelSurfaceModel {
 
     private func activityDidChange() {
         updateActivityAvailability(activityModel.current != nil)
+        guard state == .compact,
+              activityModel.current?.activity.presentation.presentationRole
+                == .completionAcknowledgement else {
+            return
+        }
+        cancelPendingHover()
+        stateMachine.send(.hoverBegan)
+        beginHitRegionTransition(to: layout.hitRegion)
+        didChange?()
     }
 
     private func updateActivityAvailability(_ hasActivity: Bool) {

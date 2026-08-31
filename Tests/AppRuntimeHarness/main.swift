@@ -25,6 +25,7 @@ enum AppRuntimeHarnessMain {
         await harness.verifyRetiredVolumeExpiryDrainAcrossResetAndShutdown()
         await harness.verifyMenuCommandRoutingAndUpdateAvailability()
         await harness.verifyFocusTimerVerticalSlice()
+        await harness.verifyNaturalCompletionPresentationAndShutdownBarrier()
         harness.finish()
     }
 }
@@ -265,13 +266,16 @@ private struct AppRuntimeHarness {
 
         var routedCommands: [ApplicationControlCommand] = []
         var appliedPolicies: [DisplayPolicy] = []
+        let menuContextProbe = FocusTimerMenuContextProbe()
         await plane.start(
             canCheckForUpdates: true,
+            focusTimerContextProvider: { menuContextProbe.evaluate() },
             commandHandler: { routedCommands.append($0) },
             displayPolicyHandler: { appliedPolicies.append($0) }
         )
         await plane.start(
             canCheckForUpdates: true,
+            focusTimerContextProvider: { .idle },
             commandHandler: { routedCommands.append($0) },
             displayPolicyHandler: { appliedPolicies.append($0) }
         )
@@ -287,6 +291,21 @@ private struct AppRuntimeHarness {
         check(
             presenter.menu?.items.contains(where: { $0.title == ApplicationControlCopy.shortcutReminder }) == true,
             "status menu includes the keyboard shortcut reminder"
+        )
+        check(menuContextProbe.evaluationCount == 1, "status menu performs no background context polling")
+        menuContextProbe.context = .active(remainingText: "18:07")
+        check(
+            presenter.menu?.items.contains(where: { $0.title.contains("18:07") }) == false
+                && menuContextProbe.evaluationCount == 1,
+            "active remaining time is not computed before the menu opens"
+        )
+        presenter.refreshMenu()
+        check(
+            menuContextProbe.evaluationCount == 2
+                && presenter.menu?.items.contains(where: {
+                    $0.title.contains("18:07") && $0.kind == .information && !$0.isEnabled
+                }) == true,
+            "menu-open refresh computes one contextual remaining-time snapshot"
         )
 
         plane.presentSettings()
@@ -361,6 +380,7 @@ private struct AppRuntimeHarness {
         _ = await returningPlane.prepareForStartup()
         await returningPlane.start(
             canCheckForUpdates: false,
+            focusTimerContextProvider: { .idle },
             commandHandler: { _ in },
             displayPolicyHandler: { _ in }
         )
@@ -424,6 +444,7 @@ private struct AppRuntimeHarness {
 
             await plane.start(
                 canCheckForUpdates: false,
+                focusTimerContextProvider: { .idle },
                 commandHandler: { _ in },
                 displayPolicyHandler: { _ in }
             )
@@ -1179,8 +1200,44 @@ private struct AppRuntimeHarness {
                 && !menu.items.map(\.title).joined(separator: " ").lowercased().contains("resume"),
             "Focus Timer menu makes no unsupported pause or resume claim"
         )
+        check(
+            menu.items.first(where: { $0.kind == .command(.cancelFocusTimer) })?.isEnabled == false,
+            "status menu disables timer cancellation while idle"
+        )
+        check(
+            menu.items.first(where: { $0.kind == .information })?.isEnabled == false,
+            "status menu reminder is truly informational"
+        )
+        let activeMenu = ApplicationMenuDescriptor(
+            canCheckForUpdates: false,
+            focusTimer: .active(remainingText: "24:59")
+        )
+        check(
+            activeMenu.items.contains(where: {
+                $0.kind == .information && $0.title.contains("24:59") && !$0.isEnabled
+            }),
+            "active status menu exposes remaining time as inert context"
+        )
+        check(
+            activeMenu.items.filter {
+                switch $0.kind {
+                case .command(.startFocusTimer15), .command(.startFocusTimer25),
+                     .command(.startFocusTimer50):
+                    true
+                default:
+                    false
+                }
+            }.allSatisfy { $0.title.hasPrefix("Replace with") },
+            "active status menu makes preset replacement semantics explicit"
+        )
+        check(
+            activeMenu.items.first(where: { $0.kind == .command(.cancelFocusTimer) })?.isEnabled == true,
+            "active status menu enables timer cancellation"
+        )
 
-        check(runtime.handle(.startFocusTimer25), "25-minute Focus Timer command is accepted")
+        check(runtime.handle(.toggleSurface), "deliberate surface toggle constructs the demand-driven idle launcher")
+        check(panel.isActivitySurfaceVisible, "idle launcher is physically and logically visible before selection")
+        check(panel.startFocusTimer(minutes: 25), "idle native launcher routes the 25-minute Focus Timer preset")
         check(
             await waitUntil {
                 let countdown = await focusTimer.provider.countdown()
@@ -1201,12 +1258,16 @@ private struct AppRuntimeHarness {
             check(false, "25-minute preset duration is observable")
         }
         check(
-            await focusTimer.provider.presentationDemand() == .hidden,
-            "hidden notch retains expiry-only timer demand"
+            focusTimer.menuContext(at: now) == .active(remainingText: "25:00"),
+            "menu-open timer context computes exact remaining time without a ticker"
+        )
+        check(
+            await waitUntil { await focusTimer.provider.presentationDemand() == .visible },
+            "shown launcher carries visible timer presentation demand"
         )
         check(
             await waitUntil { await clock.pendingCount == 1 },
-            "hidden Focus Timer owns one bounded expiry one-shot"
+            "shown Focus Timer owns one bounded expiry one-shot"
         )
 
         panel.setContentVisible(true)
@@ -1216,18 +1277,21 @@ private struct AppRuntimeHarness {
         )
         let firstTick = Date(timeIntervalSinceReferenceDate: 90_001)
         check(
-            await waitUntil { await clock.pendingDeadlines == [firstTick] },
-            "visible Focus Timer owns one aligned progress boundary"
+            await waitUntil {
+                await clock.pendingDeadlines
+                    == [Date(timeIntervalSinceReferenceDate: 91_500.25)]
+            },
+            "visible Focus Timer retains only the expiry boundary"
         )
         let originalRevision = await broker.snapshot().current?.revision
+        let originalVersion = await broker.snapshot().version
         await clock.advance(to: firstTick)
+        for _ in 0..<40 { await Task.yield() }
+        let projectedSnapshot = await broker.snapshot()
         check(
-            await waitUntil {
-                guard let current = await broker.snapshot().current else { return false }
-                return current.revision != originalRevision
-                    && (current.activity.presentation.progress?.fractionCompleted ?? 0) > 0
-            },
-            "visible Focus Timer publishes timestamp-derived live progress"
+            projectedSnapshot.version == originalVersion
+                && projectedSnapshot.current?.revision == originalRevision,
+            "visible Focus Timer tick preserves broker and cancel-action revision"
         )
 
         panel.setContentVisible(false)
@@ -1483,15 +1547,29 @@ private struct AppRuntimeHarness {
             await runtime.shutdown()
             return
         }
+        check(
+            await waitUntil { await clock.pendingDeadlines == [completionDeadline] },
+            "natural-completion timer owns its single expiry boundary before advancement"
+        )
         await clock.advance(to: completionDeadline)
         check(
             await waitUntil {
                 let countdown = await focusTimer.provider.countdown()
                 let snapshot = await broker.snapshot()
                 let providerWork = await focusTimer.provider.workState()
-                return countdown == nil && snapshot.current == nil && providerWork.isIdle
+                return countdown == nil
+                    && snapshot.current?.activity.presentation.title == "Focus complete"
+                    && snapshot.current?.activity.action == nil
+                    && providerWork.isIdle
+                    && focusTimer.workState().isIdle
             },
-            "natural completion clears activity and owns zero timer tasks"
+            "natural completion publishes only the bounded acknowledgement and drains runtime work"
+        )
+        check(await focusTimer.provider.status() == .disabled, "natural completion disables timer provider")
+        check(focusTimer.menuContext(at: completionDeadline) == .idle, "natural completion retires menu timer context")
+        check(
+            await broker.workState().activeOwnershipCount == 0,
+            "natural completion releases timer broker ownership"
         )
 
         check(runtime.handle(.startFocusTimer50), "shutdown-overlap Focus Timer starts")
@@ -1514,6 +1592,228 @@ private struct AppRuntimeHarness {
         check(await broker.workState() == .stopped, "terminal shutdown drains broker timers, subscribers, and ownership")
         check(await clock.pendingCount == 0, "terminal shutdown leaves no countdown clock waiter")
         check(!runtime.handle(.startFocusTimer15), "Focus Timer commands fail closed after terminal shutdown")
+    }
+
+    mutating func verifyNaturalCompletionPresentationAndShutdownBarrier() async {
+        let now = Date(timeIntervalSinceReferenceDate: 95_000)
+        let completionScheduler = ManualExpirationScheduler()
+        let broker = ActivityBroker(expirationScheduler: completionScheduler)
+        let clock = ManualFocusClock(now: now)
+        let activityModel = SurfaceActivityModel(broker: broker)
+        activityModel.start()
+        let panelModel = PanelSurfaceModel(
+            displayGeometry: DisplayGeometry(
+                frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
+                visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
+                backingScaleFactor: 2,
+                topEdgeOcclusion: TopEdgeOcclusion(
+                    frame: CGRect(x: 610, y: 856, width: 220, height: 44)
+                )
+            ),
+            initialState: .compact,
+            activityModel: activityModel
+        )
+        let provider = CountdownGlanceProvider(broker: broker, clock: clock)
+        do {
+            let timer = try CountdownTimer(
+                title: "Focus Timer",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(5)
+            )
+            await provider.setCountdown(timer)
+            await provider.enable()
+            check(
+                await waitUntil {
+                    activityModel.current?.activity.presentation.temporalProgress != nil
+                        && panelModel.state == .compact
+                },
+                "natural-completion surface fixture begins in the production compact timer state"
+            )
+            await clock.advance(to: timer.endsAt)
+            check(
+                await waitUntil {
+                    let providerIsIdle = await provider.workState().isIdle
+                    return activityModel.current?.activity.presentation.title == "Focus complete"
+                        && panelModel.state == .peek
+                        && providerIsIdle
+                },
+                "natural expiry promotes its bounded completion acknowledgement into visible peek copy"
+            )
+            if case let .activity(item) = panelModel.content.primary {
+                check(item.title == "Focus complete", "completion peek renders the production acknowledgement title")
+                check(item.temporalProjection == nil, "completion peek owns no continuing timeline projection")
+            } else {
+                check(false, "completion peek exposes activity content")
+                check(false, "completion peek retires temporal projection")
+            }
+            check(
+                panelModel.accessibility.value.contains("Focus complete"),
+                "completion peek announces its acknowledgement to VoiceOver"
+            )
+            check(
+                await waitUntil { await completionScheduler.pendingCount == 1 },
+                "completion peek remains bounded by its one broker expiry"
+            )
+            await completionScheduler.fireNext()
+            check(
+                await waitUntil { activityModel.current == nil && panelModel.state == .hidden },
+                "completion acknowledgement expires and returns the surface to rest"
+            )
+        } catch {
+            recordUnexpected(error, context: "natural-completion surface presentation")
+        }
+        await provider.disable()
+        await activityModel.stop()
+        await broker.shutdown()
+
+        let barrierClock = ManualFocusClock(now: now)
+        let barrierBroker = GatedReleaseBroker()
+        let barrierProvider = CountdownGlanceProvider(
+            broker: barrierBroker,
+            clock: barrierClock
+        )
+        let focusTimer = FocusTimerRuntimeService(
+            provider: barrierProvider,
+            clock: barrierClock
+        )
+        await focusTimer.start()
+        await barrierBroker.gateNextRelease()
+        check(focusTimer.requestStart(duration: 5), "shutdown-barrier Focus Timer starts")
+        check(
+            await waitUntil { await barrierProvider.countdown() != nil },
+            "shutdown-barrier timer reaches provider state"
+        )
+        guard let retiredTimer = await barrierProvider.countdown() else {
+            check(false, "shutdown-barrier timer exposes its admitted operation")
+            await focusTimer.shutdown()
+            await barrierBroker.shutdown()
+            return
+        }
+        let deadline = retiredTimer.endsAt
+        check(
+            await waitUntil { await barrierClock.pendingDeadlines == [deadline] },
+            "replacement-race timer registers its expiry boundary"
+        )
+        let retiredRevision = await barrierBroker.snapshot().current?.revision
+        await barrierClock.advance(to: deadline)
+        check(
+            await waitUntil { await barrierBroker.releasePending },
+            "replacement-race fixture reaches gated ownership release"
+        )
+        await barrierClock.advance(to: now)
+        check(
+            focusTimer.requestStart(duration: 5),
+            "value-identical replacement is admitted after a clock rewind while predecessor cleanup is gated"
+        )
+        let replacementEnd = deadline
+        check(
+            await waitUntil {
+                guard let replacement = await barrierProvider.countdown() else { return false }
+                return replacement == retiredTimer
+            },
+            "gated cleanup stores a semantically new operation with value-identical timer fields"
+        )
+        check(
+            focusTimer.menuContext(at: now) == .active(remainingText: "00:05"),
+            "value-identical replacement immediately owns its menu deadline"
+        )
+        let admittedProviderWork = await barrierProvider.workState()
+        let admittedBrokerWork = await barrierBroker.workState()
+        check(
+            !admittedProviderWork.isIdle
+                && admittedBrokerWork.activeOwnershipCount == 1
+                && admittedBrokerWork.pendingOwnershipIntentCount == 0,
+            "gated replacement retains one accounted predecessor lease without capacity growth"
+        )
+
+        await barrierBroker.releaseRelease()
+        check(
+            await waitUntil {
+                let status = await barrierProvider.status()
+                let snapshot = await barrierBroker.snapshot()
+                let work = await barrierBroker.workState()
+                return status.isEnabled
+                    && snapshot.current?.activity.presentation.title == "Focus Timer"
+                    && snapshot.current?.activity.action?.identifier
+                        == CountdownActivityContract.cancelActionIdentifier
+                    && snapshot.current?.revision != retiredRevision
+                    && work.activeOwnershipCount == 1
+                    && work.pendingOwnershipIntentCount == 0
+            },
+            "retired operation identity cannot clear or stale a value-identical live replacement"
+        )
+        check(
+            focusTimer.menuContext(at: now) == .active(remainingText: "00:05"),
+            "value-identical replacement preserves its menu context after the old callback"
+        )
+        check(
+            await waitUntil { await barrierClock.pendingDeadlines == [replacementEnd] },
+            "settled replacement owns exactly one fresh expiry boundary"
+        )
+        check(focusTimer.requestCancel(), "replacement remains cancellable after predecessor completion")
+        check(
+            await waitUntil {
+                let providerWork = await barrierProvider.workState()
+                let brokerWork = await barrierBroker.workState()
+                let snapshot = await barrierBroker.snapshot()
+                return providerWork.isIdle
+                    && focusTimer.workState().isIdle
+                    && snapshot.current == nil
+                    && brokerWork.activeOwnershipCount == 0
+                    && brokerWork.pendingOwnershipIntentCount == 0
+            },
+            "replacement cancel route drains revision, boundary, ownership, and capacity"
+        )
+
+        await barrierBroker.gateNextRelease()
+        check(focusTimer.requestStart(duration: 5), "shutdown-barrier Focus Timer restarts")
+        check(
+            await waitUntil { await barrierProvider.countdown() != nil },
+            "shutdown-barrier restart reaches provider state"
+        )
+        guard let shutdownDeadline = await barrierProvider.countdown()?.endsAt else {
+            check(false, "shutdown-barrier restart exposes its deadline")
+            await focusTimer.shutdown()
+            await barrierBroker.shutdown()
+            return
+        }
+        check(
+            await waitUntil { await barrierClock.pendingDeadlines == [shutdownDeadline] },
+            "shutdown-barrier restart registers its expiry boundary"
+        )
+        await barrierClock.advance(to: shutdownDeadline)
+        check(
+            await waitUntil { await barrierBroker.releasePending },
+            "shutdown-barrier fixture reaches gated ownership release"
+        )
+
+        let shutdownFinished = CompletionFlag()
+        let shutdownTask = Task { @MainActor in
+            await focusTimer.shutdown()
+            shutdownFinished.isComplete = true
+        }
+        for _ in 0..<50 { await Task.yield() }
+        check(!shutdownFinished.isComplete, "Focus Timer shutdown joins natural-expiry ownership release")
+        let gatedProviderWork = await barrierProvider.workState()
+        let gatedBrokerWork = await barrierBroker.workState()
+        check(
+            !gatedProviderWork.isIdle
+                && gatedBrokerWork.activeOwnershipCount == 1,
+            "gated runtime shutdown reports physically unsettled provider and ownership work"
+        )
+
+        await barrierBroker.releaseRelease()
+        await shutdownTask.value
+        check(shutdownFinished.isComplete, "Focus Timer shutdown returns after physical release settles")
+        let settledProviderWork = await barrierProvider.workState()
+        let settledBrokerWork = await barrierBroker.workState()
+        check(
+            settledProviderWork.isIdle
+                && focusTimer.workState().isIdle
+                && settledBrokerWork.activeOwnershipCount == 0,
+            "Focus Timer shutdown barrier returns with zero provider, command, and ownership work"
+        )
+        await barrierBroker.shutdown()
     }
 
     private static func makeRuntime(events: EventLog) -> RuntimeFixture {
@@ -1653,6 +1953,17 @@ private final class Counter {
 }
 
 @MainActor
+private final class FocusTimerMenuContextProbe {
+    var context = ApplicationFocusTimerMenuContext.idle
+    private(set) var evaluationCount = 0
+
+    func evaluate() -> ApplicationFocusTimerMenuContext {
+        evaluationCount += 1
+        return context
+    }
+}
+
+@MainActor
 private final class RecordingControlPlane: ApplicationControlPlaneOwning {
     private(set) var lastCanCheckForUpdates: Bool?
     private(set) var presentationCount = 0
@@ -1665,11 +1976,13 @@ private final class RecordingControlPlane: ApplicationControlPlaneOwning {
 
     func start(
         canCheckForUpdates: Bool,
+        focusTimerContextProvider: @escaping @MainActor () -> ApplicationFocusTimerMenuContext,
         commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
     ) async {
         _ = commandHandler
         _ = displayPolicyHandler
+        _ = focusTimerContextProvider
         lastCanCheckForUpdates = canCheckForUpdates
     }
 
@@ -1694,14 +2007,20 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
     private(set) var menu: ApplicationMenuDescriptor?
     private(set) var commandHandler: (@MainActor (ApplicationControlCommand) -> Void)?
     private(set) var presentedModel: TrustSettingsViewModel?
+    private var descriptorProvider: (@MainActor () -> ApplicationMenuDescriptor)?
 
     func installStatusMenu(
-        _ descriptor: ApplicationMenuDescriptor,
+        descriptorProvider: @escaping @MainActor () -> ApplicationMenuDescriptor,
         commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
     ) {
         statusItemCount = 1
-        menu = descriptor
+        self.descriptorProvider = descriptorProvider
+        menu = descriptorProvider()
         self.commandHandler = commandHandler
+    }
+
+    func refreshMenu() {
+        menu = descriptorProvider?()
     }
 
     func presentSettings(model: TrustSettingsViewModel) {
@@ -1716,6 +2035,7 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
         statusItemCount = 0
         settingsWindowCount = 0
         menu = nil
+        descriptorProvider = nil
         commandHandler = nil
         presentedModel = nil
     }
@@ -2183,13 +2503,14 @@ private final class RecordingPanel: PanelPresenting {
 }
 
 @MainActor
-private final class VisibilityReportingPanel: PanelPresenting, PanelActivityVisibilityReporting {
+private final class VisibilityReportingPanel: PanelPresenting, PanelActivityVisibilityReporting, PanelFocusTimerLaunching {
     let displayIdentity: DisplayIdentity
     private let events: EventLog
     private var isWindowVisible = false
     private var isContentVisible = false
     private var lastReportedVisibility = false
     private var visibilityHandler: (@MainActor @Sendable (Bool) -> Void)?
+    private var focusTimerStartHandler: (@MainActor @Sendable (Int) -> Bool)?
 
     var isActivitySurfaceVisible: Bool {
         isWindowVisible && isContentVisible
@@ -2205,6 +2526,16 @@ private final class VisibilityReportingPanel: PanelPresenting, PanelActivityVisi
     ) {
         visibilityHandler = handler
         reportVisibility(force: true)
+    }
+
+    func setFocusTimerStartHandler(
+        _ handler: (@MainActor @Sendable (Int) -> Bool)?
+    ) {
+        focusTimerStartHandler = handler
+    }
+
+    func startFocusTimer(minutes: Int) -> Bool {
+        focusTimerStartHandler?(minutes) == true
     }
 
     func setContentVisible(_ visible: Bool) {
@@ -2338,6 +2669,84 @@ private actor CancellationIgnoringExpirationScheduler: ActivityExpirationSchedul
     }
 }
 
+private actor GatedReleaseBroker: GlanceOwnershipActivityBroker, GlanceRevisionActivityBroker {
+    private let broker = ActivityBroker(expirationScheduler: ManualExpirationScheduler())
+    private var shouldGateRelease = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    nonisolated var ownershipCoordinator: ActivityOwnershipCoordinator {
+        broker.ownershipCoordinator
+    }
+
+    var releasePending: Bool {
+        releaseContinuation != nil
+    }
+
+    func gateNextRelease() {
+        shouldGateRelease = true
+    }
+
+    func releaseRelease() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+
+    func claimOwnership(
+        of identity: ActivityIdentity,
+        admitting intent: ActivityOwnershipClaimIntent
+    ) async -> ActivityOwnershipLease? {
+        await broker.claimOwnership(of: identity, admitting: intent)
+    }
+
+    func releaseOwnership(_ lease: ActivityOwnershipLease) async -> Bool {
+        if shouldGateRelease {
+            shouldGateRelease = false
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+            }
+        }
+        return await broker.releaseOwnership(lease)
+    }
+
+    func submit(_ request: ActivityRequest) async throws -> ActivityBrokerSnapshot {
+        try await broker.submit(request)
+    }
+
+    func submit(
+        _ request: ActivityRequest,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) async throws -> ActivityBrokerSnapshot? {
+        try await broker.submit(request, ifOwnedBy: lease)
+    }
+
+    func cancel(_ identity: ActivityIdentity) async -> Bool {
+        await broker.cancel(identity)
+    }
+
+    func cancel(_ identity: ActivityIdentity, ifRevision revision: UInt64) async -> Bool {
+        await broker.cancel(identity, ifRevision: revision)
+    }
+
+    func cancel(
+        _ identity: ActivityIdentity,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) async -> Bool {
+        await broker.cancel(identity, ifOwnedBy: lease)
+    }
+
+    func workState() async -> ActivityBrokerWorkState {
+        await broker.workState()
+    }
+
+    func snapshot() async -> ActivityBrokerSnapshot {
+        await broker.snapshot()
+    }
+
+    func shutdown() async {
+        await broker.shutdown()
+    }
+}
+
 private actor ManualExpirationScheduler: ActivityExpirationScheduling {
     private struct Waiter {
         let identifier: UUID
@@ -2368,6 +2777,11 @@ private actor ManualExpirationScheduler: ActivityExpirationScheduling {
         } onCancel: {
             Task { await self.cancel(identifier) }
         }
+    }
+
+    func fireNext() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().continuation.resume()
     }
 
     private func cancel(_ identifier: UUID) {

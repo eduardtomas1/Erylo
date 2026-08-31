@@ -58,6 +58,20 @@ package final class ApplicationRuntime {
         self.controlPlane = controlPlane
         self.focusTimer = focusTimer
         self.requestApplicationTermination = requestApplicationTermination
+        if let focusTimer {
+            panelCoordinator.setFocusTimerStartHandler { [weak focusTimer] minutes in
+                switch minutes {
+                case FocusTimerPreset.fifteenMinutes.rawValue:
+                    focusTimer?.requestStart(.fifteenMinutes) == true
+                case FocusTimerPreset.twentyFiveMinutes.rawValue:
+                    focusTimer?.requestStart(.twentyFiveMinutes) == true
+                case FocusTimerPreset.fiftyMinutes.rawValue:
+                    focusTimer?.requestStart(.fiftyMinutes) == true
+                default:
+                    false
+                }
+            }
+        }
     }
 
     package static func production(
@@ -225,6 +239,9 @@ package final class ApplicationRuntime {
         if let controlPlane {
             await controlPlane.start(
                 canCheckForUpdates: canCheckForUpdates,
+                focusTimerContextProvider: { [weak focusTimer] in
+                    focusTimer?.menuContext(at: Date()) ?? .idle
+                },
                 commandHandler: { [weak self] command in
                     _ = self?.handle(command)
                 },

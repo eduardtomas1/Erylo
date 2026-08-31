@@ -80,6 +80,7 @@ public final class PanelCoordinator {
     private var terminalCleanupWaiters: [CheckedContinuation<Void, Never>] = []
     private var activityVisibilityHandler: (@MainActor @Sendable (Bool) -> Void)?
     private var lastReportedActivityVisibility = false
+    private var focusTimerStartHandler: (@MainActor @Sendable (Int) -> Bool)?
 
     /// Preserves the original coordinator entry point with a stopped, zero-work activity model.
     public convenience init(
@@ -232,6 +233,7 @@ public final class PanelCoordinator {
         await activityModel.shutdown()
         closeAllPanels()
         activityVisibilityHandler = nil
+        focusTimerStartHandler = nil
         finishTerminalCleanup()
     }
 
@@ -242,6 +244,16 @@ public final class PanelCoordinator {
     ) {
         activityVisibilityHandler = handler
         reportActivityVisibilityIfNeeded(force: true)
+    }
+
+    package func setFocusTimerStartHandler(
+        _ handler: (@MainActor @Sendable (Int) -> Bool)?
+    ) {
+        focusTimerStartHandler = handler
+        panels.values.forEach {
+            ($0 as? any PanelFocusTimerLaunching)?
+                .setFocusTimerStartHandler(handler)
+        }
     }
 
     /// Source-compatible immediate policy request. Use `updateAndWait(policy:)`
@@ -455,6 +467,9 @@ public final class PanelCoordinator {
         let lease = UUID()
         panels[displayID] = panel
         panelLeases[displayID] = lease
+
+        (panel as? any PanelFocusTimerLaunching)?
+            .setFocusTimerStartHandler(focusTimerStartHandler)
 
         if let demandReporter = panel as? any PanelPresentationDemandReporting {
             demandReporter.setPresentationDemandHandler { [weak self] isDemanded in

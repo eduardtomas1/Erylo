@@ -27,6 +27,14 @@ public enum SurfaceStrings {
         localized: "surface.empty.compact.ready",
         defaultValue: "Ready"
     )
+    public static let focusTimerLauncherTitle = String(
+        localized: "surface.focus-timer.launcher.title",
+        defaultValue: "Start focus"
+    )
+    public static let focusTimerLauncherHint = String(
+        localized: "surface.focus-timer.launcher.hint",
+        defaultValue: "Choose a 15, 25, or 50 minute focus timer."
+    )
     public static let compactPaused = String(
         localized: "surface.degraded.compact",
         defaultValue: "Paused"

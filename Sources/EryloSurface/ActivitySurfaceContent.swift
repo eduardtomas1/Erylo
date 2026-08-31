@@ -10,6 +10,45 @@ public enum ActivityAccent: Equatable, Sendable {
     case mist
 }
 
+package struct ActivitySurfaceTemporalProjection: Equatable, Sendable {
+    package let startedAt: Date
+    package let endsAt: Date
+
+    package func snapshot(at date: Date) -> ActivitySurfaceTemporalSnapshot {
+        let duration = endsAt.timeIntervalSince(startedAt)
+        let elapsed = date.timeIntervalSince(startedAt)
+        let rawRemaining = endsAt.timeIntervalSince(date)
+        let remaining = rawRemaining.isFinite ? max(rawRemaining, 0) : 0
+        return ActivitySurfaceTemporalSnapshot(
+            remainingText: Self.remainingText(seconds: Int(remaining.rounded(.up))),
+            fractionCompleted: min(max(elapsed / duration, 0), 1)
+        )
+    }
+
+    package static func remainingText(seconds: Int) -> String {
+        let boundedSeconds = min(
+            max(seconds, 0),
+            Int(CountdownLikeLimits.maximumDuration)
+        )
+        let hours = boundedSeconds / 3_600
+        let minutes = (boundedSeconds % 3_600) / 60
+        let seconds = boundedSeconds % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
+    }
+
+    private enum CountdownLikeLimits {
+        static let maximumDuration: TimeInterval = 30 * 24 * 60 * 60
+    }
+}
+
+package struct ActivitySurfaceTemporalSnapshot: Equatable, Sendable {
+    package let remainingText: String
+    package let fractionCompleted: Double
+}
+
 public struct ActivitySurfaceItem: Equatable, Sendable {
     public let identity: ActivityIdentity
     public let revision: UInt64
@@ -22,6 +61,8 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
     public let progressFraction: Double?
     public let progressValue: String?
     public let shortProgressValue: String?
+    package let temporalProjection: ActivitySurfaceTemporalProjection?
+    package let presentationRole: ActivityPresentationRole
 
     public init(_ presented: PresentedActivity) {
         identity = presented.activity.identity
@@ -40,6 +81,13 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
         shortProgressValue = presented.activity.presentation.progress.map {
             SurfaceStrings.shortProgressValue(Int(($0.fractionCompleted * 100).rounded()))
         }
+        temporalProjection = presented.activity.presentation.temporalProgress.map {
+            ActivitySurfaceTemporalProjection(
+                startedAt: $0.startedAt,
+                endsAt: $0.endsAt
+            )
+        }
+        presentationRole = presented.activity.presentation.presentationRole
     }
 
     public var accessibilitySummary: String {
@@ -181,6 +229,7 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
     public let queue: ActivityQueueContext
     public let action: SurfaceActivityAction?
     public let actionStatus: String?
+    public let showsFocusTimerLauncher: Bool
 
     public init(
         state: PanelPresentationState,
@@ -188,9 +237,11 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
         current: PresentedActivity?,
         queueContext: ActivityQueueContext,
         action: SurfaceActivityAction?,
-        actionDispatchState: ActivityActionDispatchState
+        actionDispatchState: ActivityActionDispatchState,
+        showsFocusTimerLauncher: Bool = false
     ) {
         self.state = state
+        self.showsFocusTimerLauncher = showsFocusTimerLauncher
         switch state {
         case .hidden:
             primary = .hidden
@@ -209,7 +260,9 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
                 primary = .activity(ActivitySurfaceItem(current))
             } else {
                 primary = .empty(
-                    title: state == .compact ? SurfaceStrings.compactQuietTitle : SurfaceStrings.quietTitle,
+                    title: showsFocusTimerLauncher
+                        ? SurfaceStrings.focusTimerLauncherTitle
+                        : (state == .compact ? SurfaceStrings.compactQuietTitle : SurfaceStrings.quietTitle),
                     detail: state == .compact ? nil : SurfaceStrings.quietDetail
                 )
             }
@@ -270,13 +323,17 @@ public struct PanelSurfaceAccessibility: Equatable, Sendable {
         case .hidden:
             ""
         case .compact, .peek:
-            switch content.primary {
+            if content.showsFocusTimerLauncher {
+                SurfaceStrings.focusTimerLauncherHint
+            } else {
+                switch content.primary {
             case .activity:
                 SurfaceStrings.expandHint
             case .empty, .degraded:
                 SurfaceStrings.hideHint
             case .hidden, .dropTarget:
                 ""
+                }
             }
         case .expanded:
             SurfaceStrings.collapseHint

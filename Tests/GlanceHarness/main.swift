@@ -24,6 +24,7 @@ enum GlanceHarnessMain {
         await harness.verifyCalendarPermissionSeams()
         await harness.verifyCalendarUnavailableTakeover()
         await harness.verifyCountdownCancellationReplacementAndExpiry()
+        await harness.verifyCountdownNaturalCompletionBarrier()
         await harness.verifyVisibleCountdownDemand()
         await harness.verifyCountdownDemandMutationOrdering()
         await harness.verifyBoundaryAndMutationDraining()
@@ -1895,7 +1896,8 @@ private struct GlanceHarness {
     mutating func verifyCountdownCancellationReplacementAndExpiry() async {
         let now = Date(timeIntervalSinceReferenceDate: 40_000)
         let clock = ManualGlanceClock(now: now)
-        let broker = makeBroker()
+        let acknowledgementScheduler = ManualBrokerScheduler()
+        let broker = ActivityBroker(expirationScheduler: acknowledgementScheduler)
         let provider = CountdownGlanceProvider(broker: broker, clock: clock)
         do {
             let first = try CountdownTimer(
@@ -1946,8 +1948,38 @@ private struct GlanceHarness {
             )
             await clock.advance(to: replacement.endsAt)
             check(await waitUntil { await provider.countdown() == nil }, "countdown expires at its one-shot boundary")
-            check(await broker.snapshot().ordered.isEmpty, "countdown expiry cancels broker activity")
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Focus complete",
+                "countdown expiry publishes one bounded completion acknowledgement"
+            )
+            check(
+                await broker.snapshot().current?.activity.action == nil,
+                "completion acknowledgement exposes no stale timer action"
+            )
+            check(await provider.status() == .disabled, "natural completion disables the provider")
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "natural completion releases broker ownership before acknowledgement expiry"
+            )
             check(await provider.workState().isIdle, "expired countdown owns zero work")
+            check(
+                await waitUntil { await acknowledgementScheduler.pendingCount == 1 },
+                "completion acknowledgement owns one short broker expiry"
+            )
+            await acknowledgementScheduler.fireNext()
+            check(
+                await waitUntil { await broker.snapshot().ordered.isEmpty },
+                "completion acknowledgement disappears at its bounded expiry"
+            )
+            check(
+                await broker.workState() == ActivityBrokerWorkState(
+                    scheduledExpiryCount: 0,
+                    subscriberCount: 0,
+                    activeOwnershipCount: 0,
+                    pendingOwnershipIntentCount: 0
+                ),
+                "completion acknowledgement expiry leaves no timer work or ownership"
+            )
 
             await provider.disable()
             await provider.disable()
@@ -1990,6 +2022,131 @@ private struct GlanceHarness {
         }
     }
 
+    mutating func verifyCountdownNaturalCompletionBarrier() async {
+        let now = Date(timeIntervalSinceReferenceDate: 41_000)
+        let clock = ManualGlanceClock(now: now)
+        let broker = GatedGlanceBroker()
+        let provider = CountdownGlanceProvider(broker: broker, clock: clock)
+        let completionGate = NaturalCompletionGate()
+        do {
+            let timer = try CountdownTimer(
+                title: "Barrier timer",
+                startedAt: now,
+                endsAt: now.addingTimeInterval(5)
+            )
+            let timerOperationIdentity = CountdownOperationIdentity()
+            await provider.setNaturalCompletionHandler { completion in
+                await completionGate.wait(completion)
+            }
+            await provider.setCountdown(
+                timer,
+                operationIdentity: timerOperationIdentity
+            )
+            await provider.enable()
+            check(
+                await waitUntil { await clock.pendingDeadlines == [timer.endsAt] },
+                "natural-completion barrier fixture owns one expiry boundary"
+            )
+
+            await broker.gateNextRelease()
+            await clock.advance(to: timer.endsAt)
+            check(
+                await waitUntil { await broker.releasePending },
+                "natural completion reaches the gated physical ownership release"
+            )
+            check(await provider.status() == .disabled, "gated natural completion retires logical provider state")
+            check(
+                !(await provider.workState().isIdle),
+                "gated natural completion remains accounted while lease release is unsettled"
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 1,
+                "gated natural completion retains ownership until physical release"
+            )
+
+            let disableFinished = CompletionFlag()
+            let disableTask = Task {
+                await provider.disable()
+                await disableFinished.markComplete()
+            }
+            await yieldSeveralTimes()
+            check(
+                !(await disableFinished.isComplete),
+                "concurrent disable is a barrier for natural-completion cleanup"
+            )
+
+            await broker.releaseRelease()
+            check(
+                await waitUntil { await completionGate.didStart },
+                "natural completion invokes its callback only after ownership release"
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "natural completion physically releases ownership before its callback"
+            )
+            let callbackWork = await provider.workState()
+            let disableDidFinish = await disableFinished.isComplete
+            check(
+                !callbackWork.isIdle && !disableDidFinish,
+                "callback settlement remains provider work and keeps disable blocked"
+            )
+
+            let replacement = try CountdownTimer(
+                title: "Reusable replacement",
+                startedAt: timer.endsAt,
+                endsAt: timer.endsAt.addingTimeInterval(30)
+            )
+            let replacementOperationIdentity = CountdownOperationIdentity()
+            await provider.setCountdown(
+                replacement,
+                operationIdentity: replacementOperationIdentity
+            )
+            let enableFinished = CompletionFlag()
+            let enableTask = Task {
+                await provider.enable()
+                await enableFinished.markComplete()
+            }
+            await yieldSeveralTimes()
+            let admittedReplacement = await provider.countdown()
+            let replacementEnableDidFinish = await enableFinished.isComplete
+            check(
+                admittedReplacement == replacement && !replacementEnableDidFinish,
+                "replacement is admitted while the predecessor callback keeps enable gated"
+            )
+            check(
+                await completionGate.completedTimer == timer,
+                "natural-completion callback identifies the exact retired timer generation"
+            )
+            check(
+                await completionGate.completedOperationIdentity == timerOperationIdentity
+                    && timerOperationIdentity != replacementOperationIdentity,
+                "natural-completion callback carries the immutable retired operation identity"
+            )
+
+            await completionGate.release()
+            await disableTask.value
+            await enableTask.value
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Reusable replacement",
+                "callback-gated natural completion permits its admitted generation-safe replacement"
+            )
+            check(
+                await waitUntil { await clock.pendingDeadlines == [replacement.endsAt] },
+                "replacement owns exactly one fresh expiry boundary"
+            )
+            await provider.disable()
+            let replacementProviderWork = await provider.workState()
+            let replacementBrokerWork = await broker.workState()
+            check(
+                replacementProviderWork.isIdle
+                    && replacementBrokerWork.activeOwnershipCount == 0,
+                "replacement reuse drains its boundary and ownership"
+            )
+        } catch {
+            recordUnexpected(error, context: "countdown natural-completion barrier")
+        }
+    }
+
     mutating func verifyVisibleCountdownDemand() async {
         let now = Date(timeIntervalSinceReferenceDate: 42_000.25)
         let clock = ManualGlanceClock(now: now)
@@ -2010,25 +2167,30 @@ private struct GlanceHarness {
             )
 
             let staticVersion = await broker.snapshot().version
+            let staticRevision = await broker.snapshot().current?.revision
             await provider.setPresentationDemand(.visible)
             check(await provider.presentationDemand() == .visible, "surface can explicitly demand visible timer updates")
-            check(await broker.snapshot().version == staticVersion + 1, "visible demand immediately refreshes timer presentation")
+            check(
+                await broker.snapshot().version == staticVersion,
+                "visible demand performs no broker progress publication"
+            )
             let firstTick = Date(timeIntervalSinceReferenceDate: 42_001)
             check(
-                await waitUntil { await clock.pendingDeadlines == [firstTick] },
-                "visible timer schedules one aligned second boundary"
+                await waitUntil { await clock.pendingDeadlines == [timer.endsAt] },
+                "visible timer retains only its single expiry boundary"
             )
 
             await clock.advance(to: firstTick)
+            await yieldSeveralTimes()
+            let afterVisibleTick = await broker.snapshot()
+            check(afterVisibleTick.version == staticVersion, "visible tick performs no broker mutation")
             check(
-                await waitUntil {
-                    (await broker.snapshot().current?.activity.presentation.progress?.fractionCompleted ?? 0) > 0
-                },
-                "visible timer publishes timestamp-derived progress"
+                afterVisibleTick.current?.revision == staticRevision,
+                "visible tick preserves the exact cancel action revision"
             )
             check(
-                await waitUntil { await clock.pendingDeadlines == [firstTick.addingTimeInterval(1)] },
-                "visible timer schedules one successor one-shot instead of a repeating loop"
+                await clock.pendingDeadlines == [timer.endsAt],
+                "visible tick allocates no successor timer work"
             )
 
             let visibleVersion = await broker.snapshot().version
@@ -2044,7 +2206,11 @@ private struct GlanceHarness {
             await provider.setPresentationDemand(.visible)
             await clock.advance(to: timer.endsAt)
             check(await waitUntil { await provider.countdown() == nil }, "visible timer expires deterministically at its end date")
-            check(await broker.snapshot().ordered.isEmpty, "visible timer expiry removes broker activity")
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Focus complete",
+                "visible timer expiry replaces the action with one completion acknowledgement"
+            )
+            check(await provider.status() == .disabled, "visible timer natural completion disables provider")
             check(await provider.workState().isIdle, "visible timer expiry stops all one-shot work")
 
             let cancellable = try CountdownTimer(
@@ -2054,6 +2220,7 @@ private struct GlanceHarness {
             )
             await provider.setCountdown(cancellable)
             await provider.setPresentationDemand(.visible)
+            await provider.enable()
             check(
                 await waitUntil { await clock.pendingCount == 1 },
                 "new visible timer owns one boundary"
@@ -2154,13 +2321,12 @@ private struct GlanceHarness {
                 "replacement B owns the exact broker snapshot after visible demand"
             )
             check(
-                await broker.submitCallCount == 4,
-                "blocked A, replacement B, and visible demand each perform their ordered submit"
+                await broker.submitCallCount == 3,
+                "replacement performs its ordered submit while visible demand stays broker-free"
             )
-            let firstTick = Date(timeIntervalSinceReferenceDate: 44_001)
             check(
-                await waitUntil { await clock.pendingDeadlines == [firstTick] },
-                "visible replacement owns one aligned successor boundary"
+                await waitUntil { await clock.pendingDeadlines == [replacement.endsAt] },
+                "visible replacement owns only its expiry boundary"
             )
             check(
                 await provider.workState() == GlanceProviderWorkState(
@@ -2179,10 +2345,15 @@ private struct GlanceHarness {
                 "replacement-demand ordering retains one bounded ownership lane"
             )
 
-            await clock.advance(to: firstTick)
+            let versionBeforeProjectionTick = replacementSnapshot.version
+            await clock.advance(to: Date(timeIntervalSinceReferenceDate: 44_001))
+            await yieldSeveralTimes()
+            let submitCountAfterProjectionTick = await broker.submitCallCount
+            let snapshotAfterProjectionTick = await broker.snapshot()
             check(
-                await waitUntil { await broker.submitCallCount == 5 },
-                "visible replacement performs one bounded progress refresh"
+                submitCountAfterProjectionTick == 3
+                    && snapshotAfterProjectionTick.version == versionBeforeProjectionTick,
+                "visible replacement progress performs no provider or broker work"
             )
             check(
                 await broker.snapshot().current?.activity.presentation.title
@@ -2193,8 +2364,8 @@ private struct GlanceHarness {
             await provider.cancelCountdown()
             let reusable = try CountdownTimer(
                 title: "DEMAND ORDERING REUSABLE",
-                startedAt: firstTick,
-                endsAt: firstTick.addingTimeInterval(120)
+                startedAt: Date(timeIntervalSinceReferenceDate: 44_001),
+                endsAt: Date(timeIntervalSinceReferenceDate: 44_121)
             )
             await provider.setCountdown(reusable)
             let reusableCountdown = await provider.countdown()
@@ -2299,7 +2470,7 @@ private struct GlanceHarness {
             let submitCallCount = await broker.submitCallCount
             let cancelCallCount = await broker.cancelCallCount
             check(
-                submitCallCount == 3 && cancelCallCount == 1,
+                submitCallCount == 2 && cancelCallCount == 1,
                 "cancel-demand ordering performs the expected bounded physical mutations"
             )
             let cancelledProviderWork = await provider.workState()
@@ -2457,11 +2628,11 @@ private struct GlanceHarness {
             )
             check(await countdown.status().health == .healthy, "stale countdown submission cannot overwrite re-enabled health")
 
-            await countdownBroker.gateNextCancel()
+            await countdownBroker.gateNextSubmit()
             await countdownClock.advance(to: replacement.endsAt)
             check(
-                await waitUntil { await countdownBroker.cancelPending },
-                "countdown expiry reaches gated broker cancellation"
+                await waitUntil { await countdownBroker.submitPending },
+                "countdown expiry reaches gated completion acknowledgement"
             )
             let expiryDisableFlag = CompletionFlag()
             let expiryDisable = Task {
@@ -2476,9 +2647,9 @@ private struct GlanceHarness {
             )
             check(
                 !(await expiryDisableFlag.isComplete),
-                "countdown disable drains expiry already inside broker cancellation"
+                "countdown disable drains expiry already inside broker acknowledgement"
             )
-            await countdownBroker.releaseCancel()
+            await countdownBroker.releaseSubmit()
             await expiryDisable.value
             check(await countdown.status() == .disabled, "stale expiry cannot overwrite disabled health")
             check(await countdown.countdown() == replacement, "stale expiry cannot clear the retained countdown")
@@ -2593,7 +2764,11 @@ private struct GlanceHarness {
 
             await clock.fire(index: 0, at: replacement.endsAt)
             check(await waitUntil { await provider.countdown() == nil }, "current timer generation can expire")
-            check(await broker.snapshot().ordered.isEmpty, "current expiry reaches broker cancellation")
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Focus complete",
+                "current expiry publishes only the bounded completion acknowledgement"
+            )
+            check(await provider.status() == .disabled, "current expiry disables its provider generation")
         } catch {
             recordUnexpected(error, context: "timer generation backstop")
         }
@@ -4207,6 +4382,27 @@ private final class ThreadSafeFlag: @unchecked Sendable {
     }
 }
 
+private actor NaturalCompletionGate {
+    private(set) var didStart = false
+    private(set) var completedTimer: CountdownTimer?
+    private(set) var completedOperationIdentity: CountdownOperationIdentity?
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait(_ completion: CountdownNaturalCompletion) async {
+        didStart = true
+        completedTimer = completion.countdown
+        completedOperationIdentity = completion.operationIdentity
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 private final class WeakProviderReference<Value: AnyObject>: @unchecked Sendable {
     private let lock = NSLock()
     private weak var value: Value?
@@ -4247,9 +4443,11 @@ private actor GatedGlanceBroker: GlanceOwnershipActivityBroker, GlanceRevisionAc
     private var shouldGateClaim = false
     private var shouldGateSubmit = false
     private var shouldGateCancel = false
+    private var shouldGateRelease = false
     private var claimContinuation: CheckedContinuation<Void, Never>?
     private var submitContinuation: CheckedContinuation<Void, Never>?
     private var cancelContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
     private(set) var claimCallCount = 0
     private(set) var claimCompletionCount = 0
     private(set) var lastClaimAccepted: Bool?
@@ -4265,6 +4463,7 @@ private actor GatedGlanceBroker: GlanceOwnershipActivityBroker, GlanceRevisionAc
     var claimPending: Bool { claimContinuation != nil }
     var submitPending: Bool { submitContinuation != nil }
     var cancelPending: Bool { cancelContinuation != nil }
+    var releasePending: Bool { releaseContinuation != nil }
     var physicalCallCount: Int { submitCallCount + cancelCallCount }
 
     nonisolated var ownershipCoordinator: ActivityOwnershipCoordinator {
@@ -4289,7 +4488,22 @@ private actor GatedGlanceBroker: GlanceOwnershipActivityBroker, GlanceRevisionAc
     }
 
     func releaseOwnership(_ lease: ActivityOwnershipLease) async -> Bool {
-        await broker.releaseOwnership(lease)
+        if shouldGateRelease {
+            shouldGateRelease = false
+            await withCheckedContinuation { continuation in
+                releaseContinuation = continuation
+            }
+        }
+        return await broker.releaseOwnership(lease)
+    }
+
+    func gateNextRelease() {
+        shouldGateRelease = true
+    }
+
+    func releaseRelease() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 
     func gateNextClaim() {
@@ -4875,6 +5089,7 @@ private actor ManualGlanceClock: GlanceClock {
     }
 
     var pendingCount: Int { waiters.count }
+
     var pendingDeadlines: [Date] { waiters.map(\.deadline).sorted() }
 
     func now() async -> Date {
@@ -4997,6 +5212,11 @@ private actor ManualBrokerScheduler: ActivityExpirationScheduling {
     private(set) var totalSleepCount = 0
 
     var pendingCount: Int { waiters.count }
+
+    func fireNext() {
+        guard !waiters.isEmpty else { return }
+        waiters.removeFirst().continuation.resume()
+    }
 
     func sleep(for duration: Duration) async throws {
         let identifier = UUID()

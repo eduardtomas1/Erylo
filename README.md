@@ -124,14 +124,26 @@ disappears.
 ### Volume
 
 - Enable it explicitly in Settings; it needs no permission or network access.
+- Get row-local confirmation after an explicit enable; persisted launch restore
+  remains quiet.
 - Treat the current default-output state at enable/restore as a quiet baseline,
-  then briefly acknowledge later volume, mute, and output-device changes.
+  then show later level changes as a percentage, mute as **Muted**, unmute as
+  **Sound on**, and an output switch as the bounded device name or **Audio output**.
 - Use CoreAudio property listeners and cancellable 1.8-second presentations, not
   polling or a permanent HUD.
+- Keep output names transient: they are not persisted, logged, diagnosed, or exported.
+- Let the short Volume acknowledgement temporarily outrank a Focus Timer, then
+  restore the exact same timer and working Cancel action when it expires.
 
-These are the complete live utilities today. The screenshots above show the real
-Focus Timer; Battery and Volume still require the manual hardware validation
-listed in the compatibility matrix before a signed release.
+<p align="center">
+  <img src="docs/images/erylo-volume-muted-notched.png" width="480" alt="Erylo's compact notch-native muted acknowledgement with a speaker slash symbol and the word Muted">
+  <br>
+  <img src="docs/images/erylo-volume-output-notched.png" width="480" alt="Erylo's expanded notch-native output-change acknowledgement naming Studio Display">
+</p>
+
+These are the complete live utilities today. The screenshots show native
+production-surface renders; Battery and Volume still require the manual hardware
+validation listed in the compatibility matrix before a signed release.
 
 ## What Erylo is growing into
 

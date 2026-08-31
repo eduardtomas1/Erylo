@@ -22,6 +22,7 @@ enum AppRuntimeHarnessMain {
         await harness.verifyCallerCancellationDoesNotAbandonStartup()
         await harness.verifyControlPlanePresentationAndSafeSettings()
         await harness.verifySystemGlanceProductionSlice()
+        await harness.verifyVolumePriorityHandoffPreservesFocusTimer()
         await harness.verifyRetiredVolumeExpiryDrainAcrossResetAndShutdown()
         await harness.verifyMenuCommandRoutingAndUpdateAvailability()
         await harness.verifyFocusTimerVerticalSlice()
@@ -1031,6 +1032,133 @@ private struct AppRuntimeHarness {
             check(await broker.workState() == .stopped, "shutdown-first reset leaves the broker drained")
         } catch {
             recordUnexpected(error, context: "shutdown-first Volume reset drain")
+        }
+    }
+
+    mutating func verifyVolumePriorityHandoffPreservesFocusTimer() async {
+        do {
+            let now = Date(timeIntervalSinceReferenceDate: 72_000)
+            let timerClock = ManualFocusClock(now: now)
+            let volumeExpiration = ManualExpirationScheduler()
+            let broker = ActivityBroker(expirationScheduler: volumeExpiration)
+            let focusTimer = FocusTimerRuntimeService(broker: broker, clock: timerClock)
+            let router = FocusTimerActionRouter(broker: broker, focusTimer: focusTimer)
+            await focusTimer.start()
+            focusTimer.setSurfaceVisible(true)
+            check(
+                focusTimer.requestStart(.twentyFiveMinutes),
+                "priority-handoff fixture starts an active Focus Timer"
+            )
+            check(
+                await waitUntil {
+                    await broker.snapshot().current?.activity.identity
+                        == CountdownActivityContract.identity
+                },
+                "priority-handoff fixture publishes the Focus Timer"
+            )
+
+            guard let timerBeforeVolume = await broker.snapshot().current,
+                  let timerAction = timerBeforeVolume.activity.action else {
+                check(false, "priority-handoff fixture captures the exact timer revision")
+                check(false, "priority-handoff fixture captures the exact timer action")
+                await focusTimer.shutdown()
+                await broker.shutdown()
+                return
+            }
+            let timerVersion = await broker.snapshot().version
+            let timerDeadlines = await timerClock.pendingDeadlines
+            let routedAction = SurfaceActionIdentity(
+                activityIdentity: timerBeforeVolume.activity.identity,
+                activityRevision: timerBeforeVolume.revision,
+                actionIdentifier: timerAction.identifier
+            )
+
+            let baseline = try VolumeSnapshot(
+                deviceID: 11,
+                scalar: 0.32,
+                isMuted: false,
+                outputDisplayName: "MacBook Pro Speakers"
+            )
+            let changed = try VolumeSnapshot(
+                deviceID: 11,
+                scalar: 0.48,
+                isMuted: false,
+                outputDisplayName: "MacBook Pro Speakers"
+            )
+            let source = RuntimeVolumeSource(initialEvent: .snapshot(baseline))
+            let volume = VolumeGlanceProvider(broker: broker, source: source)
+            await volume.enable()
+            check(
+                await broker.snapshot().version == timerVersion,
+                "quiet Volume activation performs no timer broker churn"
+            )
+
+            await source.emit(.snapshot(changed))
+            check(
+                await waitUntil {
+                    let snapshot = await broker.snapshot()
+                    return snapshot.current?.activity.identity.source == .volume
+                        && snapshot.queued.first?.activity.identity
+                            == CountdownActivityContract.identity
+                },
+                "Volume transient preempts the active Focus Timer"
+            )
+            let preempted = await broker.snapshot()
+            check(
+                preempted.version == timerVersion + 1
+                    && preempted.current?.activity.priority
+                        == ActivityPriority.high
+                    && preempted.queued.first?.activity.priority
+                        == timerBeforeVolume.activity.priority
+                    && (preempted.current?.submissionSequence ?? 0)
+                        > timerBeforeVolume.submissionSequence,
+                "Volume wins only by higher priority, not arrival order or timer replacement"
+            )
+            check(
+                preempted.queued.first == timerBeforeVolume
+                    && preempted.ordered.count == 2,
+                "preemption preserves the exact timer revision, action, and queue record"
+            )
+            let deadlinesDuringVolume = await timerClock.pendingDeadlines
+            let volumeExpiryCount = await volumeExpiration.pendingCount
+            check(
+                deadlinesDuringVolume == timerDeadlines && volumeExpiryCount == 1,
+                "Volume adds only its bounded expiry and leaves timer scheduling untouched"
+            )
+
+            await volumeExpiration.fireNext()
+            check(
+                await waitUntil {
+                    let snapshot = await broker.snapshot()
+                    return snapshot.version == timerVersion + 2
+                        && snapshot.current == timerBeforeVolume
+                        && snapshot.queued.isEmpty
+                },
+                "Volume expiry restores the exact same timer revision and action"
+            )
+            check(
+                await timerClock.pendingDeadlines == timerDeadlines,
+                "Volume submit and expiry create no timer broker or boundary churn"
+            )
+            check(
+                await router.handle(.cancel, identity: routedAction) == .handled,
+                "the original Cancel action remains valid after Volume expiry"
+            )
+            check(
+                await waitUntil {
+                    await broker.snapshot().ordered.isEmpty
+                        && focusTimer.workState().isIdle
+                },
+                "restored timer Cancel drains the exact live timer"
+            )
+
+            await volume.disable()
+            await focusTimer.shutdown()
+            check(await volume.workState().isIdle, "priority-handoff Volume disable leaves zero work")
+            check(await broker.workState() == .idle, "priority-handoff cleanup leaves the shared broker idle")
+            await broker.shutdown()
+        } catch {
+            recordUnexpected(error, context: "Volume and Focus Timer priority handoff")
         }
     }
 

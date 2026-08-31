@@ -85,7 +85,7 @@ public final class PanelSurfaceModel {
             state: state,
             metrics: metrics,
             showsFocusTimerLauncher: showsFocusTimerLauncher,
-            minimumNotchWingWidth: showsTemporalTimer ? 48 : 0
+            minimumNotchWingWidth: minimumNotchWingWidth
         )
     }
 
@@ -95,6 +95,18 @@ public final class PanelSurfaceModel {
 
     private var showsTemporalTimer: Bool {
         activityModel.current?.activity.presentation.temporalProgress != nil
+    }
+
+    private var minimumNotchWingWidth: CGFloat {
+        if showsTemporalTimer { return 48 }
+        return switch activityModel.current?.activity.presentation.presentationRole {
+        case .volumeMuted, .volumeUnmuted:
+            42
+        case .volumeOutputChanged:
+            82
+        case .standard, .completionAcknowledgement, .volumeLevelChanged, .none:
+            0
+        }
     }
 
     package var isTemporalProjectionActive: Bool {

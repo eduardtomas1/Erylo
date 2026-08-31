@@ -526,9 +526,20 @@ public actor VolumeGlanceProvider {
 
         switch event {
         case let .snapshot(snapshot):
-            let previous = lastSnapshot
+            guard let previous = lastSnapshot else {
+                lastSnapshot = snapshot
+                currentStatus = GlanceProviderStatus(
+                    isEnabled: true,
+                    capability: .available,
+                    health: .healthy
+                )
+                return
+            }
             lastSnapshot = snapshot
-            guard previous != nil else {
+            guard let change = VolumePresentationChange.classify(
+                previous: previous,
+                current: snapshot
+            ) else {
                 currentStatus = GlanceProviderStatus(
                     isEnabled: true,
                     capability: .available,
@@ -537,7 +548,9 @@ public actor VolumeGlanceProvider {
                 return
             }
             do {
-                _ = try await broker.submit(GlanceRequestFactory.volume(snapshot))
+                _ = try await broker.submit(
+                    GlanceRequestFactory.volume(snapshot, change: change)
+                )
                 currentStatus = GlanceProviderStatus(
                     isEnabled: true,
                     capability: .available,

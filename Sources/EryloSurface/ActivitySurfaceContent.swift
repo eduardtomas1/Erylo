@@ -63,12 +63,17 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
     public let shortProgressValue: String?
     package let temporalProjection: ActivitySurfaceTemporalProjection?
     package let presentationRole: ActivityPresentationRole
+    package let notchCompactValue: String?
 
     public init(_ presented: PresentedActivity) {
         identity = presented.activity.identity
         revision = presented.revision
         kind = presented.activity.kind
-        let descriptor = Self.descriptor(for: presented.activity.kind)
+        presentationRole = presented.activity.presentation.presentationRole
+        let descriptor = Self.descriptor(
+            for: presented.activity.kind,
+            presentationRole: presentationRole
+        )
         kindLabel = descriptor.kindLabel
         symbolName = descriptor.symbolName
         accent = descriptor.accent
@@ -87,19 +92,52 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
                 endsAt: $0.endsAt
             )
         }
-        presentationRole = presented.activity.presentation.presentationRole
+        notchCompactValue = switch presentationRole {
+        case .volumeLevelChanged:
+            shortProgressValue
+        case .volumeMuted:
+            SurfaceStrings.volumeMuted
+        case .volumeUnmuted:
+            SurfaceStrings.volumeUnmuted
+        case .volumeOutputChanged:
+            title
+        case .standard, .completionAcknowledgement:
+            nil
+        }
     }
 
     public var accessibilitySummary: String {
-        [kindLabel, title, detail, progressValue]
-            .compactMap { $0 }
-            .joined(separator: ", ")
+        let components: [String?] = switch presentationRole {
+        case .volumeLevelChanged:
+            [kindLabel, progressValue]
+        case .volumeMuted:
+            [kindLabel, SurfaceStrings.volumeMuted]
+        case .volumeUnmuted:
+            [kindLabel, SurfaceStrings.volumeUnmuted, progressValue]
+        case .volumeOutputChanged:
+            [kindLabel, SurfaceStrings.volumeOutputChanged, title]
+        case .standard, .completionAcknowledgement:
+            [kindLabel, title, detail, progressValue]
+        }
+        return components.compactMap { $0 }.joined(separator: ", ")
     }
 
     private static func descriptor(
-        for kind: ActivityKind
+        for kind: ActivityKind,
+        presentationRole: ActivityPresentationRole
     ) -> (kindLabel: String, symbolName: String, accent: ActivityAccent) {
-        switch kind {
+        if kind == .volume {
+            return switch presentationRole {
+            case .volumeMuted:
+                (SurfaceStrings.volumeKind, "speaker.slash.fill", .mist)
+            case .volumeOutputChanged:
+                (SurfaceStrings.volumeKind, "hifispeaker.2.fill", .mist)
+            case .volumeLevelChanged, .volumeUnmuted, .standard,
+                 .completionAcknowledgement:
+                (SurfaceStrings.volumeKind, "speaker.wave.2.fill", .mist)
+            }
+        }
+        return switch kind {
         case .generic:
             (SurfaceStrings.genericKind, "sparkle", .mint)
         case .battery:
@@ -111,7 +149,7 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
         case .meeting:
             (SurfaceStrings.meetingKind, "calendar", .sky)
         case .volume:
-            (SurfaceStrings.volumeKind, "speaker.fill", .mist)
+            preconditionFailure("Volume presentation descriptor must resolve above")
         case .media:
             (SurfaceStrings.mediaKind, "waveform", .coral)
         case .file:

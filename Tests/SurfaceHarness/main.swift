@@ -36,7 +36,7 @@ enum SurfaceHarnessMain {
         await harness.verifySharedBrokerVisibilityAndDisabledWork()
         if let outputDirectory = ProcessInfo.processInfo.environment["ERYLO_VISUAL_QA_DIRECTORY"] {
             do {
-                try writeFocusTimerVisualQA(to: URL(fileURLWithPath: outputDirectory))
+                try writeNativeVisualQA(to: URL(fileURLWithPath: outputDirectory))
             } catch {
                 fputs("Visual QA rendering failed: \(error)\n", stderr)
                 Darwin.exit(1)
@@ -2354,6 +2354,8 @@ private struct SurfaceHarness {
             (ActivitySurfacePreviewCatalog.timerCompletion, .timer, SurfaceStrings.timerKind),
             (ActivitySurfacePreviewCatalog.meeting, .meeting, SurfaceStrings.meetingKind),
             (ActivitySurfacePreviewCatalog.volume, .volume, SurfaceStrings.volumeKind),
+            (ActivitySurfacePreviewCatalog.volumeMuted, .volume, SurfaceStrings.volumeKind),
+            (ActivitySurfacePreviewCatalog.volumeOutput, .volume, SurfaceStrings.volumeKind),
             (ActivitySurfacePreviewCatalog.media, .media, SurfaceStrings.mediaKind),
             (ActivitySurfacePreviewCatalog.file, .file, SurfaceStrings.fileKind),
         ]
@@ -2374,6 +2376,104 @@ private struct SurfaceHarness {
             } catch {
                 recordUnexpected(error, context: "preview \(scenario.name)")
             }
+        }
+
+        do {
+            guard let levelPresented = try ActivitySurfacePreviewCatalog.volume.snapshot().current,
+                  let mutedPresented = try ActivitySurfacePreviewCatalog.volumeMuted.snapshot().current,
+                  let outputPresented = try ActivitySurfacePreviewCatalog.volumeOutput.snapshot().current else {
+                check(false, "production-faithful Volume previews provide current content")
+                return
+            }
+            let level = ActivitySurfaceItem(levelPresented)
+            let muted = ActivitySurfaceItem(mutedPresented)
+            let output = ActivitySurfaceItem(outputPresented)
+            check(
+                level.title == "Volume"
+                    && level.shortProgressValue == SurfaceStrings.shortProgressValue(72),
+                "level preview renders a truthful percentage"
+            )
+            check(
+                level.symbolName == "speaker.wave.2.fill"
+                    && level.accessibilitySummary
+                        == [SurfaceStrings.volumeKind, SurfaceStrings.progressValue(72)]
+                            .joined(separator: ", "),
+                "level preview has an appropriate symbol and non-duplicative VoiceOver copy"
+            )
+            check(
+                muted.title == SurfaceStrings.volumeMuted
+                    && muted.progressFraction == nil
+                    && muted.shortProgressValue == nil,
+                "muted preview says Muted and never renders zero percent"
+            )
+            check(
+                muted.symbolName == "speaker.slash.fill"
+                    && muted.notchCompactValue == SurfaceStrings.volumeMuted
+                    && muted.accessibilitySummary
+                        == [SurfaceStrings.volumeKind, SurfaceStrings.volumeMuted]
+                            .joined(separator: ", "),
+                "muted preview has an appropriate symbol and non-duplicative VoiceOver copy"
+            )
+            check(
+                output.title == "Studio Display"
+                    && output.detail == SurfaceStrings.volumeOutputChanged
+                    && output.notchCompactValue == "Studio Display",
+                "output preview renders the bounded device name in compact and expanded projections"
+            )
+            check(
+                output.symbolName == "hifispeaker.2.fill"
+                    && output.accessibilitySummary
+                        == [
+                            SurfaceStrings.volumeKind,
+                            SurfaceStrings.volumeOutputChanged,
+                            "Studio Display",
+                        ].joined(separator: ", "),
+                "output preview has an appropriate symbol and non-duplicative VoiceOver copy"
+            )
+
+            let notchedDisplay = DisplayGeometry(
+                frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
+                visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
+                backingScaleFactor: 2,
+                topEdgeOcclusion: TopEdgeOcclusion(
+                    frame: CGRect(x: 610, y: 856, width: 220, height: 44)
+                )
+            )
+            let mutedModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.volumeMuted,
+                displayGeometry: notchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                mutedModel.layout.surfaceFrame.width >= 304,
+                "notch-native Muted state reserves enough wing width for unclipped copy"
+            )
+
+            let unmutedRequest = ActivityRequest(
+                identifier: "preview.volume.unmuted",
+                source: ActivitySource.volume.rawValue,
+                kind: ActivityKind.volume.rawValue,
+                priority: ActivityPriority.high.rawValue,
+                title: "Sound on",
+                progress: 0.64,
+                temporalProgress: nil,
+                presentationRole: .volumeUnmuted
+            )
+            let unmuted = ActivitySurfaceItem(
+                PresentedActivity(
+                    activity: try Activity(validating: unmutedRequest),
+                    submissionSequence: 1,
+                    revision: 1
+                )
+            )
+            check(
+                unmuted.title == SurfaceStrings.volumeUnmuted
+                    && unmuted.notchCompactValue == SurfaceStrings.volumeUnmuted
+                    && unmuted.progressFraction == 0.64,
+                "unmute presentation says Sound on while retaining truthful level progress"
+            )
+        } catch {
+            recordUnexpected(error, context: "semantic Volume surface previews")
         }
 
         do {
@@ -2447,7 +2547,7 @@ private struct SurfaceHarness {
             ),
             "degraded stream state has honest fallback copy"
         )
-        check(ActivitySurfacePreviewCatalog.representative.count == 13, "preview seam includes launcher, timer lifecycle, and representative state scenarios")
+        check(ActivitySurfacePreviewCatalog.representative.count == 15, "preview seam includes launcher, timer lifecycle, and representative Volume states")
 
         do {
             guard let current = try ActivitySurfacePreviewCatalog.generic.snapshot().current else {
@@ -3478,19 +3578,25 @@ private func makeDisplaySnapshot(
 }
 
 @MainActor
-private func writeFocusTimerVisualQA(to directory: URL) throws {
+private func writeNativeVisualQA(to directory: URL) throws {
     try FileManager.default.createDirectory(
         at: directory,
         withIntermediateDirectories: true
     )
     let frame = CGRect(x: 0, y: 0, width: 1_440, height: 900)
-    let geometry = DisplayGeometry(
+    let notchedGeometry = DisplayGeometry(
         frame: frame,
         visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
         backingScaleFactor: 2,
         topEdgeOcclusion: TopEdgeOcclusion(
             frame: CGRect(x: 610, y: 856, width: 220, height: 44)
         )
+    )
+    let notchlessGeometry = DisplayGeometry(
+        frame: frame,
+        visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
+        backingScaleFactor: 2,
+        topEdgeOcclusion: nil
     )
     let visualNow = Date()
     let temporalRequest = ActivityRequest(
@@ -3519,14 +3625,23 @@ private func writeFocusTimerVisualQA(to directory: URL) throws {
         state: .expanded,
         current: temporalRequest
     )
-    let scenarios: [(String, ActivitySurfacePreviewScenario)] = [
-        ("erylo-timer-launcher.png", ActivitySurfacePreviewCatalog.focusTimerLauncher),
-        ("erylo-timer-compact.png", temporalCompact),
-        ("erylo-timer-expanded.png", temporalExpanded),
-        ("erylo-timer-completion.png", ActivitySurfacePreviewCatalog.timerCompletion),
+    let compactOutput = ActivitySurfacePreviewScenario(
+        name: "Volume output compact visual QA",
+        state: .compact,
+        current: ActivitySurfacePreviewCatalog.volumeOutput.current
+    )
+    let scenarios: [(String, ActivitySurfacePreviewScenario, DisplayGeometry)] = [
+        ("erylo-timer-launcher.png", ActivitySurfacePreviewCatalog.focusTimerLauncher, notchedGeometry),
+        ("erylo-timer-compact.png", temporalCompact, notchedGeometry),
+        ("erylo-timer-expanded.png", temporalExpanded, notchedGeometry),
+        ("erylo-timer-completion.png", ActivitySurfacePreviewCatalog.timerCompletion, notchedGeometry),
+        ("erylo-volume-muted-notched.png", ActivitySurfacePreviewCatalog.volumeMuted, notchedGeometry),
+        ("erylo-volume-output-notched.png", ActivitySurfacePreviewCatalog.volumeOutput, notchedGeometry),
+        ("erylo-volume-muted-notchless.png", ActivitySurfacePreviewCatalog.volumeMuted, notchlessGeometry),
+        ("erylo-volume-output-notchless.png", compactOutput, notchlessGeometry),
     ]
 
-    for (filename, scenario) in scenarios {
+    for (filename, scenario, geometry) in scenarios {
         let model = try ActivitySurfacePreviewCatalog.makeModel(
             scenario: scenario,
             displayGeometry: geometry,

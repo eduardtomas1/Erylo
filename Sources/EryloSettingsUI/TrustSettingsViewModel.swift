@@ -64,6 +64,7 @@ public final class TrustSettingsViewModel {
     public private(set) var settings: EryloSettings
     public private(set) var launchAtLogin: LaunchAtLoginSnapshot
     public private(set) var statusMessage: String?
+    package private(set) var moduleFeedback: [EryloModule: String] = [:]
     public private(set) var isWorking = false
     public private(set) var displayChoices: [DisplayChoice]
     public let availableModules: Set<EryloModule>
@@ -90,6 +91,9 @@ public final class TrustSettingsViewModel {
 
     @ObservationIgnored
     private var latestAppliedSequence: UInt64 = 0
+
+    @ObservationIgnored
+    private var modulesWithFailureFeedback: Set<EryloModule> = []
 
     public init(
         coordinator: any TrustSettingsCoordinating,
@@ -127,7 +131,10 @@ public final class TrustSettingsViewModel {
 
     public func setModuleEnabled(_ module: EryloModule, enabled: Bool) async {
         guard availableModules.contains(module) else {
-            statusMessage = "This utility is not connected in this build. No work was started."
+            let message = "This utility is not connected in this build. No work was started."
+            moduleFeedback[module] = message
+            modulesWithFailureFeedback.insert(module)
+            statusMessage = message
             return
         }
         let sequence = beginOperation()
@@ -136,12 +143,23 @@ public final class TrustSettingsViewModel {
             enabled: enabled,
             permissionPolicy: module.permissionRequirement == nil ? .doNotRequest : .requestIfNeeded
         )
-        apply(result, sequence: sequence)
+        if apply(result, sequence: sequence) {
+            statusMessage = nil
+            updateModuleFeedback(
+                for: module,
+                requestedEnabled: enabled,
+                result: result
+            )
+        }
         endOperation()
     }
 
     public func isModuleAvailable(_ module: EryloModule) -> Bool {
         availableModules.contains(module)
+    }
+
+    package func moduleFeedbackIsFailure(for module: EryloModule) -> Bool {
+        modulesWithFailureFeedback.contains(module)
     }
 
     /// Package-only startup reconciliation after the application restores enabled
@@ -233,8 +251,12 @@ public final class TrustSettingsViewModel {
         let sequence = beginOperation()
         let result = await coordinator.resetToSafeDefaults()
         let didApply = apply(result, sequence: sequence)
-        if didApply, result.outcome == .applied {
-            statusMessage = "Safe defaults restored. All activity modules are off."
+        if didApply, result.failure == nil {
+            moduleFeedback.removeAll(keepingCapacity: true)
+            modulesWithFailureFeedback.removeAll(keepingCapacity: true)
+            if result.outcome == .applied {
+                statusMessage = "Safe defaults restored. All activity modules are off."
+            }
         }
         endOperation()
     }
@@ -283,6 +305,62 @@ public final class TrustSettingsViewModel {
             settings.crashAndDiagnosticSharingConsent = consent
         case let .onboardingCompleted(completed):
             settings.onboardingCompleted = completed
+        }
+    }
+
+    private func updateModuleFeedback(
+        for module: EryloModule,
+        requestedEnabled: Bool,
+        result: TrustSettingsUpdateResult
+    ) {
+        if let failure = result.failure {
+            moduleFeedback[module] = Self.moduleFailureMessage(
+                for: module,
+                failure: failure
+            )
+            modulesWithFailureFeedback.insert(module)
+            return
+        }
+
+        modulesWithFailureFeedback.remove(module)
+        guard requestedEnabled, result.settings.modules[module] else {
+            moduleFeedback.removeValue(forKey: module)
+            return
+        }
+        moduleFeedback[module] = switch module {
+        case .volume:
+            "Volume is on — adjust it to see Erylo."
+        case .battery:
+            "Battery is on — its next change will appear in Erylo."
+        case .fileHold, .appleMusic, .spotify, .timer, .calendar, .localIntegrations:
+            "\(ModuleCopy.title(for: module)) is on."
+        }
+    }
+
+    private static func moduleFailureMessage(
+        for module: EryloModule,
+        failure: TrustUpdateFailure
+    ) -> String {
+        let title = module == .volume ? "Volume" : ModuleCopy.title(for: module)
+        return switch failure {
+        case .permissionDenied:
+            "Access was not granted. \(title) remains off."
+        case .providerFactoryFailed, .providerStartFailed:
+            "\(title) could not start and remains off."
+        case .persistenceFailed:
+            "\(title) could not be saved and was rolled back."
+        case .rollbackFailed:
+            "\(title) failed to start and cleanup needs attention. Check diagnostics."
+        case .operationCancelled:
+            "The cancelled \(title) change did not run."
+        case .operationSuperseded:
+            "A newer \(title) change replaced this one."
+        case .queueCapacityExceeded:
+            "Too many changes are pending. Please try \(title) again in a moment."
+        case .coordinatorShutDown:
+            "Erylo is shutting down. \(title) did not change."
+        case .launchAtLoginFailed:
+            "\(title) did not change."
         }
     }
 

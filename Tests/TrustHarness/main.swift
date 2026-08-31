@@ -25,6 +25,7 @@ private final class TrustHarness {
         await verifyMigrationCorruptionAndBounds()
         await verifyAtomicPersistence()
         await verifyNoWorkWhileBrowsingOrDisabled()
+        await verifyRowLocalModuleFeedback()
         await verifyPromptFreePersistedRestore()
         await verifyConcurrentToggleSerialization()
         await verifyQueueCancellationCoalescingAndCapacity()
@@ -299,6 +300,91 @@ private final class TrustHarness {
             check(await fixture.coordinator.activeModules().isEmpty, "persisted start failure retains no lifecycle ownership")
         } catch {
             check(false, "persisted failure fixture encodes valid settings: \(error)")
+        }
+    }
+
+    private func verifyRowLocalModuleFeedback() async {
+        do {
+            let provider = TestLifecycleProvider()
+            let fixture = makeFixture(provider: provider)
+            let model = TrustSettingsViewModel(
+                coordinator: fixture.coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events),
+                availableModules: [.battery, .volume]
+            )
+            await model.load()
+            check(model.moduleFeedback.isEmpty, "Settings browsing starts with no synthetic module feedback")
+
+            await model.setModuleEnabled(.volume, enabled: true)
+            check(
+                model.moduleFeedback[.volume]
+                    == "Volume is on — adjust it to see Erylo.",
+                "explicit Volume enable gives row-local next-step guidance"
+            )
+            check(
+                !model.moduleFeedbackIsFailure(for: .volume)
+                    && model.statusMessage == nil,
+                "successful Volume guidance stays local to its row"
+            )
+
+            await model.setModuleEnabled(.volume, enabled: false)
+            check(
+                model.moduleFeedback[.volume] == nil,
+                "explicit Volume disable clears transient row guidance"
+            )
+        }
+
+        do {
+            let provider = TestLifecycleProvider()
+            await provider.failNextStart()
+            let fixture = makeFixture(provider: provider)
+            let model = TrustSettingsViewModel(
+                coordinator: fixture.coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events),
+                availableModules: [.volume]
+            )
+            await model.setModuleEnabled(.volume, enabled: true)
+            check(
+                model.moduleFeedback[.volume]
+                    == "Volume could not start and remains off.",
+                "Volume start failure is reported beside the Volume row"
+            )
+            check(
+                model.moduleFeedbackIsFailure(for: .volume)
+                    && model.statusMessage == nil
+                    && !model.settings.modules.volume,
+                "row-local Volume failure remains honest and rolls the toggle back"
+            )
+            await model.resetToSafeDefaults()
+            check(
+                model.moduleFeedback.isEmpty,
+                "safe reset clears row-local feedback even when settings were already safe"
+            )
+        }
+
+        do {
+            var persisted = EryloSettings.safeDefaults
+            persisted.modules.volume = true
+            let storage = TestAtomicSettingsStorage(
+                initialData: try SettingsCodec().encode(persisted)
+            )
+            let provider = TestLifecycleProvider()
+            let fixture = makeFixture(storage: storage, provider: provider)
+            let model = TrustSettingsViewModel(
+                coordinator: fixture.coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events),
+                initialSettings: persisted,
+                availableModules: [.volume]
+            )
+            _ = await fixture.coordinator.startEnabledModules()
+            model.synchronize(settings: await fixture.repository.current())
+            check(
+                model.moduleFeedback.isEmpty && model.statusMessage == nil,
+                "persisted Volume restore stays quiet in Settings"
+            )
+            _ = await fixture.coordinator.stopAll()
+        } catch {
+            check(false, "persisted row-feedback fixture encodes valid settings: \(error)")
         }
     }
 

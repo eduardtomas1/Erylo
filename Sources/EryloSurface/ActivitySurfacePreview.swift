@@ -152,9 +152,34 @@ public enum ActivitySurfacePreviewCatalog {
             identifier: "preview.volume",
             source: .volume,
             kind: .volume,
-            title: "Output volume",
-            detail: "MacBook Pro Speakers",
-            progress: 0.72
+            title: "Volume",
+            progress: 0.72,
+            presentationRole: .volumeLevelChanged
+        )
+    )
+
+    public static let volumeMuted = ActivitySurfacePreviewScenario(
+        name: "Volume muted",
+        state: .compact,
+        current: request(
+            identifier: "preview.volume.muted",
+            source: .volume,
+            kind: .volume,
+            title: "Muted",
+            presentationRole: .volumeMuted
+        )
+    )
+
+    public static let volumeOutput = ActivitySurfacePreviewScenario(
+        name: "Volume output changed",
+        state: .expanded,
+        current: request(
+            identifier: "preview.volume.output",
+            source: .volume,
+            kind: .volume,
+            title: "Studio Display",
+            detail: "Output changed",
+            presentationRole: .volumeOutputChanged
         )
     )
 
@@ -209,6 +234,8 @@ public enum ActivitySurfacePreviewCatalog {
         timerCompletion,
         meeting,
         volume,
+        volumeMuted,
+        volumeOutput,
         media,
         file,
         empty,
@@ -245,7 +272,8 @@ public enum ActivitySurfacePreviewCatalog {
         progress: Double? = nil,
         actionIdentifier: String? = nil,
         actionLabel: String? = nil,
-        actionIntent: ActivityActionIntent? = nil
+        actionIntent: ActivityActionIntent? = nil,
+        presentationRole: ActivityPresentationRole = .standard
     ) -> ActivityRequest {
         ActivityRequest(
             identifier: identifier,
@@ -257,7 +285,9 @@ public enum ActivitySurfacePreviewCatalog {
             progress: progress,
             actionIdentifier: actionIdentifier,
             actionLabel: actionLabel,
-            actionIntent: actionIntent?.rawValue
+            actionIntent: actionIntent?.rawValue,
+            temporalProgress: nil,
+            presentationRole: presentationRole
         )
     }
 }

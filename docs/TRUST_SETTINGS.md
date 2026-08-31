@@ -41,7 +41,9 @@ source construction are inert. `startEnabledModules()` runs once at application
 startup with `.doNotRequest`, while opening/loading Settings remains read-only.
 Battery and Volume toggles are live; synchronous initial unavailability retains
 enabled intent with honest unavailable health, while disable and reset await full
-provider and retired-expiry cleanup.
+provider and retired-expiry cleanup. An explicit successful Volume enable reports
+**Volume is on — adjust it to see Erylo** beside that row; provider/start failures
+also stay row-local, while persisted startup restore produces no feedback banner.
 Focus Timer is owned separately by `ApplicationRuntime` and starts only from a
 deliberate menu command. Calendar, media, File Hold, and local-integration rows
 remain visibly unavailable and defensively rejected, so they cannot request
@@ -67,7 +69,7 @@ The schema has no message, path, URL, file, media, meeting, attendee, payload, t
 
 ## Contained UI
 
-`TrustSettingsView` and `TrustSettingsViewModel` live in `EryloSettingsUI`. They use native toggles, pickers, buttons, confirmation, and save panels with explicit accessibility labels and hints. No focus binding, application activation, custom keyboard interception, or permission work occurs during browsing. Display choices are deduplicated and bounded; names are stripped of controls and capped before `ForEach` and VoiceOver see them. Async results carry local sequence numbers so an older completion cannot overwrite newer UI intent.
+`TrustSettingsView` and `TrustSettingsViewModel` live in `EryloSettingsUI`. They use native toggles, pickers, buttons, confirmation, and save panels with explicit accessibility labels and hints. Module enable guidance and failures render beside the row that caused them. No focus binding, application activation, custom keyboard interception, or permission work occurs during browsing. Display choices are deduplicated and bounded; names are stripped of controls and capped before `ForEach` and VoiceOver see them. Async results carry local sequence numbers so an older completion cannot overwrite newer UI intent.
 
 `EryloAppRuntime` owns a native status item and exactly one reusable settings window. The menu exposes Show/Hide Erylo, Settings, a shortcut reminder, Quit, and Check for Updates only when the signed-feed updater has safely started. Menu actions route back through the runtime, repeated Quit requests collapse to one termination request, and shutdown removes the status item/window and terminally drains trust settings before the panel, broker, and updater are released. The Ink, Mint, Graphite, Sky, Cloud, Mist, Amber, and Coral palette remains scoped to the contained view.
 

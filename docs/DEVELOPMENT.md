@@ -30,8 +30,8 @@ Run:
 Scripts/ci.sh
 ```
 
-To regenerate the native Focus Timer visual-QA set on representative notch
-geometry while running the deterministic surface harness. The renderer hosts
+To regenerate the native Focus Timer and Volume visual-QA set on representative
+notched and notchless geometry while running the deterministic surface harness. The renderer hosts
 the production SwiftUI view on a fixed dark desktop backdrop so the notch's
 transparent outer curls are composited as product geometry, not an alpha matte:
 

@@ -35,6 +35,16 @@ func describe(_ capability: GlanceProviderCapability) -> Int {
     case .restricted: 5
     }
 }
+
+func volumeSnapshotCompatibility() throws {
+    _ = try VolumeSnapshot(deviceID: 1, scalar: 0.5, isMuted: false)
+    _ = try VolumeSnapshot(
+        deviceID: 1,
+        scalar: 0.5,
+        isMuted: false,
+        outputDisplayName: "Public output"
+    )
+}
 SWIFT
 swiftc -typecheck -swift-version 6 -warnings-as-errors \
     -I "$bin_path/Modules" -F "$bin_path" "$check_dir/public-contract.swift"
@@ -90,6 +100,7 @@ probe_package_symbol \
 
 control_source="Sources/EryloAppRuntime/ApplicationControlPlane.swift"
 composition_source="Sources/EryloAppRuntime/ApplicationRuntime.swift"
+volume_source="Sources/EryloGlance/GlanceEventSources.swift"
 app_runtime_sources=(Sources/EryloAppRuntime/*.swift)
 
 count_occurrences() {
@@ -203,5 +214,23 @@ expect_assertion_failure availableModules \
 expect_assertion_failure sharedActivityBroker \
     assert_source_contains "$composition_source" \
         'ApplicationControlPlane.production(activityBroker: ActivityBroker())'
+
+assert_source_contains \
+    "$volume_source" \
+    'mSelector: kAudioObjectPropertyName' \
+    || exit 1
+
+output_name_sources="$({
+    git grep -l --fixed-strings 'outputDisplayName' -- 'Sources/**/*.swift' || true
+} | LC_ALL=C sort)"
+expected_output_name_sources="$(printf '%s\n' \
+    'Sources/EryloGlance/GlanceDomain.swift' \
+    'Sources/EryloGlance/GlanceEventSources.swift' \
+    | LC_ALL=C sort)"
+if [[ "$output_name_sources" != "$expected_output_name_sources" ]]; then
+    printf 'ERROR: default-output display names escaped their nonpersistent Glance boundary.\n' >&2
+    printf 'Observed:\n%s\n' "$output_name_sources" >&2
+    exit 1
+fi
 
 printf 'System Glance API and production-mount checks passed.\n'

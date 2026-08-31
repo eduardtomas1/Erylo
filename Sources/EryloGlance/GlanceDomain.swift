@@ -421,17 +421,56 @@ public enum PowerSourceEvent: Equatable, Sendable {
 }
 
 public struct VolumeSnapshot: Equatable, Sendable {
+    public static let maximumOutputDisplayNameBytes = 96
+    public static let outputDisplayNameFallback = "Audio output"
+
     public let deviceID: UInt32
     public let scalar: Double
     public let isMuted: Bool
+    public let outputDisplayName: String?
 
-    public init(deviceID: UInt32, scalar: Double, isMuted: Bool) throws(GlanceDataError) {
+    public init(
+        deviceID: UInt32,
+        scalar: Double,
+        isMuted: Bool,
+        outputDisplayName: String? = nil
+    ) throws(GlanceDataError) {
         guard scalar.isFinite, (0...1).contains(scalar) else {
             throw .invalidVolume
         }
         self.deviceID = deviceID
         self.scalar = scalar
         self.isMuted = isMuted
+        self.outputDisplayName = outputDisplayName.map {
+            GlanceText.bounded(
+                $0,
+                maximumBytes: Self.maximumOutputDisplayNameBytes,
+                fallback: Self.outputDisplayNameFallback
+            )
+        }
+    }
+}
+
+package enum VolumePresentationChange: Equatable, Sendable {
+    case levelChanged
+    case muted
+    case unmuted
+    case outputChanged
+
+    package static func classify(
+        previous: VolumeSnapshot,
+        current: VolumeSnapshot
+    ) -> Self? {
+        if previous.deviceID != current.deviceID {
+            return .outputChanged
+        }
+        if previous.isMuted != current.isMuted {
+            return current.isMuted ? .muted : .unmuted
+        }
+        if previous.scalar != current.scalar {
+            return .levelChanged
+        }
+        return nil
     }
 }
 
@@ -642,16 +681,55 @@ public enum GlanceRequestFactory {
     }
 
     public static func volume(_ snapshot: VolumeSnapshot) -> ActivityRequest {
-        let percentage = Int((snapshot.scalar * 100).rounded())
+        volume(
+            snapshot,
+            change: snapshot.isMuted ? .muted : .levelChanged
+        )
+    }
+
+    package static func volume(
+        _ snapshot: VolumeSnapshot,
+        change: VolumePresentationChange
+    ) -> ActivityRequest {
+        let title: String
+        let detail: String?
+        let progress: Double?
+        let presentationRole: ActivityPresentationRole
+
+        switch change {
+        case .levelChanged:
+            title = "Volume"
+            detail = nil
+            progress = snapshot.scalar
+            presentationRole = .volumeLevelChanged
+        case .muted:
+            title = "Muted"
+            detail = nil
+            progress = nil
+            presentationRole = .volumeMuted
+        case .unmuted:
+            title = "Sound on"
+            detail = nil
+            progress = snapshot.scalar
+            presentationRole = .volumeUnmuted
+        case .outputChanged:
+            title = snapshot.outputDisplayName ?? VolumeSnapshot.outputDisplayNameFallback
+            detail = "Output changed"
+            progress = nil
+            presentationRole = .volumeOutputChanged
+        }
+
         return ActivityRequest(
             identifier: GlanceActivityIdentity.volumeIdentifier,
             source: ActivitySource.volume.rawValue,
             kind: ActivityKind.volume.rawValue,
             priority: ActivityPriority.high.rawValue,
-            title: "Volume",
-            detail: snapshot.isMuted ? "Muted" : "\(percentage)%",
-            progress: snapshot.isMuted ? 0 : snapshot.scalar,
-            ttlMilliseconds: 1_800
+            title: title,
+            detail: detail,
+            progress: progress,
+            ttlMilliseconds: 1_800,
+            temporalProgress: nil,
+            presentationRole: presentationRole
         )
     }
 
@@ -778,6 +856,9 @@ enum GlanceText {
             let candidate = result + String(character)
             if candidate.utf8.count > contentLimit { break }
             result = candidate
+        }
+        if result.isEmpty, fallback.utf8.count <= maximumBytes {
+            return fallback
         }
         return result + (maximumBytes >= ellipsis.utf8.count ? ellipsis : "")
     }

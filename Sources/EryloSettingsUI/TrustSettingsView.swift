@@ -133,6 +133,17 @@ public struct TrustSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(EryloPalette.mist)
                     .fixedSize(horizontal: false, vertical: true)
+                if let feedback = model.moduleFeedback[module] {
+                    Text(feedback)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(
+                            model.moduleFeedbackIsFailure(for: module)
+                                ? EryloPalette.coral
+                                : EryloPalette.mint
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel("\(ModuleCopy.title(for: module)) status: \(feedback)")
+                }
                 if !model.isModuleAvailable(module) {
                     Text(module == .timer
                         ? "Focus Timer is live from the Erylo menu; this background-module switch is not used."

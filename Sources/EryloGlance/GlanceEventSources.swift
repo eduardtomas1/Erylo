@@ -299,7 +299,11 @@ public final class CoreAudioVolumeEventSource: VolumeEventSource, @unchecked Sen
                 try VolumeSnapshot(
                     deviceID: device,
                     scalar: min(max(Double(volume), 0), 1),
-                    isMuted: muteValue != 0
+                    isMuted: muteValue != 0,
+                    outputDisplayName: Self.readStringProperty(
+                        device,
+                        address: Self.outputDisplayNameAddress
+                    )
                 )
             )
         } catch {
@@ -347,6 +351,19 @@ public final class CoreAudioVolumeEventSource: VolumeEventSource, @unchecked Sen
         return status == noErr ? value : nil
     }
 
+    private static func readStringProperty(
+        _ object: AudioObjectID,
+        address originalAddress: AudioObjectPropertyAddress
+    ) -> String? {
+        var address = originalAddress
+        guard AudioObjectHasProperty(object, &address) else { return nil }
+        var value: Unmanaged<CFString>?
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        let status = AudioObjectGetPropertyData(object, &address, 0, nil, &size, &value)
+        guard status == noErr, let value else { return nil }
+        return value.takeRetainedValue() as String
+    }
+
     private func performSynchronously(_ operation: () -> Void) {
         if DispatchQueue.getSpecific(key: callbackQueueKey) != nil {
             operation()
@@ -370,6 +387,12 @@ public final class CoreAudioVolumeEventSource: VolumeEventSource, @unchecked Sen
     private static let muteAddress = AudioObjectPropertyAddress(
         mSelector: kAudioDevicePropertyMute,
         mScope: kAudioDevicePropertyScopeOutput,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    private static let outputDisplayNameAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioObjectPropertyName,
+        mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
 }

@@ -107,6 +107,18 @@ public enum SurfaceStrings {
     public static let timerKind = String(localized: "activity.kind.timer", defaultValue: "Timer")
     public static let meetingKind = String(localized: "activity.kind.meeting", defaultValue: "Meeting")
     public static let volumeKind = String(localized: "activity.kind.volume", defaultValue: "Volume")
+    public static let volumeMuted = String(
+        localized: "activity.volume.muted",
+        defaultValue: "Muted"
+    )
+    public static let volumeUnmuted = String(
+        localized: "activity.volume.unmuted",
+        defaultValue: "Sound on"
+    )
+    public static let volumeOutputChanged = String(
+        localized: "activity.volume.output-changed",
+        defaultValue: "Output changed"
+    )
     public static let mediaKind = String(localized: "activity.kind.media", defaultValue: "Media")
     public static let fileKind = String(localized: "activity.kind.file", defaultValue: "File")
 

@@ -213,6 +213,10 @@ package struct ActivityTemporalProgress: Equatable, Sendable {
 package enum ActivityPresentationRole: Equatable, Sendable {
     case standard
     case completionAcknowledgement
+    case volumeLevelChanged
+    case volumeMuted
+    case volumeUnmuted
+    case volumeOutputChanged
 }
 
 public struct ActivityPresentation: Equatable, Sendable {

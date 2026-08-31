@@ -59,6 +59,57 @@ private struct GlanceHarness {
         } catch {
             check(error == .invalidVolume, "non-finite volume returns a typed error")
         }
+        do {
+            let compatible = try VolumeSnapshot(deviceID: 1, scalar: 0.5, isMuted: false)
+            check(compatible.outputDisplayName == nil, "Volume snapshot keeps the source-compatible unnamed initializer")
+
+            let hostileName = "  Studio\n\u{0000} Display  "
+                + String(repeating: "🔊", count: 100)
+            let sanitized = try VolumeSnapshot(
+                deviceID: 1,
+                scalar: 0.5,
+                isMuted: false,
+                outputDisplayName: hostileName
+            )
+            check(
+                (sanitized.outputDisplayName?.utf8.count ?? Int.max)
+                    <= VolumeSnapshot.maximumOutputDisplayNameBytes,
+                "default-output display names are strictly byte bounded"
+            )
+            check(
+                sanitized.outputDisplayName?.unicodeScalars.contains(
+                    where: CharacterSet.controlCharacters.contains
+                ) == false,
+                "default-output display names remove control characters"
+            )
+            check(
+                sanitized.outputDisplayName?.hasPrefix("Studio Display") == true,
+                "default-output display names normalize arbitrary whitespace"
+            )
+            let fallback = try VolumeSnapshot(
+                deviceID: 2,
+                scalar: 0.5,
+                isMuted: false,
+                outputDisplayName: "\n\u{0000}\t"
+            )
+            check(
+                fallback.outputDisplayName == VolumeSnapshot.outputDisplayNameFallback,
+                "unusable default-output display names receive an honest fallback"
+            )
+            let oversizedGrapheme = try VolumeSnapshot(
+                deviceID: 3,
+                scalar: 0.5,
+                isMuted: false,
+                outputDisplayName: "a" + String(repeating: "\u{0301}", count: 100)
+            )
+            check(
+                oversizedGrapheme.outputDisplayName
+                    == VolumeSnapshot.outputDisplayNameFallback,
+                "an indivisible oversized Unicode name receives the honest fallback"
+            )
+        } catch {
+            recordUnexpected(error, context: "Volume output-name normalization")
+        }
 
         let start = Date(timeIntervalSinceReferenceDate: 10_000)
         do {
@@ -180,7 +231,26 @@ private struct GlanceHarness {
 
             let volume = try VolumeSnapshot(deviceID: 7, scalar: 0.5, isMuted: true)
             let volumeSnapshot = try await broker.submit(GlanceRequestFactory.volume(volume))
-            check(volumeSnapshot.current?.activity.presentation.detail == "Muted", "volume conversion normalizes mute presentation")
+            check(volumeSnapshot.current?.activity.presentation.title == "Muted", "volume conversion normalizes mute presentation")
+            check(volumeSnapshot.current?.activity.presentation.progress == nil, "mute presentation never claims zero-percent volume")
+            check(
+                volumeSnapshot.current?.activity.presentation.presentationRole == .volumeMuted,
+                "volume conversion carries only package-native mute intent"
+            )
+
+            let unnamedOutput = try VolumeSnapshot(
+                deviceID: 8,
+                scalar: 0.5,
+                isMuted: false
+            )
+            let outputRequest = GlanceRequestFactory.volume(
+                unnamedOutput,
+                change: .outputChanged
+            )
+            check(
+                outputRequest.title == VolumeSnapshot.outputDisplayNameFallback,
+                "output-switch conversion has an honest name fallback"
+            )
         } catch {
             recordUnexpected(error, context: "conversion and validation")
         }
@@ -899,10 +969,42 @@ private struct GlanceHarness {
         let scheduler = ManualBrokerScheduler()
         let broker = ActivityBroker(expirationScheduler: scheduler)
         do {
-            let builtIn = try VolumeSnapshot(deviceID: 1, scalar: 0.35, isMuted: false)
-            let builtInChanged = try VolumeSnapshot(deviceID: 1, scalar: 0.45, isMuted: false)
-            let external = try VolumeSnapshot(deviceID: 2, scalar: 0.45, isMuted: false)
-            let muted = try VolumeSnapshot(deviceID: 2, scalar: 0.45, isMuted: true)
+            let builtIn = try VolumeSnapshot(
+                deviceID: 1,
+                scalar: 0.35,
+                isMuted: false,
+                outputDisplayName: "MacBook Pro Speakers"
+            )
+            let builtInChanged = try VolumeSnapshot(
+                deviceID: 1,
+                scalar: 0.45,
+                isMuted: false,
+                outputDisplayName: "MacBook Pro Speakers"
+            )
+            let external = try VolumeSnapshot(
+                deviceID: 2,
+                scalar: 0.45,
+                isMuted: false,
+                outputDisplayName: "Studio Display"
+            )
+            let externalRenamed = try VolumeSnapshot(
+                deviceID: 2,
+                scalar: 0.45,
+                isMuted: false,
+                outputDisplayName: "Desk Display"
+            )
+            let muted = try VolumeSnapshot(
+                deviceID: 2,
+                scalar: 0.45,
+                isMuted: true,
+                outputDisplayName: "Desk Display"
+            )
+            let restored = try VolumeSnapshot(
+                deviceID: 2,
+                scalar: 0.55,
+                isMuted: false,
+                outputDisplayName: "Desk Display"
+            )
             let source = ManualVolumeSource(initialEvent: .snapshot(builtIn))
             let provider = VolumeGlanceProvider(broker: broker, source: source)
             await provider.enable()
@@ -912,6 +1014,16 @@ private struct GlanceHarness {
 
             await source.emit(.snapshot(builtInChanged))
             check(await waitUntil { await broker.snapshot().version == 1 }, "volume event reaches broker")
+            check(
+                await broker.snapshot().current?.activity.presentation.presentationRole
+                    == .volumeLevelChanged,
+                "scalar callback is classified as a level change"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.progress?.fractionCompleted
+                    == 0.45,
+                "level change presents the truthful percentage progress"
+            )
             if case let .expires(ttl) = await broker.snapshot().current?.activity.lifecycle {
                 check(ttl.rawValue == 1_800, "volume acknowledgement uses the bounded transient lifetime")
             } else {
@@ -927,11 +1039,33 @@ private struct GlanceHarness {
             await source.emit(.snapshot(external))
             check(await waitUntil { await broker.snapshot().version == 2 }, "default-device change refreshes volume activity")
             check(await broker.snapshot().current?.revision != firstRevision, "device change creates a new broker revision")
+            check(
+                await broker.snapshot().current?.activity.presentation.presentationRole
+                    == .volumeOutputChanged,
+                "default-device callback is classified as an output change"
+            )
+            check(
+                await broker.snapshot().current?.activity.presentation.title == "Studio Display",
+                "output change presents the bounded device display name"
+            )
             check(await scheduler.pendingCount == 1, "default-device switch replaces rather than accumulates expiry work")
+
+            await source.emit(.snapshot(externalRenamed))
+            await yieldSeveralTimes()
+            check(
+                await broker.snapshot().version == 2,
+                "display-name-only refresh does not invent a hardware output switch"
+            )
 
             await source.emit(.snapshot(muted))
             check(await waitUntil { await broker.snapshot().version == 3 }, "mute change refreshes volume activity")
-            check(await broker.snapshot().current?.activity.presentation.detail == "Muted", "mute callback produces honest HUD detail")
+            check(await broker.snapshot().current?.activity.presentation.title == "Muted", "mute callback produces honest HUD copy")
+            check(await broker.snapshot().current?.activity.presentation.progress == nil, "mute callback never renders as zero percent")
+            check(
+                await broker.snapshot().current?.activity.presentation.presentationRole
+                    == .volumeMuted,
+                "mute callback is classified semantically"
+            )
             if case let .expires(ttl) = await broker.snapshot().current?.activity.lifecycle {
                 check(ttl.rawValue == 1_800, "mute acknowledgement remains bounded")
             } else {
@@ -939,15 +1073,24 @@ private struct GlanceHarness {
             }
             check(await scheduler.pendingCount == 1, "mute change retains one bounded expiry")
 
+            await source.emit(.snapshot(externalRenamed))
+            check(await waitUntil { await broker.snapshot().version == 4 }, "unmute change refreshes volume activity")
+            check(await broker.snapshot().current?.activity.presentation.title == "Sound on", "unmute callback produces honest HUD copy")
+            check(
+                await broker.snapshot().current?.activity.presentation.presentationRole
+                    == .volumeUnmuted,
+                "unmute callback is classified semantically"
+            )
+
             await source.emit(.unavailable)
             check(
                 await waitUntil { await broker.snapshot().ordered.isEmpty },
                 "missing default output clears the stale Volume acknowledgement"
             )
             check(await scheduler.pendingCount == 0, "missing default output cancels Volume expiry work")
-            await source.emit(.snapshot(external))
+            await source.emit(.snapshot(restored))
             check(
-                await waitUntil { await broker.snapshot().version == 5 },
+                await waitUntil { await broker.snapshot().version == 6 },
                 "restored default output converges without restarting the observer"
             )
             check(await source.startCount == 1, "default-output recovery retains one event observer")

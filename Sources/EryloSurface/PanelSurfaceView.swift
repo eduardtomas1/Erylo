@@ -185,7 +185,13 @@ public struct PanelSurfaceView: View {
     private func notchCompactTrailing(_ content: ActivitySurfaceContent) -> some View {
         switch content.primary {
         case let .activity(item):
-            if let temporalProjection = item.temporalProjection {
+            if let notchCompactValue = item.notchCompactValue {
+                Text(notchCompactValue)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(EryloPalette.mist)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            } else if let temporalProjection = item.temporalProjection {
                 TemporalProjectionView(projection: temporalProjection) { snapshot in
                     Text(snapshot.remainingText)
                         .font(.system(size: 9, weight: .medium, design: .monospaced))

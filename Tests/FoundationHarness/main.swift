@@ -17,6 +17,7 @@ enum FoundationHarnessMain {
         harness.verifyHoverHysteresisAndMotionInterruption()
         await harness.verifyCoordinatorLifecycle()
         await harness.verifyDemandDrivenPanelLifecycle()
+        await harness.verifyComposedDemandPreservation()
         await harness.verifyDisabledProvider()
         harness.finish()
     }
@@ -561,6 +562,16 @@ private struct FoundationHarness {
         for _ in 0..<2_000 where eventSource.isPointerMonitoringEnabled { await Task.yield() }
         check(!eventSource.isPointerMonitoringEnabled, "final activity hide tears down pointer monitors")
         check(registry.creationCount == 3, "final hide retains the bounded constructed panel set")
+        let retainedMainPanel = registry.latestPanel(for: main.identity)
+        let retainedShowCount = retainedMainPanel?.showCount
+        eventSource.emit(.primaryShortcut)
+        check(
+            retainedMainPanel?.showCount == retainedShowCount.map { $0 + 1 },
+            "one shortcut re-presents a retained plain presenter after final activity hide"
+        )
+        check(eventSource.isPointerMonitoringEnabled, "plain-presenter shortcut restores pointer monitoring")
+        eventSource.emit(.primaryShortcut)
+        check(!eventSource.isPointerMonitoringEnabled, "second empty shortcut hides the plain presenter once")
 
         await coordinator.updateAndWait(policy: DisplayPolicy(isEnabled: false))
         check(eventSource.stopCount == 1, "disabled policy removes observers, monitors, and shortcut")
@@ -661,6 +672,99 @@ private struct FoundationHarness {
         await coordinator.shutdown()
         replacementPanel?.replayDemandRegistration(0, isDemanded: true)
         check(!events.isRunning && !events.isPointerMonitoringEnabled, "shutdown rejects pending or replayed presentation demand")
+    }
+
+    mutating func verifyComposedDemandPreservation() async {
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
+        let events = FakeLifecycleEventSource()
+        let registry = ModelDemandPanelRegistry()
+        let coordinator = PanelCoordinator(
+            displayProvider: FakeDisplayProvider(
+                displays: [makeSnapshot(identity: 70, isMain: true)]
+            ),
+            policy: .safeDefault,
+            lifecycleEventSource: events,
+            activityModel: activityModel,
+            panelFactory: { snapshot, model in
+                registry.makePanel(snapshot: snapshot, activityModel: model)
+            }
+        )
+        let request: (String) -> ActivityRequest = { identifier in
+            ActivityRequest(
+                identifier: identifier,
+                source: ActivitySource.timer.rawValue,
+                kind: ActivityKind.timer.rawValue,
+                priority: 50,
+                title: identifier
+            )
+        }
+
+        await coordinator.startAndWait()
+        do {
+            _ = try await broker.submit(request("expanded-expiry"))
+        } catch {
+            check(false, "expanded-expiry activity validates")
+        }
+        for _ in 0..<2_000 where registry.latestPanel?.state != .compact {
+            await Task.yield()
+        }
+        guard let panel = registry.latestPanel else {
+            check(false, "composed demand panel is constructed by first activity")
+            await coordinator.shutdown()
+            return
+        }
+
+        events.emit(.primaryShortcut)
+        check(panel.state == .expanded, "activity surface deliberately expands through the coordinator")
+        if let identity = await broker.snapshot().current?.activity.identity {
+            _ = await broker.cancel(identity)
+        }
+        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
+        check(panel.state == .expanded, "activity expiry preserves deliberate expanded demand")
+        check(panel.isPresented && panel.hideCount == 0, "coordinator does not order out an expanded empty surface")
+        check(events.isPointerMonitoringEnabled, "expanded empty surface retains pointer monitoring")
+        events.emit(.primaryShortcut)
+        check(panel.state == .hidden && !panel.isPresented, "one shortcut hides the still-present expanded empty surface")
+        check(!events.isPointerMonitoringEnabled, "expanded contraction removes final pointer monitoring")
+
+        do {
+            _ = try await broker.submit(request("drop-exit"))
+        } catch {
+            check(false, "drop-exit activity validates")
+        }
+        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
+        panel.send(.dragEntered)
+        check(panel.state == .dropTarget, "drag entry demands the composed drop target")
+        if let identity = await broker.snapshot().current?.activity.identity {
+            _ = await broker.cancel(identity)
+        }
+        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
+        check(panel.state == .dropTarget && panel.isPresented, "activity loss preserves active drop-target demand")
+        check(events.isPointerMonitoringEnabled, "active drop target retains pointer monitoring after activity loss")
+        panel.send(.dragExited)
+        check(panel.state == .hidden && !panel.isPresented, "drag exit restores hidden after activity loss")
+        check(!events.isPointerMonitoringEnabled, "drag exit removes final pointer monitoring")
+
+        do {
+            _ = try await broker.submit(request("drop-complete"))
+        } catch {
+            check(false, "drop-complete activity validates")
+        }
+        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
+        panel.send(.dragEntered)
+        if let identity = await broker.snapshot().current?.activity.identity {
+            _ = await broker.cancel(identity)
+        }
+        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
+        panel.send(.dropCompleted)
+        check(panel.state == .expanded && panel.isPresented, "drop completion settles into demanded expanded state")
+        check(events.isPointerMonitoringEnabled, "completed empty drop remains monitored while expanded")
+        events.emit(.primaryShortcut)
+        check(panel.state == .hidden && !events.isPointerMonitoringEnabled, "one shortcut contracts the completed empty drop")
+
+        await coordinator.shutdown()
+        check(!events.isRunning && !events.isPointerMonitoringEnabled, "composed demand fixture shuts down with zero event work")
     }
 
     private mutating func check(_ condition: @autoclosure () -> Bool, _ name: String) {
@@ -971,4 +1075,104 @@ private final class DemandPanel: PanelPresenting, PanelPresentationDemandReporti
     }
 
     func cancelPendingInteractions() {}
+}
+
+@MainActor
+private final class ModelDemandPanelRegistry {
+    private(set) var panels: [ModelDemandPanel] = []
+
+    var latestPanel: ModelDemandPanel? {
+        panels.last
+    }
+
+    func makePanel(
+        snapshot: DisplaySnapshot,
+        activityModel: SurfaceActivityModel
+    ) -> any PanelPresenting {
+        let panel = ModelDemandPanel(
+            snapshot: snapshot,
+            activityModel: activityModel
+        )
+        panels.append(panel)
+        return panel
+    }
+}
+
+@MainActor
+private final class ModelDemandPanel: PanelPresenting, PanelPresentationDemandReporting {
+    let displayIdentity: DisplayIdentity
+    private let model: PanelSurfaceModel
+    private var demandHandler: (@MainActor @Sendable (Bool) -> Void)?
+    private(set) var isPresented = false
+    private(set) var showCount = 0
+    private(set) var hideCount = 0
+    private(set) var closeCount = 0
+
+    var wantsSurfacePresentation: Bool {
+        model.state != .hidden
+    }
+
+    var state: PanelPresentationState {
+        model.state
+    }
+
+    init(snapshot: DisplaySnapshot, activityModel: SurfaceActivityModel) {
+        displayIdentity = snapshot.identity
+        model = PanelSurfaceModel(
+            displayGeometry: snapshot.geometry,
+            activityModel: activityModel
+        )
+        model.didChange = { [weak self] in
+            guard let self else { return }
+            self.demandHandler?(self.wantsSurfacePresentation)
+        }
+    }
+
+    func setPresentationDemandHandler(
+        _ handler: (@MainActor @Sendable (Bool) -> Void)?
+    ) {
+        demandHandler = handler
+        handler?(wantsSurfacePresentation)
+    }
+
+    func show() {
+        isPresented = true
+        showCount += 1
+    }
+
+    func hide() {
+        isPresented = false
+        hideCount += 1
+        model.cancelPendingInteractions()
+    }
+
+    func close() {
+        isPresented = false
+        closeCount += 1
+        model.cancelPendingInteractions()
+    }
+
+    func update(snapshot: DisplaySnapshot) {
+        model.update(displayGeometry: snapshot.geometry)
+    }
+
+    func updatePointer(screenPoint: CGPoint) {
+        _ = screenPoint
+    }
+
+    func performPrimaryAction() {
+        model.send(.primaryAction)
+    }
+
+    func performVisibilityToggle() {
+        model.send(model.state == .hidden ? .show : .hide)
+    }
+
+    func cancelPendingInteractions() {
+        model.cancelPendingInteractions()
+    }
+
+    func send(_ event: PanelEvent) {
+        model.send(event)
+    }
 }

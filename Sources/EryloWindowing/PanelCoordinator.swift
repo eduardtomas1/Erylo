@@ -73,6 +73,7 @@ public final class PanelCoordinator {
     private var displayFrames: [CGDirectDisplayID: CGRect] = [:]
     private var panelLeases: [CGDirectDisplayID: UUID] = [:]
     private var presentedPanelIDs: Set<CGDirectDisplayID> = []
+    private var fallbackManualPresentationIDs: Set<CGDirectDisplayID> = []
     private var lastPointerScreenPoint: CGPoint?
     private var pointerDisplayID: CGDirectDisplayID?
     private var isTerminalCleanupInProgress = false
@@ -315,7 +316,29 @@ public final class PanelCoordinator {
               let panel = ensurePanel(identity: selectedDisplayIdentity) else {
             return false
         }
+        let displayID = CGDirectDisplayID(selectedDisplayIdentity.rawValue)
+        guard !(panel is any PanelPresentationDemandReporting) else {
+            panel.performPrimaryAction()
+            return true
+        }
+
+        if activityModel.current == nil,
+           fallbackManualPresentationIDs.contains(displayID),
+           let lease = panelLeases[displayID] {
+            panel.performPrimaryAction()
+            fallbackManualPresentationIDs.remove(displayID)
+            hidePanel(displayID: displayID, lease: lease)
+            return true
+        }
+
         panel.performPrimaryAction()
+        if let lease = panelLeases[displayID],
+           !presentedPanelIDs.contains(displayID) {
+            if activityModel.current == nil {
+                fallbackManualPresentationIDs.insert(displayID)
+            }
+            presentPanel(displayID: displayID, lease: lease)
+        }
         return true
     }
 
@@ -331,7 +354,26 @@ public final class PanelCoordinator {
               let panel = ensurePanel(identity: selectedDisplayIdentity) else {
             return false
         }
-        panel.performVisibilityToggle()
+        let displayID = CGDirectDisplayID(selectedDisplayIdentity.rawValue)
+        guard !(panel is any PanelPresentationDemandReporting),
+              let lease = panelLeases[displayID] else {
+            panel.performVisibilityToggle()
+            return true
+        }
+
+        if presentedPanelIDs.contains(displayID) {
+            panel.performVisibilityToggle()
+            fallbackManualPresentationIDs.remove(displayID)
+            hidePanel(displayID: displayID, lease: lease)
+        } else {
+            panel.performVisibilityToggle()
+            if activityModel.current == nil {
+                fallbackManualPresentationIDs.insert(displayID)
+            } else {
+                fallbackManualPresentationIDs.remove(displayID)
+            }
+            presentPanel(displayID: displayID, lease: lease)
+        }
         return true
     }
 
@@ -370,11 +412,13 @@ public final class PanelCoordinator {
             return
         }
         guard activityModel.current != nil else {
-            for displayID in presentedPanelIDs {
-                panels[displayID]?.hide()
+            for displayID in Array(presentedPanelIDs) {
+                guard let panel = panels[displayID],
+                      !(panel is any PanelPresentationDemandReporting),
+                      !fallbackManualPresentationIDs.contains(displayID),
+                      let lease = panelLeases[displayID] else { continue }
+                hidePanel(displayID: displayID, lease: lease)
             }
-            presentedPanelIDs.removeAll()
-            lifecycleEventSource.setPointerMonitoringEnabled(false)
             reportActivityVisibilityIfNeeded()
             return
         }
@@ -420,8 +464,6 @@ public final class PanelCoordinator {
                     isDemanded: isDemanded
                 )
             }
-        } else {
-            presentPanel(displayID: displayID, lease: lease)
         }
         (panel as? any PanelActivityVisibilityReporting)?
             .setActivityVisibilityHandler { [weak self] _ in
@@ -458,7 +500,9 @@ public final class PanelCoordinator {
     private func presentDemandedPanels() {
         for (displayID, panel) in panels {
             let isDemanded = (panel as? any PanelPresentationDemandReporting)?
-                .wantsSurfacePresentation ?? (activityModel.current != nil)
+                .wantsSurfacePresentation
+                ?? (activityModel.current != nil
+                    || fallbackManualPresentationIDs.contains(displayID))
             guard isDemanded, let lease = panelLeases[displayID] else { continue }
             presentPanel(displayID: displayID, lease: lease)
         }
@@ -496,6 +540,7 @@ public final class PanelCoordinator {
         guard let panel = panels.removeValue(forKey: displayID) else { return }
         panelLeases.removeValue(forKey: displayID)
         presentedPanelIDs.remove(displayID)
+        fallbackManualPresentationIDs.remove(displayID)
         (panel as? any PanelPresentationDemandReporting)?
             .setPresentationDemandHandler(nil)
         (panel as? any PanelActivityVisibilityReporting)?
@@ -571,6 +616,7 @@ public final class PanelCoordinator {
         panels.removeAll()
         panelLeases.removeAll()
         presentedPanelIDs.removeAll()
+        fallbackManualPresentationIDs.removeAll()
         lifecycleEventSource.setPointerMonitoringEnabled(false)
         displaySnapshots.removeAll()
         displayFrames.removeAll()

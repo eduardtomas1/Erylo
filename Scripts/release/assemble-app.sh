@@ -10,6 +10,7 @@ source "$script_dir/lib.sh"
 
 repo_root="$(release_repo_root)"
 cd "$repo_root"
+source_root="$(release_validated_source_root "$repo_root")"
 
 binary_input=".release/build/arm64/release/Erylo"
 framework_input=".release/build/arm64/release/Frameworks/Sparkle.framework"
@@ -94,8 +95,12 @@ framework="$(release_existing_path "$repo_root" "$framework_input")"
 toolchain="$(release_existing_path "$repo_root" "$toolchain_input")"
 metadata_file="$(release_repo_file "$repo_root" "$metadata_input")"
 template="$(release_repo_file "$repo_root" "Resources/App/Info.plist.in")"
+permissions_validator="$(release_repo_file "$repo_root" "Scripts/release/validate-production-permissions.rb")"
 erylo_license="$(release_repo_file "$repo_root" "LICENSE")"
 third_party_notices="$(release_repo_file "$repo_root" "Resources/App/ThirdPartyNotices.txt")"
+
+/usr/bin/ruby "$permissions_validator" repository "$source_root" >/dev/null \
+    || release_die "production composition and permission declarations are inconsistent"
 
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || release_die "binary input must be a regular executable"
 [[ -d "$framework" && ! -L "$framework" ]] || release_die "framework input must be a real directory"

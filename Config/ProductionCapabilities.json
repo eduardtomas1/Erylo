@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 2,
+  "mountedUtilities": [
+    "battery",
+    "focus-timer",
+    "volume"
+  ],
+  "privacyUsageDescriptionAllowlist": [],
+  "entitlementAllowlist": [],
+  "reviewedModuleSourceSHA256": {
+    "Sources/EryloGlance": "efe45b3def67295096035adf20949698906dd17186fcfc1a10a83b6cd7453aaa",
+    "Sources/EryloIntegrations": "2fbcc028fa02c30996ecfe8c6787b030b26e2ad97a28ec8145d845b34d7547b3"
+  }
+}

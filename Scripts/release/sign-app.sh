@@ -29,8 +29,14 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 [[ -n "$identity" ]] || release_die "a Developer ID Application identity is required"
-[[ "$identity" == "Developer ID Application: "* && "$identity" != *$'\n'* && "$identity" != *$'\r'* ]] \
-    || release_die "identity must be an explicit Developer ID Application identity"
+identity_team_id="$(release_developer_id_team_id "$identity")"
+if [[ "${ERYLO_RELEASE_EXPECTED_TEAM_ID+x}" == x ]]; then
+    expected_team_id="$ERYLO_RELEASE_EXPECTED_TEAM_ID"
+    [[ "$expected_team_id" =~ ^[A-Z0-9]{10}$ ]] \
+        || release_die "expected Developer ID team identifier is invalid"
+    [[ "$identity_team_id" == "$expected_team_id" ]] \
+        || release_die "selected Developer ID identity does not match the expected team"
+fi
 
 release_require_full_xcode
 release_require_command codesign
@@ -59,5 +65,14 @@ entitlements="$(release_repo_file "$repo_root" "Resources/App/Erylo.entitlements
 /usr/bin/codesign --verify --strict "$updater"
 /usr/bin/codesign --verify --strict "$framework"
 /usr/bin/codesign --verify --deep --strict "$app"
+
+signature_details="$(/usr/bin/codesign --display --verbose=4 "$app" 2>&1)" \
+    || release_die "signed application identity is unreadable"
+actual_team_id="$(printf '%s\n' "$signature_details" | \
+    /usr/bin/sed -nE 's/^TeamIdentifier=([A-Z0-9]{10})$/\1/p')"
+[[ "$actual_team_id" =~ ^[A-Z0-9]{10}$ ]] \
+    || release_die "signed application TeamIdentifier is missing or invalid"
+[[ "$actual_team_id" == "$identity_team_id" ]] \
+    || release_die "signed application TeamIdentifier does not match the selected identity"
 
 printf 'Developer ID signing completed and passed codesign verification.\n'

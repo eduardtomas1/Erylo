@@ -18,6 +18,26 @@ release_require_command() {
     command -v "$1" >/dev/null 2>&1 || release_die "required tool is unavailable: $1"
 }
 
+release_developer_id_team_id() {
+    local identity="${1:-}"
+    local team_id
+
+    [[ "$#" -eq 1 ]] || release_die "Developer ID identity parser requires one identity"
+    team_id="$(/usr/bin/ruby -e '
+      identity = ARGV.fetch(0)
+      match = /\ADeveloper ID Application: (.+) \(([A-Z0-9]{10})\)\z/.match(identity)
+      abort unless match
+      organization = match[1]
+      abort unless organization == organization.strip
+      abort if organization.match?(/[[:cntrl:]]/)
+      print match[2]
+    ' "$identity" 2>/dev/null)" \
+        || release_die "identity must exactly match Developer ID Application: ORGANIZATION (TEAMID)"
+    [[ "$team_id" =~ ^[A-Z0-9]{10}$ ]] \
+        || release_die "Developer ID identity contains an invalid team identifier"
+    printf '%s\n' "$team_id"
+}
+
 release_system_git() {
     # Source-control admission must not resolve Git through a caller-selected
     # developer directory before that Xcode application is authenticated.
@@ -294,7 +314,12 @@ release_existing_path() {
 release_repo_file() {
     local repo_root="$1"
     local requested="$2"
-    local source_root="${ERYLO_RELEASE_SOURCE_ROOT:-$repo_root}"
+    local source_root="$repo_root"
+
+    if [[ "${ERYLO_RELEASE_SNAPSHOT_ACTIVE:-0}" == "1" ]]; then
+        source_root="${ERYLO_RELEASE_SOURCE_ROOT:-}"
+        [[ -n "$source_root" ]] || release_die "authenticated release source root is missing"
+    fi
 
     /usr/bin/ruby -ropen3 -e '
         repo = File.realpath(ARGV.fetch(0))
@@ -327,6 +352,24 @@ release_repo_file() {
         end
         puts candidate
     ' "$source_root" "$requested" "$repo_root" || release_die "invalid repository release input: $requested"
+}
+
+release_validated_source_root() {
+    local repo_root="$1"
+    local source_commit
+    local source_tree
+
+    if [[ "${ERYLO_RELEASE_SNAPSHOT_ACTIVE:-0}" != "1" ]]; then
+        [[ -z "${ERYLO_RELEASE_SOURCE_ROOT:-}" ]] \
+            || release_die "ambient release source root is not permitted outside an authenticated snapshot"
+        printf '%s\n' "$repo_root"
+        return
+    fi
+
+    source_commit="$(release_source_commit "$repo_root")"
+    source_tree="$(release_source_tree "$repo_root")"
+    release_assert_source_snapshot "$repo_root" "$source_commit" "$source_tree"
+    printf '%s\n' "${ERYLO_RELEASE_SOURCE_ROOT}"
 }
 
 release_source_commit() {

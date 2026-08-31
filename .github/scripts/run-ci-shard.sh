@@ -111,6 +111,8 @@ case "$1" in
     api-surface)
         [[ $# -eq 1 ]] || usage
         swift build --jobs 2 -Xswiftc -warnings-as-errors
+        /usr/bin/ruby Scripts/release/validate-compiler-input-policy.rb "$repo_root"
+        /usr/bin/ruby Scripts/release/validate-production-permissions.rb repository "$repo_root"
         Scripts/check-activity-api-surface.sh
         Scripts/check-media-api-surface.sh
         Scripts/check-system-glance-api-surface.sh

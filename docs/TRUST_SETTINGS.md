@@ -33,6 +33,18 @@ Permission policy is closed and module-specific:
 - The unmounted Apple Music and Spotify foundations define contextual Apple Events policies.
 - File Hold and local integrations remain unmounted; their library-level policies do not make them product features.
 
+`Config/ProductionCapabilities.json` closes the shipping permission surface over
+the actual Focus Timer, Battery, and Volume composition. The production
+`Info.plist` has no privacy usage-description key and the reviewed entitlement
+file is empty. Repository, assembly, bundle, and signed-entitlement validation
+reject declaration drift. The policy also binds canonical source-tree hashes for
+the capability-bearing Glance and media modules; a helper or source addition in
+either module therefore requires an explicit policy review. Mounting Calendar or
+media requires an allowlist, declaration, and reviewed-module hash update in the
+same change. Production composition must use the reviewed media adapters; direct
+script request, executor, runner, or protocol seams are rejected even though the
+media module exposes them for library clients.
+
 Opening or loading the settings view only reads settings and `SMAppService` status. It never constructs a provider, starts work, or asks permission.
 
 The application control plane mounts only Battery and Volume through package-only

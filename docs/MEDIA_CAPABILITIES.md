@@ -15,9 +15,18 @@ The subprocess executor has a fixed executable path and closed script routes. Co
 
 ## Permission behavior
 
-The first explicit refresh or command against a running source can cause macOS to request Automation access. Missing applications, denied Automation, malformed output, command rejection, cancellation, and scripting failures map to typed `MediaError` values.
+If this slice is deliberately mounted in a future build, the first explicit
+refresh or command against a running source can cause macOS to request
+Automation access. Missing applications, denied Automation, malformed output,
+command rejection, cancellation, and scripting failures map to typed
+`MediaError` values.
 
-This repository is still a SwiftPM technical foundation rather than the signed application bundle. A packaged Hardened Runtime target must provide its reviewed Apple Events entitlement and user-facing usage description before shipping. This slice deliberately does not add or guess application signing metadata.
+The current application does not mount either adapter. Its production bundle
+therefore has no Apple Events usage description or automation entitlement, and
+the release/repository policy rejects either declaration while media remains
+unmounted. A future mount must update the reviewed production-capability
+allowlist and restore accurate signing and usage-description metadata in the
+same change; the dormant foundation alone is not authority to declare access.
 
 ## Artwork and privacy
 
@@ -31,4 +40,7 @@ Apple Music artwork bytes are not resolved in this slice because its desktop scr
 
 `EryloMediaTests` is dependency-free and exercises capability gating, numeric validation/clamping, command and adapter admission bounds, latest-capability revalidation, lifecycle/refresh generations, exact-operation and shared-executor cancellation, stale snapshot rejection, semantic dedupe, source disappearance/recovery, inactive zero-work behavior, error mapping, subscriber limits/cleanup, text and identifier bounds, bounded/coalesced artwork plus purge races, fixed-script injection resistance, and subprocess capacity, pipe, timeout, escalation, and terminal-cause behavior.
 
-The automated suite does not send Apple Events, display a real Automation prompt, fetch artwork, or assert behavior against particular installed Apple Music/Spotify versions. Those remain explicit manual compatibility checks for the signed app target.
+The automated suite does not send Apple Events, display a real Automation
+prompt, fetch artwork, or assert behavior against particular installed Apple
+Music/Spotify versions. Those become explicit signed-app compatibility gates
+only if media is mounted in a future production composition.

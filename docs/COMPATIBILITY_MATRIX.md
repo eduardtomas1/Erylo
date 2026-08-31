@@ -35,7 +35,7 @@ Record at least one result for every row; “not available” needs a named owne
 - Battery enable/disable/relaunch/reset at ordinary, charging, unplugged-low, and unavailable states; confirm the first ordinary snapshot stays quiet and no permission appears.
 - Volume enable/disable/relaunch/reset across built-in, USB, HDMI, Bluetooth, AirPlay, muted, unsupported-volume, disconnect, and default-output switches; confirm the initial current-output snapshot stays quiet and every later acknowledgement is bounded.
 - Sleep/wake and rapid audio-device-switch convergence with zero duplicate observers, stale HUD state, expiry tasks, or broker ownership after disable and quit.
-- Confirm Calendar, Apple Music, Spotify, File Hold, and local-integration controls remain unavailable and initiate no permission or integration work.
+- Confirm Calendar, Apple Music, Spotify, File Hold, and local-integration controls remain unavailable and initiate no permission or integration work; inspect the signed app to confirm it carries no privacy usage descriptions or capability entitlement for those dormant utilities.
 - Disabled-provider zero-work check and collapsed idle Instruments Energy Log on a named reference Mac; record the internal CPU result without turning it into a public claim.
 - 60 Hz and 120 Hz motion with Reduce Motion both off and on; capture dropped frames and main-thread thumbnail/artwork work.
 - Fullscreen, Spaces, Stage Manager, scaling, mirroring, hot-plug, clamshell, screen lock, user switch, sleep/wake, and reboot.

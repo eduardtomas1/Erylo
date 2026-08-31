@@ -1,6 +1,19 @@
 import EryloActivity
 import Foundation
 
+package struct CountdownOperationIdentity: Equatable, Sendable {
+    private let value: UUID
+
+    package init() {
+        value = UUID()
+    }
+}
+
+package struct CountdownNaturalCompletion: Equatable, Sendable {
+    package let countdown: CountdownTimer
+    package let operationIdentity: CountdownOperationIdentity
+}
+
 public actor CountdownGlanceProvider {
     private enum BrokerMutationError: Error {
         case rejected
@@ -25,12 +38,16 @@ public actor CountdownGlanceProvider {
     private var deactivationRevision: UInt64 = 0
     private var mutationTask: Task<Void, Never>?
     private var mutationTailRevision: UInt64 = 0
+    private var naturalCompletionTask: Task<Void, Never>?
+    private var naturalCompletionRevision: UInt64 = 0
     private var activeCountdown: CountdownTimer?
+    private var activeCountdownOperationIdentity: CountdownOperationIdentity?
     private var publishedActivityRevision: UInt64?
     private var currentPresentationDemand: CountdownPresentationDemand = .hidden
     private var boundaryTask: Task<Void, Never>?
     private var boundaryRevision: UInt64 = 0
     private var currentStatus = GlanceProviderStatus.disabled
+    private var naturalCompletionHandler: (@Sendable (CountdownNaturalCompletion) async -> Void)?
 
     public init(
         broker: any GlanceActivityBroker,
@@ -49,6 +66,7 @@ public actor CountdownGlanceProvider {
         let activation = activationTask
         let mutation = mutationTask
         let boundary = boundaryTask
+        let naturalCompletion = naturalCompletionTask
         let pendingOwnershipClaimIntent = pendingOwnershipClaimIntent
         let brokerOwnershipLease = brokerOwnershipLease
         let legacyActivityLease = legacyActivityLease
@@ -64,6 +82,7 @@ public actor CountdownGlanceProvider {
             await activation?.value
             await mutation?.value
             await boundary?.value
+            await naturalCompletion?.value
             if let ownershipBroker, let brokerOwnershipLease {
                 _ = await ownershipBroker.cancel(
                     brokerOwnershipLease.identity,
@@ -87,6 +106,7 @@ public actor CountdownGlanceProvider {
 
     public func enable() async {
         await awaitDeactivationTail()
+        await awaitNaturalCompletionTail()
         if enabled {
             await activationTask?.value
             return
@@ -160,6 +180,7 @@ public actor CountdownGlanceProvider {
     public func disable() async {
         if !enabled {
             await awaitDeactivationTail()
+            await awaitNaturalCompletionTail()
             releaseCleanupToken.complete(generation: releaseCleanupGeneration)
             return
         }
@@ -196,6 +217,17 @@ public actor CountdownGlanceProvider {
 
     /// Replaces the single active countdown. While disabled, this stores data but starts no work.
     public func setCountdown(_ countdown: CountdownTimer) async {
+        await setCountdown(
+            countdown,
+            operationIdentity: CountdownOperationIdentity()
+        )
+    }
+
+    /// Package lifecycle seam that binds app metadata to the exact admitted provider operation.
+    package func setCountdown(
+        _ countdown: CountdownTimer,
+        operationIdentity: CountdownOperationIdentity
+    ) async {
         operationRevision &+= 1
         publishedActivityRevision = nil
         let revision = operationRevision
@@ -205,7 +237,11 @@ public actor CountdownGlanceProvider {
         let task = Task { [weak self] in
             await previous?.value
             guard let self else { return }
-            await self.performSetCountdown(countdown, operationRevision: revision)
+            await self.performSetCountdown(
+                countdown,
+                operationIdentity: operationIdentity,
+                operationRevision: revision
+            )
         }
         mutationTask = task
         await task.value
@@ -256,12 +292,11 @@ public actor CountdownGlanceProvider {
         return activeCountdown == nil
     }
 
-    /// Controls second-level broker updates. Hidden timers retain only their expiry
-    /// one-shot; visible timers schedule one successor one-shot at a time.
+    /// Records whether a surface is visible without changing broker state or the
+    /// single expiry boundary. Visible progress is projected by the SwiftUI subtree.
     public func setPresentationDemand(_ demand: CountdownPresentationDemand) async {
         presentationDemandRevision &+= 1
         let demandRevision = presentationDemandRevision
-        let countdownRevision = operationRevision
         let previous = mutationTask
         mutationTailRevision &+= 1
         let tailRevision = mutationTailRevision
@@ -269,7 +304,6 @@ public actor CountdownGlanceProvider {
             await previous?.value
             await self?.performSetPresentationDemand(
                 demand,
-                operationRevision: countdownRevision,
                 presentationDemandRevision: demandRevision
             )
         }
@@ -294,10 +328,19 @@ public actor CountdownGlanceProvider {
         currentStatus
     }
 
+    /// Package lifecycle seam used by the app runtime to retire its cached enabled
+    /// state after the provider has completed and released broker ownership.
+    package func setNaturalCompletionHandler(
+        _ handler: (@Sendable (CountdownNaturalCompletion) async -> Void)?
+    ) {
+        naturalCompletionHandler = handler
+    }
+
     public func workState() -> GlanceProviderWorkState {
         GlanceProviderWorkState(
             activeObserverCount: 0,
-            activeConsumerTaskCount: mutationTask == nil ? 0 : 1,
+            activeConsumerTaskCount: (mutationTask == nil ? 0 : 1)
+                + (naturalCompletionTask == nil ? 0 : 1),
             scheduledBoundaryCount: boundaryTask == nil ? 0 : 1
         )
     }
@@ -310,6 +353,7 @@ public actor CountdownGlanceProvider {
 
     private func performSetCountdown(
         _ countdown: CountdownTimer,
+        operationIdentity: CountdownOperationIdentity,
         operationRevision: UInt64
     ) async {
         guard self.operationRevision == operationRevision else { return }
@@ -317,9 +361,11 @@ public actor CountdownGlanceProvider {
         await boundary?.value
         guard self.operationRevision == operationRevision else { return }
         activeCountdown = countdown
+        activeCountdownOperationIdentity = operationIdentity
         guard enabled else { return }
         await activateCountdown(
             countdown,
+            operationIdentity: operationIdentity,
             generation: generation,
             operationRevision: operationRevision
         )
@@ -331,13 +377,15 @@ public actor CountdownGlanceProvider {
         await boundary?.value
         guard self.operationRevision == operationRevision else { return }
         activeCountdown = nil
+        activeCountdownOperationIdentity = nil
         guard enabled else { return }
         let lifecycleGeneration = generation
         await cancelBrokerCountdown()
         guard isCurrent(
             generation: lifecycleGeneration,
             operationRevision: operationRevision,
-            countdown: nil
+            countdown: nil,
+            operationIdentity: nil
         ) else { return }
         currentStatus = GlanceProviderStatus(
             isEnabled: true,
@@ -348,53 +396,12 @@ public actor CountdownGlanceProvider {
 
     private func performSetPresentationDemand(
         _ demand: CountdownPresentationDemand,
-        operationRevision: UInt64,
         presentationDemandRevision: UInt64
     ) async {
         guard self.presentationDemandRevision == presentationDemandRevision else {
             return
         }
-        let boundary = takeBoundaryTask()
-        await boundary?.value
-        guard self.presentationDemandRevision == presentationDemandRevision else {
-            return
-        }
         currentPresentationDemand = enabled ? demand : .hidden
-        guard enabled, let countdown = activeCountdown else { return }
-
-        if demand == .visible {
-            await activateCountdown(
-                countdown,
-                generation: generation,
-                operationRevision: operationRevision,
-                requiredPresentationDemandRevision: presentationDemandRevision
-            )
-            return
-        }
-
-        let now = await clock.now()
-        guard isCurrent(
-            generation: generation,
-            operationRevision: operationRevision,
-            countdown: countdown,
-            requiredPresentationDemandRevision: presentationDemandRevision
-        ) else { return }
-        if now >= countdown.endsAt {
-            await expire(
-                countdown,
-                generation: generation,
-                operationRevision: operationRevision,
-                boundaryRevision: boundaryRevision,
-                presentationDemandRevision: presentationDemandRevision
-            )
-        } else {
-            startBoundary(
-                for: countdown,
-                now: now,
-                generation: generation,
-                operationRevision: operationRevision
-            )
-        }
     }
 
     private func activateCurrentCountdown(
@@ -412,8 +419,10 @@ public actor CountdownGlanceProvider {
             )
             return
         }
+        guard let operationIdentity = activeCountdownOperationIdentity else { return }
         await activateCountdown(
             countdown,
+            operationIdentity: operationIdentity,
             generation: generation,
             operationRevision: operationRevision
         )
@@ -421,6 +430,7 @@ public actor CountdownGlanceProvider {
 
     private func activateCountdown(
         _ countdown: CountdownTimer,
+        operationIdentity: CountdownOperationIdentity,
         generation: UInt64,
         operationRevision: UInt64,
         requiredPresentationDemandRevision: UInt64? = nil
@@ -429,6 +439,7 @@ public actor CountdownGlanceProvider {
             generation: generation,
             operationRevision: operationRevision,
             countdown: countdown,
+            operationIdentity: operationIdentity,
             requiredPresentationDemandRevision: requiredPresentationDemandRevision
         ) else { return }
 
@@ -437,6 +448,7 @@ public actor CountdownGlanceProvider {
             generation: generation,
             operationRevision: operationRevision,
             countdown: countdown,
+            operationIdentity: operationIdentity,
             requiredPresentationDemandRevision: requiredPresentationDemandRevision
         ) else { return }
         guard countdown.startedAt <= now else {
@@ -453,9 +465,11 @@ public actor CountdownGlanceProvider {
                 generation: generation,
                 operationRevision: operationRevision,
                 countdown: countdown,
+                operationIdentity: operationIdentity,
                 requiredPresentationDemandRevision: requiredPresentationDemandRevision
             ) else { return }
             activeCountdown = nil
+            activeCountdownOperationIdentity = nil
             publishedActivityRevision = nil
             currentStatus = GlanceProviderStatus(
                 isEnabled: true,
@@ -477,6 +491,7 @@ public actor CountdownGlanceProvider {
             generation: generation,
             operationRevision: operationRevision,
             countdown: countdown,
+            operationIdentity: operationIdentity,
             requiredPresentationDemandRevision: requiredPresentationDemandRevision
         ) else { return }
         let health: GlanceProviderHealth
@@ -495,6 +510,7 @@ public actor CountdownGlanceProvider {
         )
         startBoundary(
             for: countdown,
+            operationIdentity: operationIdentity,
             now: now,
             generation: generation,
             operationRevision: operationRevision
@@ -535,6 +551,14 @@ public actor CountdownGlanceProvider {
         }
     }
 
+    private func awaitNaturalCompletionTail() async {
+        while let task = naturalCompletionTask {
+            let revision = naturalCompletionRevision
+            await task.value
+            if revision == naturalCompletionRevision { return }
+        }
+    }
+
     private func clearMutationTask(tailRevision: UInt64) {
         guard mutationTailRevision == tailRevision else { return }
         mutationTask = nil
@@ -544,12 +568,14 @@ public actor CountdownGlanceProvider {
         generation: UInt64,
         operationRevision: UInt64,
         countdown: CountdownTimer?,
+        operationIdentity: CountdownOperationIdentity?,
         requiredPresentationDemandRevision: UInt64? = nil
     ) -> Bool {
         guard enabled,
               self.generation == generation,
               self.operationRevision == operationRevision,
-              activeCountdown == countdown else {
+              activeCountdown == countdown,
+              activeCountdownOperationIdentity == operationIdentity else {
             return false
         }
         guard let requiredPresentationDemandRevision else { return true }
@@ -558,28 +584,16 @@ public actor CountdownGlanceProvider {
 
     private func startBoundary(
         for countdown: CountdownTimer,
+        operationIdentity: CountdownOperationIdentity,
         now: Date,
         generation: UInt64,
         operationRevision: UInt64
     ) {
-        let deadline: Date
-        if currentPresentationDemand == .visible {
-            let nextSecond = Date(
-                timeIntervalSinceReferenceDate:
-                    floor(now.timeIntervalSinceReferenceDate) + 1
-            )
-            deadline = min(
-                nextSecond > now ? nextSecond : now.addingTimeInterval(1),
-                countdown.endsAt
-            )
-        } else {
-            deadline = countdown.endsAt
-        }
+        let deadline = countdown.endsAt
         guard deadline > now else { return }
 
         boundaryRevision &+= 1
         let revision = boundaryRevision
-        let demandRevision = presentationDemandRevision
         let clock = self.clock
         boundaryTask = Task { [weak self] in
             do {
@@ -590,26 +604,26 @@ public actor CountdownGlanceProvider {
             }
             await self?.boundaryReached(
                 countdown,
+                operationIdentity: operationIdentity,
                 generation: generation,
                 operationRevision: operationRevision,
-                boundaryRevision: revision,
-                presentationDemandRevision: demandRevision
+                boundaryRevision: revision
             )
         }
     }
 
     private func boundaryReached(
         _ countdown: CountdownTimer,
+        operationIdentity: CountdownOperationIdentity,
         generation: UInt64,
         operationRevision: UInt64,
-        boundaryRevision: UInt64,
-        presentationDemandRevision: UInt64
+        boundaryRevision: UInt64
     ) async {
         guard isCurrent(
             generation: generation,
             operationRevision: operationRevision,
             countdown: countdown,
-            requiredPresentationDemandRevision: presentationDemandRevision
+            operationIdentity: operationIdentity
         ), self.boundaryRevision == boundaryRevision else { return }
 
         let now = await clock.now()
@@ -617,52 +631,23 @@ public actor CountdownGlanceProvider {
             generation: generation,
             operationRevision: operationRevision,
             countdown: countdown,
-            requiredPresentationDemandRevision: presentationDemandRevision
+            operationIdentity: operationIdentity
         ), self.boundaryRevision == boundaryRevision else { return }
         if now >= countdown.endsAt {
             await expire(
                 countdown,
+                operationIdentity: operationIdentity,
                 generation: generation,
                 operationRevision: operationRevision,
-                boundaryRevision: boundaryRevision,
-                presentationDemandRevision: presentationDemandRevision
+                boundaryRevision: boundaryRevision
             )
             return
         }
 
-        if currentPresentationDemand == .visible {
-            let result: Result<UInt64, any Error>
-            do {
-                result = .success(try await submitBrokerCountdown(
-                    GlanceRequestFactory.countdown(countdown, now: now)
-                ))
-            } catch {
-                result = .failure(error)
-            }
-            guard isCurrent(
-                generation: generation,
-                operationRevision: operationRevision,
-                countdown: countdown,
-                requiredPresentationDemandRevision: presentationDemandRevision
-            ), self.boundaryRevision == boundaryRevision else { return }
-            let health: GlanceProviderHealth
-            switch result {
-            case let .success(revision):
-                publishedActivityRevision = revision
-                health = .healthy
-            case .failure:
-                publishedActivityRevision = nil
-                health = .degraded(.brokerRejected)
-            }
-            currentStatus = GlanceProviderStatus(
-                isEnabled: true,
-                capability: .available,
-                health: health
-            )
-        }
         boundaryTask = nil
         startBoundary(
             for: countdown,
+            operationIdentity: operationIdentity,
             now: now,
             generation: generation,
             operationRevision: operationRevision
@@ -671,32 +656,69 @@ public actor CountdownGlanceProvider {
 
     private func expire(
         _ countdown: CountdownTimer,
+        operationIdentity: CountdownOperationIdentity,
         generation: UInt64,
         operationRevision: UInt64,
-        boundaryRevision: UInt64,
-        presentationDemandRevision: UInt64
+        boundaryRevision: UInt64
     ) async {
         guard isCurrent(
             generation: generation,
             operationRevision: operationRevision,
             countdown: countdown,
-            requiredPresentationDemandRevision: presentationDemandRevision
+            operationIdentity: operationIdentity
         ), self.boundaryRevision == boundaryRevision else { return }
-        await cancelBrokerCountdown()
+        let completionRevision: UInt64?
+        do {
+            completionRevision = try await submitBrokerCountdown(
+                GlanceRequestFactory.countdownCompletion()
+            )
+        } catch {
+            completionRevision = nil
+            await cancelBrokerCountdown()
+        }
         guard isCurrent(
             generation: generation,
             operationRevision: operationRevision,
             countdown: countdown,
-            requiredPresentationDemandRevision: presentationDemandRevision
+            operationIdentity: operationIdentity
         ), self.boundaryRevision == boundaryRevision else { return }
-        boundaryTask = nil
         activeCountdown = nil
+        activeCountdownOperationIdentity = nil
         publishedActivityRevision = nil
-        currentStatus = GlanceProviderStatus(
-            isEnabled: true,
-            capability: .available,
-            health: .healthy
-        )
+        enabled = false
+        self.generation &+= 1
+        self.presentationDemandRevision &+= 1
+        currentPresentationDemand = .hidden
+        currentStatus = .disabled
+        let retiringLease = brokerOwnershipLease
+        if let retiringLease {
+            brokerOwnershipLease = nil
+            retiringLease.beginRetirement()
+        }
+        let ownershipBroker = ownershipBroker
+        let legacyActivityLease = legacyActivityLease
+        let naturalCompletionHandler = naturalCompletionHandler
+        let releaseCleanupToken = releaseCleanupToken
+        let releaseCleanupGeneration = releaseCleanupGeneration
+        naturalCompletionRevision &+= 1
+        let naturalCompletionRevision = naturalCompletionRevision
+        let task = Task.detached { [weak self] in
+            if let ownershipBroker, let retiringLease {
+                _ = await ownershipBroker.releaseOwnership(retiringLease)
+            } else if ownershipBroker == nil, let completionRevision {
+                legacyActivityLease.retire(revision: completionRevision)
+            }
+            await naturalCompletionHandler?(
+                CountdownNaturalCompletion(
+                    countdown: countdown,
+                    operationIdentity: operationIdentity
+                )
+            )
+            releaseCleanupToken.complete(generation: releaseCleanupGeneration)
+            await self?.naturalCompletionStopped(revision: naturalCompletionRevision)
+        }
+        naturalCompletionTask = task
+        boundaryTask = nil
     }
 
     private func submitBrokerCountdown(_ request: ActivityRequest) async throws -> UInt64 {
@@ -747,6 +769,11 @@ public actor CountdownGlanceProvider {
     private func boundaryStopped(revision: UInt64) {
         guard boundaryRevision == revision else { return }
         boundaryTask = nil
+    }
+
+    private func naturalCompletionStopped(revision: UInt64) {
+        guard naturalCompletionRevision == revision else { return }
+        naturalCompletionTask = nil
     }
 
     private func takeBoundaryTask() -> Task<Void, Never>? {

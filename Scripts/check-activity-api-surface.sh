@@ -72,6 +72,30 @@ fi
 
 printf '%s\n' \
     'import EryloActivity' \
+    'let role = ActivityPresentationRole.completionAcknowledgement' \
+    > "$check_dir/internal-presentation-role.swift"
+if swiftc -typecheck -swift-version 6 -warnings-as-errors \
+    -I "$bin_path/Modules" "$check_dir/internal-presentation-role.swift" \
+    > /dev/null 2>&1; then
+    printf 'ERROR: production clients can construct internal presentation intent.\n' >&2
+    exit 1
+fi
+
+printf '%s\n' \
+    'import EryloActivity' \
+    'func readInternalPresentationRole(_ activity: Activity) {' \
+    '    _ = activity.presentation.presentationRole' \
+    '}' \
+    > "$check_dir/internal-presentation-role-read.swift"
+if swiftc -typecheck -swift-version 6 -warnings-as-errors \
+    -I "$bin_path/Modules" "$check_dir/internal-presentation-role-read.swift" \
+    > /dev/null 2>&1; then
+    printf 'ERROR: production clients can read internal presentation intent.\n' >&2
+    exit 1
+fi
+
+printf '%s\n' \
+    'import EryloActivity' \
     'import Foundation' \
     'func reachPackageRegistration(_ broker: ActivityBroker) async throws {' \
     '    _ = try await broker.snapshotSubscription(subscriberID: UUID())' \
@@ -95,6 +119,44 @@ if swiftc -typecheck -swift-version 6 -warnings-as-errors \
     -I "$bin_path/Modules" "$check_dir/explicit-cancellation.swift" \
     > /dev/null 2>&1; then
     printf 'ERROR: production clients can cancel ActivityBroker ownership by UUID alone.\n' >&2
+    exit 1
+fi
+
+printf '%s\n' \
+    'import EryloActivity' \
+    'import Foundation' \
+    'let temporal = ActivityTemporalProgress(startedAt: Date(), endsAt: Date().addingTimeInterval(60))' \
+    > "$check_dir/internal-temporal-progress.swift"
+if swiftc -typecheck -swift-version 6 -warnings-as-errors \
+    -I "$bin_path/Modules" "$check_dir/internal-temporal-progress.swift" \
+    > /dev/null 2>&1; then
+    printf 'ERROR: production clients can construct internal temporal progress metadata.\n' >&2
+    exit 1
+fi
+
+printf '%s\n' \
+    'import EryloActivity' \
+    'func readInternalProjection(_ activity: Activity) {' \
+    '    _ = activity.presentation.temporalProgress' \
+    '}' \
+    > "$check_dir/internal-temporal-read.swift"
+if swiftc -typecheck -swift-version 6 -warnings-as-errors \
+    -I "$bin_path/Modules" "$check_dir/internal-temporal-read.swift" \
+    > /dev/null 2>&1; then
+    printf 'ERROR: production clients can read internal temporal progress metadata.\n' >&2
+    exit 1
+fi
+
+printf '%s\n' \
+    'import EryloGlance' \
+    'func installCompletionHook(_ provider: CountdownGlanceProvider) async {' \
+    '    await provider.setNaturalCompletionHandler({ _ in })' \
+    '}' \
+    > "$check_dir/internal-countdown-hook.swift"
+if swiftc -typecheck -swift-version 6 -warnings-as-errors \
+    -I "$bin_path/Modules" "$check_dir/internal-countdown-hook.swift" \
+    > /dev/null 2>&1; then
+    printf 'ERROR: production clients can install the app-owned countdown completion hook.\n' >&2
     exit 1
 fi
 

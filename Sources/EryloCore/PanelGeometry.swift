@@ -9,6 +9,7 @@ public struct PanelMetrics: Equatable, Sendable {
     public let dropTargetSize: CGSize
     public let notchHorizontalPadding: CGFloat
     public let notchlessTopInset: CGFloat
+    public let timerLauncherSize: CGSize
 
     public init(
         maximumSize: CGSize,
@@ -17,7 +18,8 @@ public struct PanelMetrics: Equatable, Sendable {
         expandedSize: CGSize,
         dropTargetSize: CGSize,
         notchHorizontalPadding: CGFloat,
-        notchlessTopInset: CGFloat = 0
+        notchlessTopInset: CGFloat = 0,
+        timerLauncherSize: CGSize = CGSize(width: 316, height: 88)
     ) {
         self.maximumSize = maximumSize
         self.compactSize = compactSize
@@ -26,6 +28,7 @@ public struct PanelMetrics: Equatable, Sendable {
         self.dropTargetSize = dropTargetSize
         self.notchHorizontalPadding = notchHorizontalPadding
         self.notchlessTopInset = notchlessTopInset
+        self.timerLauncherSize = timerLauncherSize
     }
 
     public static let feasibility = PanelMetrics(
@@ -35,7 +38,8 @@ public struct PanelMetrics: Equatable, Sendable {
         expandedSize: CGSize(width: 376, height: 164),
         dropTargetSize: CGSize(width: 404, height: 180),
         notchHorizontalPadding: 30,
-        notchlessTopInset: 8
+        notchlessTopInset: 8,
+        timerLauncherSize: CGSize(width: 316, height: 88)
     )
 }
 
@@ -177,7 +181,9 @@ public struct PanelLayout: Equatable, Sendable {
     public init(
         display: DisplayGeometry,
         state: PanelPresentationState,
-        metrics: PanelMetrics = .feasibility
+        metrics: PanelMetrics = .feasibility,
+        showsFocusTimerLauncher: Bool = false,
+        minimumNotchWingWidth: CGFloat = 0
     ) {
         let maximumSize = metrics.maximumSize
         fixedFrame = CGRect(
@@ -193,7 +199,9 @@ public struct PanelLayout: Equatable, Sendable {
         let requestedSize = Self.requestedSurfaceSize(
             state: state,
             display: display,
-            metrics: metrics
+            metrics: metrics,
+            showsFocusTimerLauncher: showsFocusTimerLauncher,
+            minimumNotchWingWidth: minimumNotchWingWidth
         )
         let availableHeight = max(maximumSize.height - surfaceTopInset, 0)
         let size = CGSize(
@@ -208,19 +216,21 @@ public struct PanelLayout: Equatable, Sendable {
         )
 
         if let occlusion = display.topEdgeOcclusion {
-            topCornerRadius = switch state {
-            case .hidden:
-                0
-            case .compact:
-                6
-            case .peek:
+            topCornerRadius = switch (state, showsFocusTimerLauncher) {
+            case (.compact, true):
                 13
-            case .expanded:
+            case (.hidden, _):
+                0
+            case (.compact, _):
+                6
+            case (.peek, _):
+                13
+            case (.expanded, _):
                 19
-            case .dropTarget:
+            case (.dropTarget, _):
                 21
             }
-            surfaceContentTopInset = state == .compact
+            surfaceContentTopInset = state == .compact && !showsFocusTimerLauncher
                 ? 0
                 : min(max(occlusion.frame.height, 0), size.height)
 
@@ -249,16 +259,20 @@ public struct PanelLayout: Equatable, Sendable {
             hoverAnchorRegion = .empty
         }
 
-        cornerRadius = switch (attachment, state) {
-        case (_, .hidden):
+        cornerRadius = switch (attachment, state, showsFocusTimerLauncher) {
+        case (_, .hidden, _):
             0
-        case (.notchlessPill, .compact), (.notchlessPill, .peek):
-            size.height / 2
-        case (.notchIntegrated, .compact):
-            min(14, size.height / 2)
-        case (.notchIntegrated, .peek):
+        case (.notchlessPill, .compact, true):
             min(19, size.height / 2)
-        case (_, .expanded), (_, .dropTarget):
+        case (.notchlessPill, .compact, _), (.notchlessPill, .peek, _):
+            size.height / 2
+        case (.notchIntegrated, .compact, true):
+            min(19, size.height / 2)
+        case (.notchIntegrated, .compact, _):
+            min(14, size.height / 2)
+        case (.notchIntegrated, .peek, _):
+            min(19, size.height / 2)
+        case (_, .expanded, _), (_, .dropTarget, _):
             min(23, size.height / 2)
         }
 
@@ -268,7 +282,7 @@ public struct PanelLayout: Equatable, Sendable {
             // The concave top corners are transparent. Accept clicks only in an
             // inscribed visible shelf; the global pointer monitor owns the wider
             // noninteractive hover envelope.
-            let bodyHeight = state == .compact
+            let bodyHeight = state == .compact && !showsFocusTimerLauncher
                 ? size.height
                 : max(size.height - surfaceContentTopInset, 0)
             let bodyWidth = max(size.width - topCornerRadius * 2, 0)
@@ -292,9 +306,14 @@ public struct PanelLayout: Equatable, Sendable {
     private static func requestedSurfaceSize(
         state: PanelPresentationState,
         display: DisplayGeometry,
-        metrics: PanelMetrics
+        metrics: PanelMetrics,
+        showsFocusTimerLauncher: Bool,
+        minimumNotchWingWidth: CGFloat
     ) -> CGSize {
-        var size = switch state {
+        var size = if state == .compact && showsFocusTimerLauncher {
+            metrics.timerLauncherSize
+        } else {
+            switch state {
         case .hidden:
             CGSize.zero
         case .compact:
@@ -305,10 +324,15 @@ public struct PanelLayout: Equatable, Sendable {
             metrics.expandedSize
         case .dropTarget:
             metrics.dropTargetSize
+            }
         }
 
         if state != .hidden, let occlusion = display.topEdgeOcclusion {
-            size.width = max(size.width, occlusion.frame.width + metrics.notchHorizontalPadding * 2)
+            let horizontalPadding = max(
+                metrics.notchHorizontalPadding,
+                state == .compact ? minimumNotchWingWidth : 0
+            )
+            size.width = max(size.width, occlusion.frame.width + horizontalPadding * 2)
             size.height = max(size.height, occlusion.frame.height)
         }
         return size

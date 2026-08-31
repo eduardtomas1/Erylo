@@ -24,14 +24,20 @@ your day—present when it matters, invisible when it does not.
 
 ## A timer should not need another window
 
-Start a 15, 25, or 50 minute Focus Timer from the Erylo menu. Its progress
-lives at the top edge of the display, where it can be checked without opening an
-app, moving a window, or breaking concentration.
+Deliberately open idle Erylo and choose a 15, 25, or 50 minute Focus Timer from
+the compact launcher, or use the same presets in the Erylo menu. Its progress
+lives at the top edge of the display, where it can be checked without opening
+an app, moving a window, or breaking concentration.
 
 When you want more detail, reveal Erylo with a click or
 <kbd>Control</kbd> + <kbd>Option</kbd> + <kbd>Command</kbd> + <kbd>E</kbd>.
 Cancel from the expanded surface or directly from the menu. When the session
-ends, the activity disappears.
+ends, Erylo briefly opens a readable **Focus complete** acknowledgement, then
+disappears.
+
+<p align="center">
+  <img src="docs/images/erylo-timer-launcher.png" width="560" alt="Erylo's compact native Focus Timer launcher with 15, 25, and 50 minute presets below MacBook notch geometry">
+</p>
 
 <p align="center">
   <img src="docs/images/erylo-timer-compact.png" width="496" alt="Erylo's compact live timer state wrapping the MacBook notch">
@@ -45,8 +51,8 @@ ends, the activity disappears.
   <tr>
     <td width="33%" valign="top">
       <strong>1 · Start</strong><br><br>
-      Choose a focus length from the native Erylo menu. Starting again cleanly
-      replaces the current session.
+      Choose a focus length from the compact native launcher or Erylo menu.
+      Starting again cleanly replaces the current session.
     </td>
     <td width="33%" valign="top">
       <strong>2 · Glance</strong><br><br>
@@ -100,12 +106,12 @@ ends, the activity disappears.
 
 ### Focus Timer
 
-- Start a **15, 25, or 50 minute** session from the Erylo menu.
-- Follow remaining time and live progress from the compact notch surface.
+- Start a **15, 25, or 50 minute** session from the idle notch launcher or Erylo menu.
+- Follow useful `MM:SS` or `H:MM:SS` remaining time and live progress from the compact notch surface.
 - Expand for context and a clear **Cancel timer** action.
 - Cancel from the menu when keyboard or VoiceOver navigation is preferable.
 - Replace a running session safely by starting another preset.
-- Let natural completion clear the activity without leaving timer work behind.
+- Let a short **Focus complete** acknowledgement disappear without leaving timer work or ownership behind.
 
 ### Battery and charging
 

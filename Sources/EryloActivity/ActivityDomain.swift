@@ -194,10 +194,33 @@ public struct ActivityProgress: Equatable, Sendable {
     }
 }
 
+/// Package-internal timestamp metadata for progress that is projected only by a
+/// currently visible native surface. It is deliberately absent from the public
+/// request initializer and Codable schema, so external routes cannot smuggle an
+/// unvalidated clock contract into the activity broker.
+package struct ActivityTemporalProgress: Equatable, Sendable {
+    package let startedAt: Date
+    package let endsAt: Date
+
+    package init(startedAt: Date, endsAt: Date) {
+        self.startedAt = startedAt
+        self.endsAt = endsAt
+    }
+}
+
+/// Package-only native presentation intent. It is deliberately absent from the
+/// public request initializer and Codable schema.
+package enum ActivityPresentationRole: Equatable, Sendable {
+    case standard
+    case completionAcknowledgement
+}
+
 public struct ActivityPresentation: Equatable, Sendable {
     public let title: String
     public let detail: String?
     public let progress: ActivityProgress?
+    package let temporalProgress: ActivityTemporalProgress?
+    package let presentationRole: ActivityPresentationRole
 
     public init(
         validatingTitle title: String,
@@ -217,6 +240,39 @@ public struct ActivityPresentation: Equatable, Sendable {
         self.title = title
         self.detail = detail
         self.progress = try progress.map(ActivityProgress.init(validating:))
+        temporalProgress = nil
+        presentationRole = .standard
+    }
+
+    package init(
+        validatingTitle title: String,
+        detail: String? = nil,
+        progress: Double? = nil,
+        temporalProgress: ActivityTemporalProgress?,
+        presentationRole: ActivityPresentationRole
+    ) throws(ActivityValidationError) {
+        try Self.validateText(title, field: .title, maximumBytes: ActivityLimits.titleBytes, allowEmpty: false)
+        if let detail {
+            try Self.validateText(detail, field: .detail, maximumBytes: ActivityLimits.detailBytes, allowEmpty: true)
+        }
+
+        let totalBytes = title.utf8.count + (detail?.utf8.count ?? 0)
+        guard totalBytes <= ActivityLimits.presentationBytes else {
+            throw .tooLarge(.presentation, maximumBytes: ActivityLimits.presentationBytes)
+        }
+        if let temporalProgress {
+            guard temporalProgress.startedAt.timeIntervalSinceReferenceDate.isFinite,
+                  temporalProgress.endsAt.timeIntervalSinceReferenceDate.isFinite,
+                  temporalProgress.endsAt > temporalProgress.startedAt else {
+                throw .invalidFormat(.progress)
+            }
+        }
+
+        self.title = title
+        self.detail = detail
+        self.progress = try progress.map(ActivityProgress.init(validating:))
+        self.temporalProgress = temporalProgress
+        self.presentationRole = presentationRole
     }
 
     private static func validateText(
@@ -348,6 +404,8 @@ public struct ActivityRequest: Equatable, Codable, Sendable {
     public let actionLabel: String?
     public let actionIntent: String?
     public let ttlMilliseconds: Int?
+    package let temporalProgress: ActivityTemporalProgress?
+    package let presentationRole: ActivityPresentationRole
 
     public init(
         identifier: String,
@@ -373,6 +431,84 @@ public struct ActivityRequest: Equatable, Codable, Sendable {
         self.actionLabel = actionLabel
         self.actionIntent = actionIntent
         self.ttlMilliseconds = ttlMilliseconds
+        temporalProgress = nil
+        presentationRole = .standard
+    }
+
+    package init(
+        identifier: String,
+        source: String,
+        kind: String,
+        priority: Int,
+        title: String,
+        detail: String? = nil,
+        progress: Double? = nil,
+        actionIdentifier: String? = nil,
+        actionLabel: String? = nil,
+        actionIntent: String? = nil,
+        ttlMilliseconds: Int? = nil,
+        temporalProgress: ActivityTemporalProgress?,
+        presentationRole: ActivityPresentationRole = .standard
+    ) {
+        self.identifier = identifier
+        self.source = source
+        self.kind = kind
+        self.priority = priority
+        self.title = title
+        self.detail = detail
+        self.progress = progress
+        self.actionIdentifier = actionIdentifier
+        self.actionLabel = actionLabel
+        self.actionIntent = actionIntent
+        self.ttlMilliseconds = ttlMilliseconds
+        self.temporalProgress = temporalProgress
+        self.presentationRole = presentationRole
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case identifier
+        case source
+        case kind
+        case priority
+        case title
+        case detail
+        case progress
+        case actionIdentifier
+        case actionLabel
+        case actionIntent
+        case ttlMilliseconds
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        identifier = try container.decode(String.self, forKey: .identifier)
+        source = try container.decode(String.self, forKey: .source)
+        kind = try container.decode(String.self, forKey: .kind)
+        priority = try container.decode(Int.self, forKey: .priority)
+        title = try container.decode(String.self, forKey: .title)
+        detail = try container.decodeIfPresent(String.self, forKey: .detail)
+        progress = try container.decodeIfPresent(Double.self, forKey: .progress)
+        actionIdentifier = try container.decodeIfPresent(String.self, forKey: .actionIdentifier)
+        actionLabel = try container.decodeIfPresent(String.self, forKey: .actionLabel)
+        actionIntent = try container.decodeIfPresent(String.self, forKey: .actionIntent)
+        ttlMilliseconds = try container.decodeIfPresent(Int.self, forKey: .ttlMilliseconds)
+        temporalProgress = nil
+        presentationRole = .standard
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(identifier, forKey: .identifier)
+        try container.encode(source, forKey: .source)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(priority, forKey: .priority)
+        try container.encode(title, forKey: .title)
+        try container.encodeIfPresent(detail, forKey: .detail)
+        try container.encodeIfPresent(progress, forKey: .progress)
+        try container.encodeIfPresent(actionIdentifier, forKey: .actionIdentifier)
+        try container.encodeIfPresent(actionLabel, forKey: .actionLabel)
+        try container.encodeIfPresent(actionIntent, forKey: .actionIntent)
+        try container.encodeIfPresent(ttlMilliseconds, forKey: .ttlMilliseconds)
     }
 }
 
@@ -395,7 +531,9 @@ public struct Activity: Equatable, Sendable {
         presentation = try ActivityPresentation(
             validatingTitle: request.title,
             detail: request.detail,
-            progress: request.progress
+            progress: request.progress,
+            temporalProgress: request.temporalProgress,
+            presentationRole: request.presentationRole
         )
         action = try Self.validateAction(request)
         if let ttlMilliseconds = request.ttlMilliseconds {

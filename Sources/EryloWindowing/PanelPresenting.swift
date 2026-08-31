@@ -40,6 +40,13 @@ package protocol PanelPresentationDemandReporting: AnyObject {
     )
 }
 
+@MainActor
+package protocol PanelFocusTimerLaunching: AnyObject {
+    func setFocusTimerStartHandler(
+        _ handler: (@MainActor @Sendable (Int) -> Bool)?
+    )
+}
+
 public extension PanelPresenting {
     /// Compatibility fallback for injected presenters that only implement the original action.
     /// The native presenter overrides this with a strict hidden/visible surface toggle.

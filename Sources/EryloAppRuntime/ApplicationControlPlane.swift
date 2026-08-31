@@ -29,19 +29,32 @@ package struct ApplicationMenuItemDescriptor: Equatable, Sendable {
     package let keyEquivalent: String
     package let accessibilityHint: String?
     package let accessibilityIdentifier: String?
+    package let isEnabled: Bool
 
     package init(
         kind: ApplicationMenuItemKind,
         title: String,
         keyEquivalent: String = "",
         accessibilityHint: String? = nil,
-        accessibilityIdentifier: String? = nil
+        accessibilityIdentifier: String? = nil,
+        isEnabled: Bool = true
     ) {
         self.kind = kind
         self.title = title
         self.keyEquivalent = keyEquivalent
         self.accessibilityHint = accessibilityHint
         self.accessibilityIdentifier = accessibilityIdentifier
+        self.isEnabled = isEnabled
+    }
+}
+
+package enum ApplicationFocusTimerMenuContext: Equatable, Sendable {
+    case idle
+    case active(remainingText: String)
+
+    package var isActive: Bool {
+        if case .active = self { return true }
+        return false
     }
 }
 
@@ -54,42 +67,74 @@ package enum ApplicationControlCopy {
     package static let startFocus50 = "Start 50-Minute Focus Timer"
     package static let cancelFocus = "Cancel Focus Timer"
     package static let startFocusHint = "Starts a new focus timer and replaces any focus timer already running."
+    package static let replaceFocusHint = "Replaces the current focus timer with this duration."
     package static let cancelFocusHint = "Cancels the current focus timer. It has no effect when no focus timer is running."
     package static let settings = "Settings…"
     package static let checkForUpdates = "Check for Updates…"
     package static let shortcutReminder = "Shortcut: Control–Option–Command–E"
     package static let quit = "Quit Erylo"
+
+    package static func remainingFocus(_ value: String) -> String {
+        "Focus Timer · \(value) remaining"
+    }
+
+    package static func focusPreset(minutes: Int, replacing: Bool) -> String {
+        replacing
+            ? "Replace with \(minutes)-Minute Focus Timer"
+            : "Start \(minutes)-Minute Focus Timer"
+    }
 }
 
 package struct ApplicationMenuDescriptor: Equatable, Sendable {
     package let items: [ApplicationMenuItemDescriptor]
 
-    package init(canCheckForUpdates: Bool) {
+    package init(
+        canCheckForUpdates: Bool,
+        focusTimer: ApplicationFocusTimerMenuContext = .idle
+    ) {
+        let replacing = focusTimer.isActive
         var items = [
             ApplicationMenuItemDescriptor(
                 kind: .command(.toggleSurface),
                 title: ApplicationControlCopy.toggleSurface
             ),
-            ApplicationMenuItemDescriptor(kind: .separator, title: ""),
+        ]
+        if case let .active(remainingText) = focusTimer {
+            items.append(
+                ApplicationMenuItemDescriptor(
+                    kind: .information,
+                    title: ApplicationControlCopy.remainingFocus(remainingText),
+                    isEnabled: false
+                )
+            )
+        }
+        items.append(ApplicationMenuItemDescriptor(kind: .separator, title: ""))
+        items.append(contentsOf: [
             ApplicationMenuItemDescriptor(
                 kind: .command(.startFocusTimer15),
-                title: ApplicationControlCopy.startFocus15,
+                title: ApplicationControlCopy.focusPreset(minutes: 15, replacing: replacing),
                 keyEquivalent: "1",
-                accessibilityHint: ApplicationControlCopy.startFocusHint,
+                accessibilityHint: replacing
+                    ? ApplicationControlCopy.replaceFocusHint
+                    : ApplicationControlCopy.startFocusHint,
                 accessibilityIdentifier: "erylo.focus-timer.start-15"
             ),
             ApplicationMenuItemDescriptor(
                 kind: .command(.startFocusTimer25),
-                title: ApplicationControlCopy.startFocus25,
+                title: ApplicationControlCopy.focusPreset(minutes: 25, replacing: replacing),
                 keyEquivalent: "2",
-                accessibilityHint: ApplicationControlCopy.startFocusHint,
+                accessibilityHint: replacing
+                    ? ApplicationControlCopy.replaceFocusHint
+                    : ApplicationControlCopy.startFocusHint,
                 accessibilityIdentifier: "erylo.focus-timer.start-25"
             ),
             ApplicationMenuItemDescriptor(
                 kind: .command(.startFocusTimer50),
-                title: ApplicationControlCopy.startFocus50,
+                title: ApplicationControlCopy.focusPreset(minutes: 50, replacing: replacing),
                 keyEquivalent: "5",
-                accessibilityHint: ApplicationControlCopy.startFocusHint,
+                accessibilityHint: replacing
+                    ? ApplicationControlCopy.replaceFocusHint
+                    : ApplicationControlCopy.startFocusHint,
                 accessibilityIdentifier: "erylo.focus-timer.start-50"
             ),
             ApplicationMenuItemDescriptor(
@@ -97,7 +142,8 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
                 title: ApplicationControlCopy.cancelFocus,
                 keyEquivalent: ".",
                 accessibilityHint: ApplicationControlCopy.cancelFocusHint,
-                accessibilityIdentifier: "erylo.focus-timer.cancel"
+                accessibilityIdentifier: "erylo.focus-timer.cancel",
+                isEnabled: focusTimer.isActive
             ),
             ApplicationMenuItemDescriptor(kind: .separator, title: ""),
             ApplicationMenuItemDescriptor(
@@ -105,7 +151,7 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
                 title: ApplicationControlCopy.settings,
                 keyEquivalent: ","
             ),
-        ]
+        ])
         if canCheckForUpdates {
             items.append(
                 ApplicationMenuItemDescriptor(
@@ -118,7 +164,8 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
             ApplicationMenuItemDescriptor(kind: .separator, title: ""),
             ApplicationMenuItemDescriptor(
                 kind: .information,
-                title: ApplicationControlCopy.shortcutReminder
+                title: ApplicationControlCopy.shortcutReminder,
+                isEnabled: false
             ),
             ApplicationMenuItemDescriptor(kind: .separator, title: ""),
             ApplicationMenuItemDescriptor(
@@ -134,7 +181,7 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
 @MainActor
 package protocol ApplicationControlPresenting: AnyObject {
     func installStatusMenu(
-        _ descriptor: ApplicationMenuDescriptor,
+        descriptorProvider: @escaping @MainActor () -> ApplicationMenuDescriptor,
         commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
     )
     func presentSettings(model: TrustSettingsViewModel)
@@ -146,6 +193,7 @@ package protocol ApplicationControlPlaneOwning: AnyObject {
     func prepareForStartup() async -> DisplayPolicy
     func start(
         canCheckForUpdates: Bool,
+        focusTimerContextProvider: @escaping @MainActor () -> ApplicationFocusTimerMenuContext,
         commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
     ) async
@@ -253,6 +301,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
 
     package func start(
         canCheckForUpdates: Bool,
+        focusTimerContextProvider: @escaping @MainActor () -> ApplicationFocusTimerMenuContext,
         commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
     ) async {
@@ -271,7 +320,12 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
 
         self.displayPolicyHandler = displayPolicyHandler
         presenter.installStatusMenu(
-            ApplicationMenuDescriptor(canCheckForUpdates: canCheckForUpdates),
+            descriptorProvider: {
+                ApplicationMenuDescriptor(
+                    canCheckForUpdates: canCheckForUpdates,
+                    focusTimer: focusTimerContextProvider()
+                )
+            },
             commandHandler: commandHandler
         )
         isStarted = true
@@ -312,13 +366,15 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
     private var statusItem: NSStatusItem?
     private var commandHandler: (@MainActor (ApplicationControlCommand) -> Void)?
     private var settingsWindowController: NativeSettingsWindowController?
+    private var descriptorProvider: (@MainActor () -> ApplicationMenuDescriptor)?
 
     func installStatusMenu(
-        _ descriptor: ApplicationMenuDescriptor,
+        descriptorProvider: @escaping @MainActor () -> ApplicationMenuDescriptor,
         commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
     ) {
         guard statusItem == nil else { return }
         self.commandHandler = commandHandler
+        self.descriptorProvider = descriptorProvider
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
@@ -331,6 +387,14 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
 
         let menu = NSMenu(title: "Erylo")
         menu.autoenablesItems = false
+        menu.delegate = self
+        rebuild(menu, with: descriptorProvider())
+        item.menu = menu
+        statusItem = item
+    }
+
+    private func rebuild(_ menu: NSMenu, with descriptor: ApplicationMenuDescriptor) {
+        menu.removeAllItems()
         for descriptor in descriptor.items {
             switch descriptor.kind {
             case .separator:
@@ -343,7 +407,7 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
                 )
                 menuItem.target = self
                 menuItem.representedObject = NSNumber(value: command.rawValue)
-                menuItem.isEnabled = true
+                menuItem.isEnabled = descriptor.isEnabled
                 menuItem.keyEquivalentModifierMask = descriptor.keyEquivalent.isEmpty ? [] : [.command]
                 menuItem.setAccessibilityLabel(descriptor.title)
                 if let accessibilityHint = descriptor.accessibilityHint {
@@ -354,18 +418,12 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
                 }
                 menu.addItem(menuItem)
             case .information:
-                let menuItem = NSMenuItem(
-                    title: descriptor.title,
-                    action: #selector(acknowledgeShortcutReminder(_:)),
-                    keyEquivalent: ""
-                )
-                menuItem.target = self
-                menuItem.isEnabled = true
+                let menuItem = NSMenuItem(title: descriptor.title, action: nil, keyEquivalent: "")
+                menuItem.isEnabled = descriptor.isEnabled
+                menuItem.setAccessibilityLabel(descriptor.title)
                 menu.addItem(menuItem)
             }
         }
-        item.menu = menu
-        statusItem = item
     }
 
     func presentSettings(model: TrustSettingsViewModel) {
@@ -381,6 +439,7 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
 
     func shutdown() {
         commandHandler = nil
+        descriptorProvider = nil
         settingsWindowController?.shutdown()
         settingsWindowController = nil
         if let statusItem {
@@ -398,10 +457,12 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
         }
         commandHandler?(command)
     }
+}
 
-    @objc
-    private func acknowledgeShortcutReminder(_ sender: NSMenuItem) {
-        _ = sender
+extension NativeApplicationControlPresenter: NSMenuDelegate {
+    func menuWillOpen(_ menu: NSMenu) {
+        guard let descriptorProvider else { return }
+        rebuild(menu, with: descriptorProvider())
     }
 }
 

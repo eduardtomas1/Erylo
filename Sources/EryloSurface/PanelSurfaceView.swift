@@ -27,41 +27,44 @@ public struct PanelSurfaceView: View {
         )
 
         ZStack(alignment: .top) {
-            silhouette
-                .fill(
-                    layout.attachment == .notchIntegrated
-                        ? Color.black
-                        : EryloPalette.ink
-                )
-                .accessibilityHidden(true)
+            if model.isWindowPresented {
+                silhouette
+                    .fill(
+                        layout.attachment == .notchIntegrated
+                            ? Color.black
+                            : EryloPalette.ink
+                    )
+                    .accessibilityHidden(true)
 
-            if layout.attachment == .notchIntegrated,
-               model.state == .compact {
-                notchCompactContent(
-                    content,
-                    surfaceWidth: layout.surfaceFrame.width,
-                    surfaceHeight: layout.surfaceFrame.height,
-                    occlusionWidth: model.displayGeometry.topEdgeOcclusion?.frame.width ?? 0
-                )
-                .opacity(model.isPointerInside ? 1 : 0.9)
-                .animation(.easeOut(duration: 0.12), value: model.isPointerInside)
-            } else {
-                VStack(spacing: 0) {
-                    Color.clear
-                        .frame(height: layout.surfaceContentTopInset)
-                        .accessibilityHidden(true)
-                    surfaceContent(content)
-                        .frame(
-                            width: layout.surfaceFrame.width,
-                            height: contentHeight
-                        )
-                        .clipped()
+                if layout.attachment == .notchIntegrated,
+                   model.state == .compact,
+                   !content.showsFocusTimerLauncher {
+                    notchCompactContent(
+                        content,
+                        surfaceWidth: layout.surfaceFrame.width,
+                        surfaceHeight: layout.surfaceFrame.height,
+                        occlusionWidth: model.displayGeometry.topEdgeOcclusion?.frame.width ?? 0
+                    )
+                    .opacity(model.isPointerInside ? 1 : 0.9)
+                    .animation(.easeOut(duration: 0.12), value: model.isPointerInside)
+                } else {
+                    VStack(spacing: 0) {
+                        Color.clear
+                            .frame(height: layout.surfaceContentTopInset)
+                            .accessibilityHidden(true)
+                        surfaceContent(content)
+                            .frame(
+                                width: layout.surfaceFrame.width,
+                                height: contentHeight
+                            )
+                            .clipped()
+                    }
+                    .frame(
+                        width: layout.surfaceFrame.width,
+                        height: layout.surfaceFrame.height,
+                        alignment: .top
+                    )
                 }
-                .frame(
-                    width: layout.surfaceFrame.width,
-                    height: layout.surfaceFrame.height,
-                    alignment: .top
-                )
             }
         }
         .frame(
@@ -72,7 +75,9 @@ public struct PanelSurfaceView: View {
         .clipShape(silhouette)
         .contentShape(silhouette)
         .onTapGesture {
-            model.send(.primaryAction)
+            if !model.showsFocusTimerLauncher {
+                model.send(.primaryAction)
+            }
         }
         .overlay {
             if model.state == .dropTarget {
@@ -180,11 +185,25 @@ public struct PanelSurfaceView: View {
     private func notchCompactTrailing(_ content: ActivitySurfaceContent) -> some View {
         switch content.primary {
         case let .activity(item):
-            Text(item.shortProgressValue ?? item.kindLabel)
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(EryloPalette.mist)
-                .lineLimit(1)
-                .minimumScaleFactor(0.7)
+            if let temporalProjection = item.temporalProjection {
+                TemporalProjectionView(projection: temporalProjection) { snapshot in
+                    Text(snapshot.remainingText)
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(EryloPalette.mist)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+            } else {
+                Text(
+                    item.kind == .timer
+                        ? item.detail ?? item.shortProgressValue ?? item.kindLabel
+                        : item.shortProgressValue ?? item.kindLabel
+                )
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(EryloPalette.mist)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
         case .degraded:
             Text(SurfaceStrings.compactPaused)
                 .font(.system(size: 9, weight: .medium))
@@ -216,7 +235,11 @@ public struct PanelSurfaceView: View {
                     EmptyView()
                 }
             case let .empty(title, detail):
-                emptyContent(title: title, detail: detail, expanded: content.state == .expanded)
+                if content.showsFocusTimerLauncher {
+                    focusTimerLauncher()
+                } else {
+                    emptyContent(title: title, detail: detail, expanded: content.state == .expanded)
+                }
             case let .degraded(title, detail):
                 degradedContent(title: title, detail: detail)
             case let .dropTarget(title, detail):
@@ -228,6 +251,39 @@ public struct PanelSurfaceView: View {
         .animation(contentAnimation, value: ContentIdentity(content: content))
     }
 
+    private func focusTimerLauncher() -> some View {
+        HStack(spacing: 9) {
+            HStack(spacing: 6) {
+                Image(systemName: "timer")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(EryloPalette.amber)
+                    .accessibilityHidden(true)
+                Text(SurfaceStrings.focusTimerLauncherTitle)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(EryloPalette.cloud)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 2)
+            ForEach([15, 25, 50], id: \.self) { minutes in
+                Button("\(minutes)m") {
+                    model.startFocusTimer(minutes: minutes)
+                }
+                .buttonStyle(
+                    FocusTimerPresetButtonStyle(
+                        reduceMotion: model.motionStyle == .reduced
+                    )
+                )
+                .accessibilityLabel("Start \(minutes)-minute Focus Timer")
+                .accessibilityHint(SurfaceStrings.focusTimerLauncherHint)
+                .accessibilityIdentifier("erylo.focus-timer.launcher-\(minutes)")
+            }
+        }
+        .padding(.horizontal, 16)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(SurfaceStrings.focusTimerLauncherTitle)
+        .accessibilityHint(SurfaceStrings.focusTimerLauncherHint)
+    }
+
     private func compactActivity(_ item: ActivitySurfaceItem) -> some View {
         HStack(spacing: 9) {
             activitySymbol(item, size: 13)
@@ -235,17 +291,31 @@ public struct PanelSurfaceView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .lineLimit(1)
             Spacer(minLength: 0)
-            if let progressValue = item.shortProgressValue {
-                Text(progressValue)
-                    .font(.system(size: 11, weight: .medium, design: .monospaced))
-                    .foregroundStyle(EryloPalette.mist)
-            }
+            compactProgressValue(item)
         }
         .foregroundStyle(EryloPalette.cloud)
         .padding(.horizontal, 15)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(item.accessibilitySummary)
         .accessibilitySortPriority(3)
+    }
+
+    @ViewBuilder
+    private func compactProgressValue(_ item: ActivitySurfaceItem) -> some View {
+        if let temporalProjection = item.temporalProjection {
+            TemporalProjectionView(projection: temporalProjection) { snapshot in
+                Text(snapshot.remainingText)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                    .foregroundStyle(EryloPalette.mist)
+                    .accessibilityLabel("\(snapshot.remainingText) remaining")
+            }
+        } else if let progressValue = item.kind == .timer
+            ? item.detail ?? item.shortProgressValue
+            : item.shortProgressValue {
+            Text(progressValue)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundStyle(EryloPalette.mist)
+        }
     }
 
     private func peekActivity(_ item: ActivitySurfaceItem) -> some View {
@@ -257,20 +327,9 @@ public struct PanelSurfaceView: View {
                     .foregroundStyle(EryloPalette.cloud)
                     .lineLimit(1)
                 Spacer(minLength: 0)
-                if let value = item.detail ?? item.shortProgressValue {
-                    Text(value)
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(EryloPalette.mist)
-                        .lineLimit(1)
-                }
+            projectedDetail(item, fontSize: 10)
             }
-            if let progress = item.progressFraction {
-                SurfaceProgressTrack(
-                    progress: progress,
-                    tint: accentColor(item.accent),
-                    height: 2
-                )
-            }
+            projectedProgressTrack(item, height: 2)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 6)
@@ -295,26 +354,8 @@ public struct PanelSurfaceView: View {
                         .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(EryloPalette.cloud)
                         .lineLimit(1)
-                    if let detail = item.detail {
-                        Text(detail)
-                            .font(.system(size: 12))
-                            .foregroundStyle(EryloPalette.mist)
-                            .lineLimit(2)
-                    }
-                    if let progress = item.progressFraction,
-                       let progressValue = item.shortProgressValue {
-                        HStack(spacing: 10) {
-                            SurfaceProgressTrack(
-                                progress: progress,
-                                tint: accentColor(item.accent),
-                                height: 4
-                            )
-                            Text(progressValue)
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(EryloPalette.mist)
-                        }
-                        .padding(.top, 2)
-                    }
+                    projectedDetail(item, fontSize: 12)
+                    expandedProgress(item)
                 }
                 Spacer(minLength: 0)
             }
@@ -337,6 +378,81 @@ public struct PanelSurfaceView: View {
             actionArea(content)
                 .padding(.horizontal, 19)
                 .padding(.bottom, 14)
+        }
+    }
+
+    @ViewBuilder
+    private func projectedDetail(
+        _ item: ActivitySurfaceItem,
+        fontSize: CGFloat
+    ) -> some View {
+        if let temporalProjection = item.temporalProjection {
+            TemporalProjectionView(projection: temporalProjection) { snapshot in
+                Text("\(snapshot.remainingText) remaining")
+                    .font(.system(size: fontSize, weight: .medium, design: .monospaced))
+                    .foregroundStyle(EryloPalette.mist)
+                    .lineLimit(1)
+                    .accessibilityLabel("\(snapshot.remainingText) remaining")
+            }
+        } else if let value = item.detail ?? item.shortProgressValue {
+            Text(value)
+                .font(.system(size: fontSize, weight: .medium, design: .monospaced))
+                .foregroundStyle(EryloPalette.mist)
+                .lineLimit(2)
+        }
+    }
+
+    @ViewBuilder
+    private func projectedProgressTrack(
+        _ item: ActivitySurfaceItem,
+        height: CGFloat
+    ) -> some View {
+        if let temporalProjection = item.temporalProjection {
+            TemporalProjectionView(projection: temporalProjection) { snapshot in
+                SurfaceProgressTrack(
+                    progress: snapshot.fractionCompleted,
+                    tint: accentColor(item.accent),
+                    height: height
+                )
+            }
+        } else if let progress = item.progressFraction {
+            SurfaceProgressTrack(
+                progress: progress,
+                tint: accentColor(item.accent),
+                height: height
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func expandedProgress(_ item: ActivitySurfaceItem) -> some View {
+        if let temporalProjection = item.temporalProjection {
+            TemporalProjectionView(projection: temporalProjection) { snapshot in
+                HStack(spacing: 10) {
+                    SurfaceProgressTrack(
+                        progress: snapshot.fractionCompleted,
+                        tint: accentColor(item.accent),
+                        height: 4
+                    )
+                    Text(snapshot.remainingText)
+                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(EryloPalette.mist)
+                }
+                .padding(.top, 2)
+            }
+        } else if let progress = item.progressFraction,
+                  let progressValue = item.shortProgressValue {
+            HStack(spacing: 10) {
+                SurfaceProgressTrack(
+                    progress: progress,
+                    tint: accentColor(item.accent),
+                    height: 4
+                )
+                Text(progressValue)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(EryloPalette.mist)
+            }
+            .padding(.top, 2)
         }
     }
 
@@ -629,6 +745,20 @@ private struct ContentIdentity: Hashable {
     }
 }
 
+/// Exists only inside a physically presented rendered activity branch. SwiftUI
+/// tears its periodic schedule down when the NSPanel is ordered out, the logical
+/// surface hides, or the timer activity is replaced.
+private struct TemporalProjectionView<Content: View>: View {
+    let projection: ActivitySurfaceTemporalProjection
+    @ViewBuilder let content: (ActivitySurfaceTemporalSnapshot) -> Content
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { context in
+            content(projection.snapshot(at: context.date))
+        }
+    }
+}
+
 private struct SurfaceProgressTrack: View {
     let progress: Double
     let tint: Color
@@ -674,6 +804,33 @@ private struct SurfaceActionButtonStyle: ButtonStyle {
             )
             .opacity(configuration.isPressed ? 0.86 : 1)
             .scaleEffect(!reduceMotion && configuration.isPressed ? 0.98 : 1)
+            .animation(
+                reduceMotion ? nil : .easeOut(duration: 0.08),
+                value: configuration.isPressed
+            )
+    }
+}
+
+private struct FocusTimerPresetButtonStyle: ButtonStyle {
+    let reduceMotion: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .foregroundStyle(EryloPalette.cloud)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(
+                        EryloPalette.amber.opacity(configuration.isPressed ? 0.28 : 0.14)
+                    )
+                    .overlay {
+                        Capsule(style: .continuous)
+                            .stroke(EryloPalette.amber.opacity(0.32), lineWidth: 0.5)
+                    }
+            )
+            .scaleEffect(!reduceMotion && configuration.isPressed ? 0.97 : 1)
             .animation(
                 reduceMotion ? nil : .easeOut(duration: 0.08),
                 value: configuration.isPressed

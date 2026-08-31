@@ -30,6 +30,15 @@ Run:
 Scripts/ci.sh
 ```
 
+To regenerate the native Focus Timer visual-QA set on representative notch
+geometry while running the deterministic surface harness. The renderer hosts
+the production SwiftUI view on a fixed dark desktop backdrop so the notch's
+transparent outer curls are composited as product geometry, not an alpha matte:
+
+```sh
+ERYLO_VISUAL_QA_DIRECTORY="$PWD/docs/images" swift run EryloSurfaceTests
+```
+
 The script fails for tracked files hidden by `.gitignore`, common private signing/credential filenames, private-key markers, high-confidence GitHub/AWS token patterns, invalid tracked shell syntax, or invalid GitHub YAML syntax. A false positive should receive a narrow reviewed exception; do not weaken the repository-wide rule or add a broad ignore pattern.
 
 Use `git check-ignore -v <path>` when changing `.gitignore`, and confirm that collaboration inputs such as `Package.resolved`, project/workspace metadata, entitlements, documentation assets, and sanitized test fixtures remain visible to Git.

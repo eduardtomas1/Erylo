@@ -699,7 +699,24 @@ public enum GlanceRequestFactory {
             progress: presentation.fractionCompleted,
             actionIdentifier: CountdownActivityContract.cancelActionIdentifier,
             actionLabel: "Cancel",
-            actionIntent: ActivityActionIntent.cancel.rawValue
+            actionIntent: ActivityActionIntent.cancel.rawValue,
+            temporalProgress: ActivityTemporalProgress(
+                startedAt: timer.startedAt,
+                endsAt: timer.endsAt
+            )
+        )
+    }
+
+    static func countdownCompletion() -> ActivityRequest {
+        ActivityRequest(
+            identifier: GlanceActivityIdentity.timerIdentifier,
+            source: ActivitySource.timer.rawValue,
+            kind: ActivityKind.timer.rawValue,
+            priority: 60,
+            title: "Focus complete",
+            ttlMilliseconds: 2_500,
+            temporalProgress: nil,
+            presentationRole: .completionAcknowledgement
         )
     }
 

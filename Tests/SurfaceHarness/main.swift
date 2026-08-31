@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Darwin
 import EryloActivity
@@ -6,6 +7,7 @@ import EryloIntegrations
 import EryloSurface
 import EryloWindowing
 import Foundation
+import SwiftUI
 
 @main
 @MainActor
@@ -28,8 +30,18 @@ enum SurfaceHarnessMain {
         await harness.verifyDetachedReleaseTeardown()
         harness.verifyLegacyCompatibilityDefaultsAreInert()
         harness.verifyStateContentAccessibilityAndPreviews()
+        await harness.verifyFocusTimerProjectionAndLauncher()
+        await harness.verifyTemporalProjectionPhysicalVisibility()
         harness.verifyReduceMotionAndRapidStateChanges()
         await harness.verifySharedBrokerVisibilityAndDisabledWork()
+        if let outputDirectory = ProcessInfo.processInfo.environment["ERYLO_VISUAL_QA_DIRECTORY"] {
+            do {
+                try writeFocusTimerVisualQA(to: URL(fileURLWithPath: outputDirectory))
+            } catch {
+                fputs("Visual QA rendering failed: \(error)\n", stderr)
+                Darwin.exit(1)
+            }
+        }
         harness.finish()
     }
 }
@@ -2338,6 +2350,8 @@ private struct SurfaceHarness {
             (ActivitySurfacePreviewCatalog.battery, .battery, SurfaceStrings.batteryKind),
             (ActivitySurfacePreviewCatalog.charging, .charging, SurfaceStrings.chargingKind),
             (ActivitySurfacePreviewCatalog.timer, .timer, SurfaceStrings.timerKind),
+            (ActivitySurfacePreviewCatalog.timerCompact, .timer, SurfaceStrings.timerKind),
+            (ActivitySurfacePreviewCatalog.timerCompletion, .timer, SurfaceStrings.timerKind),
             (ActivitySurfacePreviewCatalog.meeting, .meeting, SurfaceStrings.meetingKind),
             (ActivitySurfacePreviewCatalog.volume, .volume, SurfaceStrings.volumeKind),
             (ActivitySurfacePreviewCatalog.media, .media, SurfaceStrings.mediaKind),
@@ -2433,7 +2447,7 @@ private struct SurfaceHarness {
             ),
             "degraded stream state has honest fallback copy"
         )
-        check(ActivitySurfacePreviewCatalog.representative.count == 10, "preview seam includes bounded representative and state scenarios")
+        check(ActivitySurfacePreviewCatalog.representative.count == 13, "preview seam includes launcher, timer lifecycle, and representative state scenarios")
 
         do {
             guard let current = try ActivitySurfacePreviewCatalog.generic.snapshot().current else {
@@ -2460,6 +2474,235 @@ private struct SurfaceHarness {
         } catch {
             recordUnexpected(error, context: "queue saturation")
         }
+    }
+
+    mutating func verifyFocusTimerProjectionAndLauncher() async {
+        let start = Date(timeIntervalSinceReferenceDate: 70_000)
+        let end = start.addingTimeInterval(3_700)
+        let temporalRequest = ActivityRequest(
+            identifier: "active-countdown",
+            source: ActivitySource.timer.rawValue,
+            kind: ActivityKind.timer.rawValue,
+            priority: 60,
+            title: "Focus Timer",
+            detail: "62m remaining",
+            progress: 0,
+            actionIdentifier: "timer.cancel",
+            actionLabel: "Cancel",
+            actionIntent: ActivityActionIntent.cancel.rawValue,
+            temporalProgress: ActivityTemporalProgress(
+                startedAt: start,
+                endsAt: end
+            )
+        )
+        do {
+            let activity = try Activity(
+                validating: temporalRequest
+            )
+            let item = ActivitySurfaceItem(
+                PresentedActivity(activity: activity, submissionSequence: 1, revision: 41)
+            )
+            guard let projection = item.temporalProjection else {
+                check(false, "timer activity preserves its internal temporal projection")
+                check(false, "timer projection formats MM:SS")
+                check(false, "timer projection formats H:MM:SS")
+                check(false, "timer projection derives local progress")
+                return
+            }
+            let nearEnd = projection.snapshot(at: end.addingTimeInterval(-9.2))
+            let hourScale = projection.snapshot(at: start.addingTimeInterval(39.2))
+            check(nearEnd.remainingText == "00:10", "timer projection rounds useful MM:SS remaining time")
+            check(hourScale.remainingText == "1:01:01", "timer projection formats H:MM:SS without percentage fallback")
+            check(
+                hourScale.fractionCompleted > 0 && hourScale.fractionCompleted < 1,
+                "timer projection derives progress locally from immutable timestamps"
+            )
+
+            let broker = ActivityBroker()
+            let handler = CancellationWaitingActionHandler()
+            let activityModel = SurfaceActivityModel(broker: broker, actionHandler: handler)
+            activityModel.start()
+            let snapshot = try await broker.submit(temporalRequest)
+            check(
+                await waitUntil {
+                    activityModel.snapshotVersion == snapshot.version
+                        && activityModel.currentAction != nil
+                },
+                "timestamp-backed timer exposes its stable cancel action"
+            )
+            if let action = activityModel.currentAction {
+                check(activityModel.dispatch(action), "timestamp-backed cancel action begins dispatch")
+                check(
+                    await waitUntil { handler.didStart },
+                    "cancel handler is deterministically in flight before local projection"
+                )
+                let brokerVersion = await broker.snapshot().version
+                for second in 1...5 {
+                    _ = projection.snapshot(at: start.addingTimeInterval(Double(second)))
+                }
+                check(
+                    activityModel.actionDispatchState == .inProgress
+                        && activityModel.currentAction == action
+                        && activityModel.workState.hasActionTask,
+                    "visible-only projection cannot cancel or stale an in-flight Cancel action"
+                )
+                check(
+                    await broker.snapshot().version == brokerVersion,
+                    "visible-only projection allocates no broker revision"
+                )
+            } else {
+                check(false, "timestamp-backed cancel action is available for dispatch")
+                check(false, "cancel handler can remain in flight through local projection")
+                check(false, "local projection can preserve the broker revision")
+            }
+            await activityModel.stop()
+            check(
+                handler.didFinishAfterCancellation && activityModel.workState == .stopped,
+                "projection fixture drains its action and subscription at the stop barrier"
+            )
+        } catch {
+            recordUnexpected(error, context: "surface timer projection")
+        }
+
+        let frame = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+        let geometry = DisplayGeometry(
+            frame: frame,
+            visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
+            backingScaleFactor: 2,
+            topEdgeOcclusion: TopEdgeOcclusion(
+                frame: CGRect(x: 610, y: 856, width: 220, height: 44)
+            )
+        )
+        let model = PanelSurfaceModel(
+            displayGeometry: geometry,
+            initialState: .compact,
+            scheduler: ManualOneShotScheduler(),
+            activityModel: makeEmptyPreviewModel()
+        )
+        var launchedMinutes: [Int] = []
+        model.setFocusTimerStartHandler { minutes in
+            launchedMinutes.append(minutes)
+            return true
+        }
+        check(model.showsFocusTimerLauncher, "idle deliberate compact state exposes the Focus Timer launcher")
+        check(
+            model.layout.surfaceFrame.size == PanelMetrics.feasibility.timerLauncherSize,
+            "notch-native launcher has one bounded compact geometry"
+        )
+        check(model.startFocusTimer(minutes: 15), "launcher accepts the 15-minute preset")
+        check(model.startFocusTimer(minutes: 25), "launcher accepts the 25-minute preset")
+        check(model.startFocusTimer(minutes: 50), "launcher accepts the 50-minute preset")
+        check(!model.startFocusTimer(minutes: 30), "launcher rejects non-preset durations")
+        check(launchedMinutes == [15, 25, 50], "launcher routes only the three closed preset values")
+        check(
+            model.accessibility.hint == SurfaceStrings.focusTimerLauncherHint,
+            "launcher exposes an accurate VoiceOver choice hint"
+        )
+    }
+
+    mutating func verifyTemporalProjectionPhysicalVisibility() async {
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
+        let display = makeDisplaySnapshot(identity: 71, isMain: true)
+        let displays = FakeDisplayProvider(displays: [display])
+        let events = FakeLifecycleEventSource()
+        let registry = SharedModelPanelRegistry()
+        let coordinator = makeCoordinator(
+            displays: displays,
+            events: events,
+            registry: registry,
+            model: activityModel
+        )
+        await coordinator.startAndWait()
+
+        let start = Date(timeIntervalSinceReferenceDate: 80_000)
+        let end = start.addingTimeInterval(90)
+        do {
+            let submitted = try await broker.submit(
+                ActivityRequest(
+                    identifier: "physical-visibility-timer",
+                    source: ActivitySource.timer.rawValue,
+                    kind: ActivityKind.timer.rawValue,
+                    priority: 60,
+                    title: "Focus Timer",
+                    actionIdentifier: "timer.cancel",
+                    actionLabel: "Cancel",
+                    actionIntent: ActivityActionIntent.cancel.rawValue,
+                    temporalProgress: ActivityTemporalProgress(
+                        startedAt: start,
+                        endsAt: end
+                    )
+                )
+            )
+            check(
+                await waitUntil {
+                    activityModel.snapshotVersion == submitted.version
+                        && registry.activeTemporalProjectionCount == 1
+                },
+                "shown timer panel owns one visible-only temporal projection"
+            )
+            guard let panel = registry.latestOpenPanel else {
+                check(false, "temporal projection panel remains available")
+                await coordinator.shutdown()
+                await broker.shutdown()
+                return
+            }
+            let stableVersion = await broker.snapshot().version
+
+            events.emitCurrent(.workspaceWillSleep)
+            check(
+                panel.hideCount == 1 && registry.activeTemporalProjectionCount == 0,
+                "workspace sleep orders out the panel and retires all timeline projection work"
+            )
+            check(
+                panel.temporalSnapshot(at: start.addingTimeInterval(30))?.remainingText == "01:00",
+                "ordered-out timer retains immutable timestamps without scheduling"
+            )
+            check(
+                await broker.snapshot().version == stableVersion,
+                "sleeping projection performs no broker revision churn"
+            )
+
+            events.emitCurrent(.workspaceDidWake)
+            check(
+                panel.showCount == 2 && registry.activeTemporalProjectionCount == 1,
+                "workspace wake reshows the panel and re-enables visible-only projection"
+            )
+            check(
+                panel.temporalSnapshot(at: start.addingTimeInterval(61))?.remainingText == "00:29",
+                "reshown projection resumes directly from current timestamps"
+            )
+            check(
+                await broker.snapshot().version == stableVersion,
+                "wake-time projection preserves the exact activity revision"
+            )
+
+            check(coordinator.toggleSelectedPanelVisibility(), "menu hide reaches the selected timer panel")
+            check(
+                !panel.isTemporalProjectionActive,
+                "logically hidden shown panel owns zero temporal projection work"
+            )
+            check(coordinator.toggleSelectedPanelVisibility(), "menu reshow restores the selected timer panel")
+            check(
+                panel.isTemporalProjectionActive,
+                "logical reshow restores projection without a provider tick"
+            )
+        } catch {
+            recordUnexpected(error, context: "temporal projection physical visibility")
+        }
+
+        await coordinator.shutdown()
+        check(
+            registry.panels.allSatisfy { !$0.isTemporalProjectionActive },
+            "projection visibility shutdown leaves zero mounted timeline work"
+        )
+        let finalBrokerWork = await broker.workState()
+        check(
+            activityModel.workState == .stopped
+                && finalBrokerWork.subscriberCount == 0,
+            "projection visibility shutdown settles all surface subscription work"
+        )
+        await broker.shutdown()
     }
 
     mutating func verifyReduceMotionAndRapidStateChanges() {
@@ -3107,6 +3350,10 @@ private final class SharedModelPanelRegistry {
         panels.reduce(0) { $0 + $1.primaryActionCount }
     }
 
+    var activeTemporalProjectionCount: Int {
+        panels.lazy.filter(\.isTemporalProjectionActive).count
+    }
+
     var latestOpenPanel: FakePanel? {
         panels.last { !$0.isClosed }
     }
@@ -3130,7 +3377,14 @@ private final class SharedModelPanelRegistry {
     ) -> any PanelPresenting {
         models.append(activityModel)
         creationCount += 1
-        let panel = FakePanel(displayIdentity: snapshot.identity)
+        let panel = FakePanel(
+            displayIdentity: snapshot.identity,
+            surfaceModel: PanelSurfaceModel(
+                displayGeometry: snapshot.geometry,
+                initialState: .hidden,
+                activityModel: activityModel
+            )
+        )
         panels.append(panel)
         return panel
     }
@@ -3139,6 +3393,7 @@ private final class SharedModelPanelRegistry {
 @MainActor
 private final class FakePanel: PanelPresenting {
     let displayIdentity: DisplayIdentity
+    private let surfaceModel: PanelSurfaceModel
     private(set) var isClosed = false
     private(set) var showCount = 0
     private(set) var hideCount = 0
@@ -3147,21 +3402,30 @@ private final class FakePanel: PanelPresenting {
     private(set) var pointerUpdateCount = 0
     private(set) var primaryActionCount = 0
 
-    init(displayIdentity: DisplayIdentity) {
+    var isTemporalProjectionActive: Bool {
+        surfaceModel.isTemporalProjectionActive
+    }
+
+    init(displayIdentity: DisplayIdentity, surfaceModel: PanelSurfaceModel) {
         self.displayIdentity = displayIdentity
+        self.surfaceModel = surfaceModel
+        surfaceModel.setWindowPresented(false)
     }
 
     func show() {
         showCount += 1
+        surfaceModel.setWindowPresented(true)
     }
 
     func hide() {
         hideCount += 1
+        surfaceModel.setWindowPresented(false)
     }
 
     func close() {
         closeCount += 1
         isClosed = true
+        surfaceModel.setWindowPresented(false)
     }
 
     func update(snapshot: DisplaySnapshot) {
@@ -3174,6 +3438,16 @@ private final class FakePanel: PanelPresenting {
 
     func performPrimaryAction() {
         primaryActionCount += 1
+        surfaceModel.send(.primaryAction)
+    }
+
+    func performVisibilityToggle() {
+        surfaceModel.send(surfaceModel.state == .hidden ? .show : .hide)
+    }
+
+    func temporalSnapshot(at date: Date) -> ActivitySurfaceTemporalSnapshot? {
+        guard case let .activity(item) = surfaceModel.content.primary else { return nil }
+        return item.temporalProjection?.snapshot(at: date)
     }
     func cancelPendingInteractions() {}
 }
@@ -3201,4 +3475,104 @@ private func makeDisplaySnapshot(
         ),
         isMain: isMain
     )
+}
+
+@MainActor
+private func writeFocusTimerVisualQA(to directory: URL) throws {
+    try FileManager.default.createDirectory(
+        at: directory,
+        withIntermediateDirectories: true
+    )
+    let frame = CGRect(x: 0, y: 0, width: 1_440, height: 900)
+    let geometry = DisplayGeometry(
+        frame: frame,
+        visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
+        backingScaleFactor: 2,
+        topEdgeOcclusion: TopEdgeOcclusion(
+            frame: CGRect(x: 610, y: 856, width: 220, height: 44)
+        )
+    )
+    let visualNow = Date()
+    let temporalRequest = ActivityRequest(
+        identifier: "preview.visual.timer",
+        source: ActivitySource.timer.rawValue,
+        kind: ActivityKind.timer.rawValue,
+        priority: 60,
+        title: "Focus Timer",
+        detail: "13m remaining",
+        progress: 0.36,
+        actionIdentifier: "timer.cancel",
+        actionLabel: "Cancel timer",
+        actionIntent: ActivityActionIntent.cancel.rawValue,
+        temporalProgress: ActivityTemporalProgress(
+            startedAt: visualNow.addingTimeInterval(-456),
+            endsAt: visualNow.addingTimeInterval(760)
+        )
+    )
+    let temporalCompact = ActivitySurfacePreviewScenario(
+        name: "Timer compact visual QA",
+        state: .compact,
+        current: temporalRequest
+    )
+    let temporalExpanded = ActivitySurfacePreviewScenario(
+        name: "Timer expanded visual QA",
+        state: .expanded,
+        current: temporalRequest
+    )
+    let scenarios: [(String, ActivitySurfacePreviewScenario)] = [
+        ("erylo-timer-launcher.png", ActivitySurfacePreviewCatalog.focusTimerLauncher),
+        ("erylo-timer-compact.png", temporalCompact),
+        ("erylo-timer-expanded.png", temporalExpanded),
+        ("erylo-timer-completion.png", ActivitySurfacePreviewCatalog.timerCompletion),
+    ]
+
+    for (filename, scenario) in scenarios {
+        let model = try ActivitySurfacePreviewCatalog.makeModel(
+            scenario: scenario,
+            displayGeometry: geometry,
+            scheduler: ManualOneShotScheduler()
+        )
+        let renderedSize = PanelMetrics.feasibility.maximumSize
+        let rootView = ZStack(alignment: .top) {
+            Color(red: 0.035, green: 0.047, blue: 0.067)
+            PanelSurfaceView(model: model)
+        }
+        .frame(
+            width: renderedSize.width,
+            height: renderedSize.height,
+            alignment: .top
+        )
+        .environment(\.colorScheme, .dark)
+        .transaction { transaction in
+            transaction.animation = nil
+            transaction.disablesAnimations = true
+        }
+        let hostingView = NSHostingView(rootView: rootView)
+        hostingView.frame = CGRect(origin: .zero, size: renderedSize)
+        hostingView.layoutSubtreeIfNeeded()
+        guard let representation = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(renderedSize.width * 2),
+            pixelsHigh: Int(renderedSize.height * 2),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            throw VisualQARenderingError.encodingFailed(filename)
+        }
+        representation.size = renderedSize
+        hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+        guard let png = representation.representation(using: .png, properties: [:]) else {
+            throw VisualQARenderingError.encodingFailed(filename)
+        }
+        try png.write(to: directory.appendingPathComponent(filename), options: .atomic)
+    }
+}
+
+private enum VisualQARenderingError: Error {
+    case encodingFailed(String)
 }

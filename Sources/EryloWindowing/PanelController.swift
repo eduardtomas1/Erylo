@@ -5,7 +5,7 @@ import SwiftUI
 
 @MainActor
 final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
-    PanelPresentationDemandReporting {
+    PanelPresentationDemandReporting, PanelFocusTimerLaunching {
     let directDisplayID: CGDirectDisplayID
 
     var displayIdentity: DisplayIdentity {
@@ -40,6 +40,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
             initialState: initialState,
             activityModel: activityModel
         )
+        model.setWindowPresented(false)
         let layout = model.layout
 
         panel = NonActivatingPanel(
@@ -72,15 +73,23 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         reportPresentationDemandIfNeeded(force: true)
     }
 
+    func setFocusTimerStartHandler(
+        _ handler: (@MainActor @Sendable (Int) -> Bool)?
+    ) {
+        model.setFocusTimerStartHandler(handler)
+    }
+
     func show() {
         isVisible = true
         panel.orderFrontRegardless()
+        model.setWindowPresented(true)
         updatePointer(screenPoint: NSEvent.mouseLocation)
         reportActivityVisibilityIfNeeded()
     }
 
     func close() {
         isVisible = false
+        model.setWindowPresented(false)
         model.cancelPendingInteractions()
         panel.ignoresMouseEvents = true
         panel.close()
@@ -89,6 +98,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
 
     func hide() {
         isVisible = false
+        model.setWindowPresented(false)
         model.cancelPendingInteractions()
         panel.ignoresMouseEvents = true
         panel.orderOut(nil)

@@ -452,7 +452,7 @@ public final class SurfaceActivityModel {
             && snapshotSubscriberID == subscriberID
     }
 
-    func addObserver(
+    package func addObserver(
         _ observer: @escaping @MainActor @Sendable () -> Void
     ) -> UUID {
         let identifier = UUID()
@@ -460,7 +460,7 @@ public final class SurfaceActivityModel {
         return identifier
     }
 
-    func removeObserver(_ identifier: UUID) {
+    package func removeObserver(_ identifier: UUID) {
         observers.removeValue(forKey: identifier)
     }
 

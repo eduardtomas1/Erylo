@@ -16,7 +16,16 @@ public protocol PanelLifecycleEventSourcing: AnyObject {
     var isRunning: Bool { get }
 
     func start(handler: @escaping @MainActor @Sendable (PanelLifecycleEvent) -> Void)
+    func setPointerMonitoringEnabled(_ isEnabled: Bool)
     func stop()
+}
+
+public extension PanelLifecycleEventSourcing {
+    /// Compatibility fallback for injected event sources that do not own native
+    /// pointer monitors. The system source overrides this with demand ownership.
+    func setPointerMonitoringEnabled(_ isEnabled: Bool) {
+        _ = isEnabled
+    }
 }
 
 package typealias PanelLifecycleEventDeliveryScheduler = @Sendable (
@@ -42,6 +51,7 @@ private final class PanelPointerEventCoalescer: @unchecked Sendable {
         var pendingPosition: PendingPosition?
         var lastDeliveredPosition: CGPoint?
         var isDeliveryScheduled = false
+        var deliveryGeneration: UInt64 = 0
         var maximumPendingDeliveryCount = 0
     }
 
@@ -60,43 +70,47 @@ private final class PanelPointerEventCoalescer: @unchecked Sendable {
 
     func activate(lease: UUID) {
         lock.withLock {
+            state.deliveryGeneration &+= 1
             state.activeLease = lease
             state.pendingPosition = nil
             state.lastDeliveredPosition = nil
+            state.isDeliveryScheduled = false
         }
     }
 
     func deactivate() {
         lock.withLock {
+            state.deliveryGeneration &+= 1
             state.activeLease = nil
             state.pendingPosition = nil
             state.lastDeliveredPosition = nil
+            state.isDeliveryScheduled = false
         }
     }
 
     func submit(_ point: CGPoint, lease: UUID) {
-        let shouldSchedule = lock.withLock { () -> Bool in
-            guard state.activeLease == lease else { return false }
+        let scheduledGeneration = lock.withLock { () -> UInt64? in
+            guard state.activeLease == lease else { return nil }
             if state.pendingPosition?.point == point {
-                return false
+                return nil
             }
             if state.pendingPosition == nil, state.lastDeliveredPosition == point {
-                return false
+                return nil
             }
 
             state.pendingPosition = PendingPosition(point: point, lease: lease)
-            guard !state.isDeliveryScheduled else { return false }
+            guard !state.isDeliveryScheduled else { return nil }
             state.isDeliveryScheduled = true
             state.maximumPendingDeliveryCount = max(
                 state.maximumPendingDeliveryCount,
                 1
             )
-            return true
+            return state.deliveryGeneration
         }
 
-        guard shouldSchedule else { return }
+        guard let scheduledGeneration else { return }
         schedule { [weak self] in
-            await self?.drain()
+            await self?.drain(generation: scheduledGeneration)
         }
     }
 
@@ -111,15 +125,16 @@ private final class PanelPointerEventCoalescer: @unchecked Sendable {
     }
 
     @MainActor
-    private func drain() async {
-        while let pendingPosition = takeNextPosition() {
+    private func drain(generation: UInt64) async {
+        while let pendingPosition = takeNextPosition(generation: generation) {
             deliver(pendingPosition.point, pendingPosition.lease)
             await Task.yield()
         }
     }
 
-    private func takeNextPosition() -> PendingPosition? {
+    private func takeNextPosition(generation: UInt64) -> PendingPosition? {
         lock.withLock {
+            guard state.deliveryGeneration == generation else { return nil }
             guard let pendingPosition = state.pendingPosition,
                   state.activeLease == pendingPosition.lease else {
                 state.pendingPosition = nil
@@ -207,6 +222,10 @@ public final class SystemPanelLifecycleEventSource: PanelLifecycleEventSourcing 
         resources.start(handler: handler)
     }
 
+    public func setPointerMonitoringEnabled(_ isEnabled: Bool) {
+        resources.setPointerMonitoringEnabled(isEnabled)
+    }
+
     public func stop() {
         resources.stop()
     }
@@ -270,10 +289,21 @@ private final class SystemPanelLifecycleResources {
         isRunning = true
         activeLease = lease
         self.handler = handler
-        pointerDelivery.activate(lease: lease)
+        pointerDelivery.deactivate()
         installNotifications(lease: lease)
-        installPointerMonitors(lease: lease)
         installPrimaryShortcut(lease: lease)
+    }
+
+    func setPointerMonitoringEnabled(_ isEnabled: Bool) {
+        guard isRunning, let activeLease else {
+            removePointerMonitors()
+            return
+        }
+        if isEnabled {
+            installPointerMonitors(lease: activeLease)
+        } else {
+            removePointerMonitors()
+        }
     }
 
     func stop() {
@@ -289,14 +319,7 @@ private final class SystemPanelLifecycleResources {
         workspaceObservers.forEach(workspaceCenter.removeObserver)
         workspaceObservers.removeAll()
 
-        if let globalPointerMonitor {
-            NSEvent.removeMonitor(globalPointerMonitor)
-            self.globalPointerMonitor = nil
-        }
-        if let localPointerMonitor {
-            NSEvent.removeMonitor(localPointerMonitor)
-            self.localPointerMonitor = nil
-        }
+        removePointerMonitors()
         if let hotKey {
             UnregisterEventHotKey(hotKey)
             self.hotKey = nil
@@ -361,6 +384,8 @@ private final class SystemPanelLifecycleResources {
     }
 
     private func installPointerMonitors(lease: UUID) {
+        guard globalPointerMonitor == nil, localPointerMonitor == nil else { return }
+        pointerDelivery.activate(lease: lease)
         let pointerEvents: NSEvent.EventTypeMask = [
             .mouseMoved,
             .leftMouseDragged,
@@ -377,8 +402,21 @@ private final class SystemPanelLifecycleResources {
         }
     }
 
+    private func removePointerMonitors() {
+        pointerDelivery.deactivate()
+        if let globalPointerMonitor {
+            NSEvent.removeMonitor(globalPointerMonitor)
+            self.globalPointerMonitor = nil
+        }
+        if let localPointerMonitor {
+            NSEvent.removeMonitor(localPointerMonitor)
+            self.localPointerMonitor = nil
+        }
+    }
+
     fileprivate func submitCurrentPointerPosition(_ point: CGPoint) {
-        guard let activeLease else { return }
+        guard globalPointerMonitor != nil || localPointerMonitor != nil,
+              let activeLease else { return }
         pointerDelivery.submit(point, lease: activeLease)
     }
 

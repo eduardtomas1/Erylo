@@ -784,7 +784,9 @@ private struct SurfaceHarness {
             panelFactory: legacyFactory
         )
         coordinator.start()
-        check(events.isRunning && registry.openPanelCount == 1, "legacy coordinator start remains immediately observable")
+        check(events.isRunning && registry.openPanelCount == 0, "legacy coordinator start remains observable without hidden panels")
+        events.emitCurrent(.primaryShortcut)
+        check(registry.openPanelCount == 1, "legacy shortcut constructs its selected panel on demand")
         coordinator.update(policy: DisplayPolicy(isEnabled: false))
         check(!events.isRunning && registry.openPanelCount == 0, "legacy coordinator disable immediately retires events and panels")
         coordinator.stop()
@@ -1155,7 +1157,7 @@ private struct SurfaceHarness {
             coordinator.start()
             await coordinator.startAndWait()
             check(coordinator.isRunning && events.isRunning, "sync stop-start keeps the latest running state")
-            check(registry.openPanelCount == 1, "sync stop-start retains exactly one current panel")
+            check(registry.openPanelCount == 0, "sync stop-start preserves zero idle panels")
             check(model.isRunning && model.lifecycleRequestTaskCount == 0, "sync stop-start settles its owned model request")
             check(await broker.workState().subscriberCount == 1, "sync stop-start retains exactly one subscriber")
 
@@ -1164,7 +1166,7 @@ private struct SurfaceHarness {
             coordinator.update(policy: .safeDefault)
             await coordinator.updateAndWait(policy: .safeDefault)
             check(coordinator.policy.isEnabled && events.isRunning, "sync disable-enable keeps the latest enabled policy")
-            check(registry.openPanelCount == 1, "sync disable-enable retains exactly one current panel")
+            check(registry.openPanelCount == 0, "sync disable-enable preserves zero idle panels")
             check(model.isRunning && model.lifecycleRequestTaskCount == 0, "sync disable-enable settles its owned model request")
             check(await broker.workState().subscriberCount == 1, "sync disable-enable retains exactly one subscriber")
         }
@@ -1612,8 +1614,8 @@ private struct SurfaceHarness {
         check(!enableReturned, "awaited policy enable remains behind the active physical drain")
         check(coordinator.isRunning && coordinator.policy.isEnabled, "overlapping on-off-on records enabled as latest policy")
         check(events.isRunning, "latest policy enable reinstalls the event source while the old drain is suspended")
-        check(coordinator.activeDisplayIdentities.count == 2, "latest policy enable retains both requested panels")
-        check(registry.openPanelCount == 2, "stale disable cleanup has not closed latest-policy panels")
+        check(coordinator.activeDisplayIdentities.isEmpty, "latest policy enable stays panel-free during the old drain")
+        check(registry.openPanelCount == 0, "stale disable cleanup cannot recreate panels before fresh content")
         check(await broker.workState().subscriberCount <= 1, "overlapping policy restart never exceeds one subscriber")
 
         handler.release()
@@ -1628,8 +1630,13 @@ private struct SurfaceHarness {
             "latest policy enable restarts the model after the stale disable drain"
         )
         check(events.isRunning && events.runningInstanceCount == 1, "on-off-on finishes with exactly one event source")
-        check(coordinator.activeDisplayIdentities.count == 2, "stale disable continuation cannot close enabled panels")
-        check(registry.openPanelCount == 2, "on-off-on finishes with exactly two open panels")
+        check(
+            await waitUntil {
+                coordinator.activeDisplayIdentities.count == 2
+                    && registry.openPanelCount == 2
+            },
+            "on-off-on constructs exactly the two enabled panels after fresh content arrives"
+        )
         check(await broker.workState().subscriberCount == 1, "on-off-on finishes with exactly one subscriber")
 
         await coordinator.stopAndWait()
@@ -1683,7 +1690,7 @@ private struct SurfaceHarness {
         check(!startReturned, "awaited restart remains behind the active physical stop drain")
         check(coordinator.isRunning, "overlapping stop-start records running as the latest request")
         check(events.isRunning && events.runningInstanceCount == 1, "latest start restores exactly one event source")
-        check(coordinator.activeDisplayIdentities.count == 1, "latest start retains the requested panel")
+        check(coordinator.activeDisplayIdentities.isEmpty, "latest start stays panel-free during the old drain")
         check(await broker.workState().subscriberCount <= 1, "overlapping coordinator restart never exceeds one subscriber")
 
         handler.release()
@@ -1698,7 +1705,13 @@ private struct SurfaceHarness {
             "latest coordinator start restarts the model after stale stop drain"
         )
         check(coordinator.isRunning && events.isRunning, "stop-start finishes running with events active")
-        check(coordinator.activeDisplayIdentities.count == 1 && registry.openPanelCount == 1, "stale stop cannot close latest-start panel")
+        check(
+            await waitUntil {
+                coordinator.activeDisplayIdentities.count == 1
+                    && registry.openPanelCount == 1
+            },
+            "stale stop cannot close the panel created by fresh successor content"
+        )
         check(await broker.workState().subscriberCount == 1, "stop-start finishes with exactly one subscriber")
 
         await coordinator.stopAndWait()
@@ -1880,6 +1893,7 @@ private struct SurfaceHarness {
         await coordinator.stopAndWait()
         await coordinator.startAndWait()
         check(events.registrationCount == 3, "stop-start installs a third event lease")
+        events.replayRegistration(2, event: .primaryShortcut)
         guard let latestPanel = registry.latestOpenPanel else {
             check(false, "stop-start replacement panel is available")
             await coordinator.shutdown()
@@ -1935,7 +1949,10 @@ private struct SurfaceHarness {
             deliveredPositions.append(point)
         }
 
-        check(probe.monitorCount == 2, "system pointer delivery retains one local and one global monitor")
+        let idleHotKeyResourceCount = probe.hotKeyResourceCount
+        check(probe.monitorCount == 0, "started lifecycle discovery owns zero idle pointer monitors")
+        source.setPointerMonitoringEnabled(true)
+        check(probe.monitorCount == 2, "visible demand installs one local and one global monitor")
         for revision in 0..<20_000 {
             source.submitPointerPositionForTesting(
                 CGPoint(x: CGFloat(revision), y: CGFloat(revision % 997))
@@ -1965,11 +1982,50 @@ private struct SurfaceHarness {
         source.submitPointerPositionForTesting(newestBurstPosition)
         check(scheduler.pendingOperationCount == 0, "equivalent delivered pointer positions schedule no work")
 
+        source.setPointerMonitoringEnabled(false)
+        check(probe.monitorCount == 0, "final hide removes both pointer monitors")
+        check(
+            probe.observerCount == 4
+                && probe.hotKeyResourceCount == idleHotKeyResourceCount
+                && probe.handlerCount == 1 && probe.callbackLeaseCount == 1,
+            "final hide preserves display, Space, sleep/wake, and shortcut discovery"
+        )
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "final hide leaves no pending pointer delivery"
+        )
+        source.setPointerMonitoringEnabled(true)
+
         source.submitPointerPositionForTesting(CGPoint(x: 21_000, y: 210))
         check(scheduler.pendingOperationCount == 1, "a fresh pointer position schedules one delivery")
         source.stop()
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "shutdown synchronously revokes pending pointer ownership"
+        )
+        source.start { event in
+            guard case let .pointerMoved(point) = event else { return }
+            deliveredPositions.append(point)
+        }
+        source.setPointerMonitoringEnabled(true)
+        let restartedPosition = CGPoint(x: 22_000, y: 220)
+        source.submitPointerPositionForTesting(restartedPosition)
+        check(scheduler.pendingOperationCount == 2, "restart owns one new delivery alongside one stale scheduled callback")
         await scheduler.runNext()
         check(deliveredPositions == [newestBurstPosition], "stop revokes a queued pointer callback before delivery")
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 1
+                && probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "stale callback cannot consume successor delivery ownership"
+        )
+        await scheduler.runNext()
+        check(
+            deliveredPositions == [newestBurstPosition, restartedPosition],
+            "restart delivers only its fresh leased pointer position"
+        )
+        source.stop()
         check(
             probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
                 && !probe.pointerDeliveryWorkState.hasBufferedPosition,
@@ -1992,6 +2048,7 @@ private struct SurfaceHarness {
                 releasedDeliveryCount += 1
             }
         }
+        releasableSource?.setPointerMonitoringEnabled(true)
         for revision in 0..<20_000 {
             releasableSource?.submitPointerPositionForTesting(
                 CGPoint(x: CGFloat(revision), y: CGFloat(-revision))
@@ -2046,13 +2103,17 @@ private struct SurfaceHarness {
             model: model
         )
         await secondCoordinator.startAndWait()
-        check(secondCoordinator.isRunning && secondRegistry.openPanelCount == 1, "replacement coordinator starts with the same injected model")
+        check(secondCoordinator.isRunning && secondRegistry.openPanelCount == 0, "replacement coordinator starts panel-free with the same idle model")
         check(await broker.workState().subscriberCount == 1, "replacement owner retains exactly one shared broker subscriber")
         do {
             let submitted = try await broker.submit(request(id: "replacement-owner", title: "Replacement owner update"))
             check(
                 await waitUntil { model.snapshotVersion == submitted.version },
                 "replacement coordinator model receives fresh broker updates"
+            )
+            check(
+                await waitUntil { secondRegistry.openPanelCount == 1 },
+                "replacement coordinator constructs its panel on fresh broker activity"
             )
         } catch {
             recordUnexpected(error, context: "replacement coordinator broker update")
@@ -2128,7 +2189,7 @@ private struct SurfaceHarness {
         }
         for _ in 0..<50 { await Task.yield() }
         check(!replacementStartReturned, "successor awaited start joins the inherited model drain")
-        check(replacementCoordinator.isRunning && replacementRegistry.openPanelCount == 1, "successor coordinator starts while prior model drain is pending")
+        check(replacementCoordinator.isRunning && replacementRegistry.openPanelCount == 0, "successor coordinator stays panel-free while the prior model drain is pending")
         drainHandler.release(invocation: 0)
         await replacementStartTask.value
         check(replacementStartReturned, "successor awaited start returns after inherited model work settles")
@@ -2141,6 +2202,10 @@ private struct SurfaceHarness {
         )
         check(drainHandler.activeHandlerCount == 0, "pending drain completes without orphaned action work")
         check(replacementCoordinator.isRunning && replacementEvents.isRunning, "successor coordinator remains current after drain completion")
+        check(
+            await waitUntil { replacementRegistry.openPanelCount == 1 },
+            "successor coordinator constructs one panel after fresh activity replay"
+        )
         await replacementCoordinator.shutdown()
         let finalDrainSubscriberCount = await drainBroker.workState().subscriberCount
         check(drainModel.workState == .stopped && finalDrainSubscriberCount == 0, "explicit final owner shutdown remains terminal and complete")
@@ -2226,7 +2291,7 @@ private struct SurfaceHarness {
             await waitUntil { await broker.workState().subscriberCount == 1 },
             "detached-release coordinator fixture starts one shared subscriber"
         )
-        check(events.isRunning && registry.openPanelCount == 1, "detached-release coordinator owns one event source and panel")
+        check(events.isRunning && registry.openPanelCount == 0, "detached-release coordinator owns discovery events but zero idle panels")
 
         let coordinatorGate = DetachedReleaseGate()
         let coordinatorRelease = Task.detached { [coordinator] in
@@ -2246,7 +2311,7 @@ private struct SurfaceHarness {
             "detached coordinator deinit completes exact MainActor event and panel teardown without crashing"
         )
         check(events.stopCount == 1, "detached coordinator teardown stops its event source exactly once")
-        check(registry.mutationSnapshot.closeCount == 1, "detached coordinator teardown closes its panel exactly once")
+        check(registry.mutationSnapshot.closeCount == 0, "detached idle coordinator has no panel cleanup allocation")
         let subscriberCountAfterDeinit = await broker.workState().subscriberCount
         check(sharedModel.isRunning && subscriberCountAfterDeinit == 1, "detached coordinator teardown does not shut down the injected shared model")
 
@@ -2453,9 +2518,7 @@ private struct SurfaceHarness {
             await waitUntil { await broker.workState().subscriberCount == 1 },
             "re-enabled coordinator starts the shared model's one subscriber"
         )
-        check(registry.creationCount == 2, "panel factory remains injected for both displays")
-        check(registry.modelIdentities.count == 1, "all display panels receive the same observable activity model")
-        check(registry.modelIdentities.first == ObjectIdentifier(sharedModel), "panel factory receives the app-owned model identity")
+        check(registry.creationCount == 0, "re-enabled idle coordinator constructs zero hidden panels")
 
         do {
             let submitted = try await broker.submit(
@@ -2465,6 +2528,12 @@ private struct SurfaceHarness {
                 await waitUntil { sharedModel.snapshotVersion == submitted.version },
                 "shared broker snapshot is visible through the injected model"
             )
+            check(
+                await waitUntil { registry.creationCount == 2 },
+                "first broker activity invokes one bounded factory path for both enabled displays"
+            )
+            check(registry.modelIdentities.count == 1, "all display panels receive the same observable activity model")
+            check(registry.modelIdentities.first == ObjectIdentifier(sharedModel), "panel factory receives the app-owned model identity")
             check(
                 registry.models.allSatisfy {
                     $0.current?.activity.presentation.title == "Shared broker activity"

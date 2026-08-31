@@ -2,7 +2,7 @@
 
 require "json"
 
-EXPECTED_TOTAL = 587
+EXPECTED_TOTAL = 593
 manifest = File.expand_path("shards.tsv", __dir__)
 rows = []
 File.readlines(manifest, chomp: true).each do |line|

@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Prove the shard contract covers exactly 587 checks
+      - name: Prove the shard contract covers exactly 593 checks
         id: contract
         run: /usr/bin/ruby Tests/ReleaseHarness/check-shards.rb --github-output "$GITHUB_OUTPUT"
 

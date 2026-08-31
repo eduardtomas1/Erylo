@@ -57,7 +57,7 @@ contract.
 
 `nightly-verification.yml` runs daily at 03:17 UTC and supports manual dispatch.
 It proves that the release-shard manifest is the same ordered, duplicate-free
-set as the executable harness phases and that their expected counts sum to 587.
+set as the executable harness phases and that their expected counts sum to 593.
 The resulting 17-way matrix runs every phase in a separate clean checkout. Each
 release shard has a 900-second command deadline inside a 17-minute job deadline;
 the outer owner reports the exact timeout/cancellation classification and uses

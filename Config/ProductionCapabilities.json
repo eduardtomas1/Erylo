@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "mountedUtilities": [
     "battery",
     "focus-timer",
@@ -7,6 +7,7 @@
   ],
   "privacyUsageDescriptionAllowlist": [],
   "entitlementAllowlist": [],
+  "productionCompositionSourceSHA256": "52ca7d0e58c3ea249444c71fbec1e2a22dae1c3aaa1a2742c682c2d2d06efa70",
   "reviewedModuleSourceSHA256": {
     "Sources/EryloGlance": "efe45b3def67295096035adf20949698906dd17186fcfc1a10a83b6cd7453aaa",
     "Sources/EryloIntegrations": "2fbcc028fa02c30996ecfe8c6787b030b26e2ad97a28ec8145d845b34d7547b3"

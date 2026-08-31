@@ -23,6 +23,52 @@ FORBIDDEN_DIRECT_COMPOSITION_IDENTIFIERS = %w[
   MediaScriptRoute
   ProcessMediaScriptExecutor
 ].freeze
+REVIEWED_PRODUCTION_DIVISION_LINES = {
+  "Sources/EryloAppRuntime/FocusTimerRuntime.swift" => {
+    "        let hours = bounded / 3_600" => 1,
+    "        let minutes = (bounded % 3_600) / 60" => 1
+  }.freeze,
+  "Sources/EryloCore/PanelGeometry.swift" => {
+    "        let radius = min(max(cornerRadius, 0), min(rect.width, rect.height) / 2)" => 1,
+    "            x: display.frame.midX - maximumSize.width / 2," => 1,
+    "            x: (maximumSize.width - size.width) / 2," => 1,
+    "                        x: (maximumSize.width - compactAnchorWidth) / 2," => 1,
+    "            min(19, size.height / 2)" => 1,
+    "            size.height / 2" => 1,
+    "            min(14, size.height / 2)" => 1,
+    "            min(23, size.height / 2)" => 1,
+    "                    cornerRadius: min(cornerRadius, bodyHeight / 2)" => 1
+  }.freeze,
+  "Sources/EryloSettingsUI/EryloPalette.swift" => {
+    "    public static let ink = Color(red: 6 / 255, green: 8 / 255, blue: 11 / 255)" => 3,
+    "    public static let mint = Color(red: 98 / 255, green: 242 / 255, blue: 193 / 255)" => 3,
+    "    public static let graphite = Color(red: 21 / 255, green: 26 / 255, blue: 33 / 255)" => 3,
+    "    public static let sky = Color(red: 107 / 255, green: 155 / 255, blue: 255 / 255)" => 3,
+    "    public static let cloud = Color(red: 244 / 255, green: 247 / 255, blue: 250 / 255)" => 3,
+    "    public static let mist = Color(red: 152 / 255, green: 163 / 255, blue: 179 / 255)" => 3,
+    "    public static let amber = Color(red: 255 / 255, green: 180 / 255, blue: 84 / 255)" => 3,
+    "    public static let coral = Color(red: 255 / 255, green: 101 / 255, blue: 122 / 255)" => 3
+  }.freeze,
+  "Sources/EryloSurface/ActivitySurfaceContent.swift" => {
+    "            fractionCompleted: min(max(elapsed / duration, 0), 1)" => 1,
+    "        let hours = boundedSeconds / 3_600" => 1,
+    "        let minutes = (boundedSeconds % 3_600) / 60" => 1
+  }.freeze,
+  "Sources/EryloSurface/PanelSurfaceView.swift" => {
+    "        let wingWidth = max((surfaceWidth - resolvedOcclusionWidth) / 2, 0)" => 1,
+    "                min(rect.width, rect.height) / 2" => 1,
+    "            min(rect.width / 4, rect.height / 4)" => 2,
+    "            min((rect.width - topRadius * 2) / 2, rect.height - topRadius)" => 1,
+    "    static let ink = Color(red: 6 / 255, green: 8 / 255, blue: 11 / 255)" => 3,
+    "    static let mint = Color(red: 98 / 255, green: 242 / 255, blue: 193 / 255)" => 3,
+    "    static let graphite = Color(red: 21 / 255, green: 26 / 255, blue: 33 / 255)" => 3,
+    "    static let sky = Color(red: 107 / 255, green: 155 / 255, blue: 255 / 255)" => 3,
+    "    static let cloud = Color(red: 244 / 255, green: 247 / 255, blue: 250 / 255)" => 3,
+    "    static let mist = Color(red: 152 / 255, green: 163 / 255, blue: 179 / 255)" => 3,
+    "    static let amber = Color(red: 255 / 255, green: 180 / 255, blue: 84 / 255)" => 3,
+    "    static let coral = Color(red: 255 / 255, green: 101 / 255, blue: 122 / 255)" => 3
+  }.freeze
+}.freeze
 
 UTILITY_RULES = {
   "apple-music" => {
@@ -190,7 +236,7 @@ def skip_swift_block_comment(bytes, index)
   fail_closed("production composition contains an unterminated block comment")
 end
 
-def scan_swift_string(bytes, index, identifier_tokens, hash_count)
+def scan_swift_string(bytes, index, identifier_tokens, hash_count, relative_path)
   triple = bytes.byteslice(index, 3) == '"""'
   quote_count = triple ? 3 : 1
   index += quote_count
@@ -203,6 +249,7 @@ def scan_swift_string(bytes, index, identifier_tokens, hash_count)
         bytes,
         index + interpolation.bytesize,
         identifier_tokens,
+        relative_path,
         interpolation_depth: 1
       )
       next
@@ -216,32 +263,63 @@ def scan_swift_string(bytes, index, identifier_tokens, hash_count)
   fail_closed("production composition contains an unterminated string literal")
 end
 
-def scan_swift_code(bytes, index, identifier_tokens, interpolation_depth: nil)
+def reviewed_division_slash?(bytes, index, relative_path)
+  prior_boundaries = if index.zero?
+                       []
+                     else
+                       [bytes.rindex("\n", index - 1), bytes.rindex("\r", index - 1)].compact
+                     end
+  line_start = prior_boundaries.max
+  line_start = line_start ? line_start + 1 : 0
+  line_feed = bytes.index("\n", index + 1)
+  carriage_return = bytes.index("\r", index + 1)
+  line_end = [line_feed, carriage_return].compact.min || bytes.bytesize
+  line = bytes.byteslice(line_start, line_end - line_start)
+  expected_count = REVIEWED_PRODUCTION_DIVISION_LINES.fetch(relative_path, {}).fetch(line, 0)
+  expected_count.positive? && line.count("/") == expected_count
+end
+
+def scan_swift_code(bytes, index, identifier_tokens, relative_path, interpolation_depth: nil)
   while index < bytes.bytesize
     byte = bytes.getbyte(index)
     following = bytes.getbyte(index + 1)
     if byte == 47 && following == 47
       line_feed = bytes.index("\n", index + 2)
       carriage_return = bytes.index("\r", index + 2)
-      newline = [line_feed, carriage_return].compact.min
-      index = newline || bytes.bytesize
+      index = [line_feed, carriage_return].compact.min || bytes.bytesize
     elsif byte == 47 && following == 42
       index = skip_swift_block_comment(bytes, index)
+    elsif byte == 47
+      unless reviewed_division_slash?(bytes, index, relative_path)
+        line = bytes.byteslice(0, index).count("\n") + 1
+        fail_closed("regex literals are forbidden in production composition (#{relative_path}:#{line})")
+      end
+      index += 1
     elsif byte == 34
-      index = scan_swift_string(bytes, index, identifier_tokens, 0)
+      index = scan_swift_string(bytes, index, identifier_tokens, 0, relative_path)
     elsif byte == 35
       hash_count = 0
       hash_count += 1 while bytes.getbyte(index + hash_count) == 35
-      if bytes.getbyte(index + hash_count) == 34
-        index = scan_swift_string(bytes, index + hash_count, identifier_tokens, hash_count)
+      if bytes.getbyte(index + hash_count) == 47
+        line = bytes.byteslice(0, index).count("\n") + 1
+        fail_closed("regex literals are forbidden in production composition (#{relative_path}:#{line})")
+      elsif bytes.getbyte(index + hash_count) == 34
+        index = scan_swift_string(
+          bytes,
+          index + hash_count,
+          identifier_tokens,
+          hash_count,
+          relative_path
+        )
       else
-        index += 1
+        index += hash_count
       end
     elsif identifier_start_byte?(byte)
       ending = index + 1
       ending += 1 while ending < bytes.bytesize && identifier_byte?(bytes.getbyte(ending))
       identifier_tokens << {
         value: bytes.byteslice(index, ending - index),
+        ending: ending,
         escaped: index.positive? && bytes.getbyte(index - 1) == 96 && bytes.getbyte(ending) == 96
       }
       index = ending
@@ -260,13 +338,9 @@ def scan_swift_code(bytes, index, identifier_tokens, interpolation_depth: nil)
   index
 end
 
-def swift_identifiers(source)
-  swift_identifier_tokens(source).map { |token| token.fetch(:value) }
-end
-
-def swift_identifier_tokens(source)
+def swift_identifier_tokens(source, relative_path)
   tokens = []
-  scan_swift_code(source.b, 0, tokens)
+  scan_swift_code(source.b, 0, tokens, relative_path)
   tokens
 end
 
@@ -378,7 +452,7 @@ def sexpression_header_fields(block, expected_form)
   end
   [attributes, positional, flags]
 rescue JSON::ParserError
-  fail_closed("Swift parser returned a malformed quoted node attribute")
+  fail_closed("Swift parser returned a malformed quoted #{expected_form} node attribute")
 end
 
 def sexpression_nodes(source, form)
@@ -387,6 +461,45 @@ def sexpression_nodes(source, form)
     prefix = "(#{form}"
     header.start_with?(prefix) && [nil, " ", ")"].include?(header[prefix.length])
   end
+end
+
+def sexpression_nodes_at_depth(source, form, target_depth)
+  marker = "(#{form}"
+  blocks = []
+  captures = []
+  depth = 0
+  in_string = false
+  escaped = false
+  index = 0
+  while index < source.bytesize
+    byte = source.getbyte(index)
+    if in_string
+      if escaped
+        escaped = false
+      elsif byte == 92
+        escaped = true
+      elsif byte == 34
+        in_string = false
+      end
+    elsif byte == 34
+      in_string = true
+    elsif byte == 40
+      boundary = source.getbyte(index + marker.bytesize)
+      captures << index if depth == target_depth &&
+        source.byteslice(index, marker.bytesize) == marker && [nil, 32, 41].include?(boundary)
+      depth += 1
+    elsif byte == 41
+      depth -= 1
+      fail_closed("Swift parser returned an unbalanced syntax tree") if depth.negative?
+      if !captures.empty? && depth == target_depth
+        start_index = captures.pop
+        blocks << source.byteslice(start_index, index - start_index + 1)
+      end
+    end
+    index += 1
+  end
+  fail_closed("Swift parser returned an incomplete syntax tree") unless depth.zero? && captures.empty? && !in_string
+  blocks
 end
 
 def syntax_node_attribute_values(source, form, attribute)
@@ -399,7 +512,9 @@ def syntax_node_attribute_values(source, form, attribute)
   end
 end
 
-def swift_parse_tree(path)
+def swift_compiler
+  return @swift_compiler if defined?(@swift_compiler)
+
   compiler_output, compiler_error, compiler_status = Open3.capture3(
     "/usr/bin/xcrun", "--find", "swiftc", binmode: true
   )
@@ -407,8 +522,12 @@ def swift_parse_tree(path)
     unless compiler_status.success?
   compiler = Pathname.new(compiler_output.strip).realpath
   fail_closed("selected Swift compiler is not executable") unless compiler.file? && compiler.executable?
+  @swift_compiler = compiler
+end
+
+def swift_parse_tree(path, label = "Swift source")
   output, error, status = Open3.capture3(
-    compiler.to_s,
+    swift_compiler.to_s,
     "-frontend",
     "-dump-parse",
     "-swift-version",
@@ -416,9 +535,23 @@ def swift_parse_tree(path)
     path.to_s,
     binmode: true
   )
-  fail_closed("production capability manifest does not parse as Swift (#{error.lines.first.to_s.strip})") \
+  fail_closed("#{label} does not parse as Swift (#{error.lines.first.to_s.strip})") \
     unless status.success?
   output
+end
+
+
+def named_syntax_declarations(syntax_tree, name)
+  forms = %w[
+    actor_decl class_decl enum_decl extension_decl pattern_named protocol_decl
+    struct_decl typealias var_decl
+  ]
+  forms.flat_map do |form|
+    sexpression_nodes(syntax_tree, form).select do |block|
+      attributes, positional, = sexpression_header_fields(block, form)
+      positional.include?(name) || attributes.fetch("name", nil) == name
+    end
+  end
 end
 
 def parse_plist_node(element)
@@ -477,6 +610,7 @@ def load_policy(root)
     entitlementAllowlist
     mountedUtilities
     privacyUsageDescriptionAllowlist
+    productionCompositionSourceSHA256
     reviewedModuleSourceSHA256
     schemaVersion
   ]
@@ -484,7 +618,7 @@ def load_policy(root)
   fail_closed("production capability policy fields are noncanonical") unless policy.keys.sort == expected_keys
   schema_version = policy.fetch("schemaVersion")
   fail_closed("production capability policy schema is unsupported") \
-    unless schema_version.instance_of?(Integer) && schema_version == 2
+    unless schema_version.instance_of?(Integer) && schema_version == 3
 
   mounted = canonical_string_array(policy.fetch("mountedUtilities"), "mountedUtilities")
   privacy = canonical_string_array(
@@ -493,6 +627,10 @@ def load_policy(root)
   )
   entitlements = canonical_string_array(policy.fetch("entitlementAllowlist"), "entitlementAllowlist")
   reviewed_module_hashes = policy.fetch("reviewedModuleSourceSHA256")
+  production_composition_sha256 = policy.fetch("productionCompositionSourceSHA256")
+  fail_closed("production composition source hash is invalid") \
+    unless production_composition_sha256.is_a?(String) &&
+      /\A[0-9a-f]{64}\z/.match?(production_composition_sha256)
   fail_closed("reviewed module source hashes must be a dictionary") \
     unless reviewed_module_hashes.is_a?(Hash)
   fail_closed("reviewed module source hash set is noncanonical") \
@@ -515,6 +653,7 @@ def load_policy(root)
     mounted: mounted,
     privacy: privacy,
     entitlements: entitlements,
+    production_composition_sha256: production_composition_sha256,
     reviewed_module_hashes: reviewed_module_hashes
   }
 rescue JSON::ParserError => error
@@ -543,9 +682,10 @@ def validate_composition(root, policy)
       repository_swift_files(root, "Sources/EryloAppRuntime")
   ).uniq.reject { |path| reviewed_sources.key?(path.to_s) }
   fail_closed("production composition source set is empty") if source_paths.empty?
+  actual_composition_sha256 = canonical_source_tree_sha256(root, source_paths)
   source_identifiers = source_paths.map do |path|
-    source = File.binread(path)
-    identifier_tokens = swift_identifier_tokens(source)
+    relative = path.relative_path_from(root).to_s
+    identifier_tokens = swift_identifier_tokens(File.binread(path), relative)
     wrapper_observed = identifier_tokens.each_with_index.any? do |token, index|
       next false unless token.fetch(:value) == "EryloGlance"
       previous = index.positive? ? identifier_tokens.fetch(index - 1) : nil
@@ -573,8 +713,24 @@ def validate_composition(root, policy)
   ) unless observed == policy.fetch(:mounted)
 
   manifest_path = repository_file(root, PRODUCTION_MANIFEST_PATH)
-  syntax_tree = swift_parse_tree(manifest_path)
-  bindings = sexpression_nodes(syntax_tree, "pattern_binding_decl").select do |block|
+  syntax_tree = swift_parse_tree(manifest_path, "production capability manifest")
+  fail_closed("conditional compilation is forbidden in the production capability manifest") \
+    if File.binread(manifest_path).match?(/#(?:if|elseif|else|endif)\b/)
+  capability_enums = sexpression_nodes_at_depth(syntax_tree, "enum_decl", 1).select do |block|
+    _attributes, positional, = sexpression_header_fields(block, "enum_decl")
+    positional == ["ProductionCapabilities"]
+  end
+  fail_closed("production composition must contain one ProductionCapabilities enum") \
+    unless capability_enums.length == 1
+  capability_enum = capability_enums.fetch(0)
+  fail_closed("ProductionCapabilities must be the only declaration with that name") \
+    unless named_syntax_declarations(syntax_tree, "ProductionCapabilities") == [capability_enum]
+  nested_type_forms = %w[actor_decl class_decl protocol_decl struct_decl typealias]
+  fail_closed("ProductionCapabilities cannot contain a nested type declaration") if
+    sexpression_nodes(capability_enum, "enum_decl").length != 1 ||
+      nested_type_forms.any? { |form| sexpression_nodes(capability_enum, form).any? }
+
+  bindings = sexpression_nodes(capability_enum, "pattern_binding_decl").select do |block|
     sexpression_nodes(block, "pattern_named").any? do |pattern|
       _attributes, positional, = sexpression_header_fields(pattern, "pattern_named")
       positional == ["mountedUtilities"]
@@ -583,7 +739,7 @@ def validate_composition(root, policy)
   fail_closed("production composition must contain one canonical mounted-utility declaration") \
     unless bindings.length == 1
   binding = bindings.fetch(0)
-  variable_declarations = sexpression_nodes(syntax_tree, "var_decl").select do |block|
+  variable_declarations = sexpression_nodes(capability_enum, "var_decl").select do |block|
     _attributes, positional, = sexpression_header_fields(block, "var_decl")
     positional == ["mountedUtilities"]
   end
@@ -620,6 +776,8 @@ def validate_composition(root, policy)
   declared = case_names.map { |name| UTILITY_CASES.fetch(name) }.sort
   fail_closed("typed production capability declaration differs from the reviewed allowlist") \
     unless declared == policy.fetch(:mounted)
+  fail_closed("production composition source digest differs") \
+    unless actual_composition_sha256 == policy.fetch(:production_composition_sha256)
 end
 
 def validate_privacy_declarations(plist, policy)

@@ -1,6 +1,95 @@
 import EryloActivity
 import Foundation
 
+/// Captures the newest callback delivered before `start()` returns, then hands
+/// later callbacks to the bounded async relay. This makes synchronous platform
+/// baselines part of activation settlement instead of racing the caller's status read.
+package final class GlanceActivationEventRelay<Event: Sendable>: @unchecked Sendable {
+    private enum State {
+        case capturing(Event?)
+        case settling(Event?)
+        case live
+        case finished
+    }
+
+    private let lock = NSLock()
+    private let continuation: AsyncStream<Event>.Continuation
+    private let beforePendingDelivery: (@Sendable () -> Void)?
+    private var state: State = .capturing(nil)
+
+    package init(
+        continuation: AsyncStream<Event>.Continuation,
+        beforePendingDelivery: (@Sendable () -> Void)? = nil
+    ) {
+        self.continuation = continuation
+        self.beforePendingDelivery = beforePendingDelivery
+    }
+
+    package func yield(_ event: Event) {
+        let shouldYield = lock.withLock {
+            switch state {
+            case .capturing:
+                state = .capturing(event)
+                return false
+            case .settling:
+                state = .settling(event)
+                return false
+            case .live:
+                return true
+            case .finished:
+                return false
+            }
+        }
+        if shouldYield {
+            continuation.yield(event)
+        }
+    }
+
+    /// Atomically extracts the synchronous baseline while retaining the newest
+    /// callback that arrives while the provider awaits baseline processing.
+    package func beginActivationSettlement() -> Event? {
+        lock.withLock {
+            switch state {
+            case let .capturing(event):
+                state = .settling(nil)
+                return event
+            case .settling, .live, .finished:
+                return nil
+            }
+        }
+    }
+
+    /// Opens the live relay only after the initial event has settled. A callback
+    /// captured during settlement is yielded afterward, preserving source order.
+    package func completeActivation() {
+        lock.withLock {
+            switch state {
+            case let .settling(event):
+                if let event {
+                    beforePendingDelivery?()
+                    continuation.yield(event)
+                }
+                state = .live
+            case .capturing, .live, .finished:
+                return
+            }
+        }
+    }
+
+    package func finish() {
+        let shouldFinish = lock.withLock {
+            guard case .finished = state else {
+                state = .finished
+                return true
+            }
+            return false
+        }
+        if shouldFinish {
+            continuation.finish()
+        }
+    }
+}
+
 public actor PowerGlanceProvider {
     private let broker: any GlanceActivityBroker
     private let source: any PowerEventSource
@@ -11,7 +100,7 @@ public actor PowerGlanceProvider {
     private var activationTask: Task<Void, Never>?
     private var deactivationTask: Task<Void, Never>?
     private var deactivationRevision: UInt64 = 0
-    private var eventContinuation: AsyncStream<PowerSourceEvent>.Continuation?
+    private var eventRelay: GlanceActivationEventRelay<PowerSourceEvent>?
     private var eventConsumerTask: Task<Void, Never>?
     private var lastEvent: PowerSourceEvent?
     private var lastSnapshot: PowerSnapshot?
@@ -52,12 +141,12 @@ public actor PowerGlanceProvider {
             capability: .available,
             health: .starting
         )
-        let continuation = installEventRelay(generation: activationGeneration)
+        let relay = installEventRelay(generation: activationGeneration)
         let task = Task { [weak self] in
             guard let self else { return }
             await self.activate(
                 generation: activationGeneration,
-                continuation: continuation
+                relay: relay
             )
         }
         activationTask = task
@@ -110,11 +199,11 @@ public actor PowerGlanceProvider {
 
     private func activate(
         generation: UInt64,
-        continuation: AsyncStream<PowerSourceEvent>.Continuation
+        relay: GlanceActivationEventRelay<PowerSourceEvent>
     ) async {
         do {
             try await source.start { event in
-                continuation.yield(event)
+                relay.yield(event)
             }
         } catch {
             await source.stop()
@@ -131,9 +220,19 @@ public actor PowerGlanceProvider {
         }
 
         guard enabled, self.generation == generation else {
+            relay.finish()
             await source.stop()
             return
         }
+        if let initialEvent = relay.beginActivationSettlement() {
+            await receive(initialEvent, generation: generation)
+        }
+        guard enabled, self.generation == generation else {
+            relay.finish()
+            await source.stop()
+            return
+        }
+        relay.completeActivation()
         sourceActive = true
         if currentStatus.health == .starting {
             currentStatus = GlanceProviderStatus(
@@ -168,24 +267,25 @@ public actor PowerGlanceProvider {
 
     private func installEventRelay(
         generation: UInt64
-    ) -> AsyncStream<PowerSourceEvent>.Continuation {
+    ) -> GlanceActivationEventRelay<PowerSourceEvent> {
         let (stream, continuation) = AsyncStream.makeStream(
             of: PowerSourceEvent.self,
             bufferingPolicy: .bufferingNewest(1)
         )
-        eventContinuation = continuation
+        let relay = GlanceActivationEventRelay(continuation: continuation)
+        eventRelay = relay
         eventConsumerTask = Task { [weak self] in
             for await event in stream {
                 guard !Task.isCancelled else { return }
                 await self?.receive(event, generation: generation)
             }
         }
-        return continuation
+        return relay
     }
 
     private func finishEventRelay() -> Task<Void, Never>? {
-        eventContinuation?.finish()
-        eventContinuation = nil
+        eventRelay?.finish()
+        eventRelay = nil
         let consumer = eventConsumerTask
         eventConsumerTask = nil
         consumer?.cancel()
@@ -249,9 +349,10 @@ public actor VolumeGlanceProvider {
     private var activationTask: Task<Void, Never>?
     private var deactivationTask: Task<Void, Never>?
     private var deactivationRevision: UInt64 = 0
-    private var eventContinuation: AsyncStream<VolumeSourceEvent>.Continuation?
+    private var eventRelay: GlanceActivationEventRelay<VolumeSourceEvent>?
     private var eventConsumerTask: Task<Void, Never>?
     private var lastEvent: VolumeSourceEvent?
+    private var lastSnapshot: VolumeSnapshot?
     private var currentStatus = GlanceProviderStatus.disabled
 
     public init(broker: any GlanceActivityBroker, source: any VolumeEventSource) {
@@ -273,12 +374,12 @@ public actor VolumeGlanceProvider {
             capability: .available,
             health: .starting
         )
-        let continuation = installEventRelay(generation: activationGeneration)
+        let relay = installEventRelay(generation: activationGeneration)
         let task = Task { [weak self] in
             guard let self else { return }
             await self.activate(
                 generation: activationGeneration,
-                continuation: continuation
+                relay: relay
             )
         }
         activationTask = task
@@ -325,11 +426,11 @@ public actor VolumeGlanceProvider {
 
     private func activate(
         generation: UInt64,
-        continuation: AsyncStream<VolumeSourceEvent>.Continuation
+        relay: GlanceActivationEventRelay<VolumeSourceEvent>
     ) async {
         do {
             try await source.start { event in
-                continuation.yield(event)
+                relay.yield(event)
             }
         } catch {
             await source.stop()
@@ -346,9 +447,19 @@ public actor VolumeGlanceProvider {
         }
 
         guard enabled, self.generation == generation else {
+            relay.finish()
             await source.stop()
             return
         }
+        if let initialEvent = relay.beginActivationSettlement() {
+            await receive(initialEvent, generation: generation)
+        }
+        guard enabled, self.generation == generation else {
+            relay.finish()
+            await source.stop()
+            return
+        }
+        relay.completeActivation()
         sourceActive = true
         if currentStatus.health == .starting {
             currentStatus = GlanceProviderStatus(
@@ -368,6 +479,7 @@ public actor VolumeGlanceProvider {
         sourceActive = false
         await consumer?.value
         lastEvent = nil
+        lastSnapshot = nil
         currentStatus = .disabled
         _ = await broker.cancel(GlanceActivityIdentity.volume)
     }
@@ -382,24 +494,25 @@ public actor VolumeGlanceProvider {
 
     private func installEventRelay(
         generation: UInt64
-    ) -> AsyncStream<VolumeSourceEvent>.Continuation {
+    ) -> GlanceActivationEventRelay<VolumeSourceEvent> {
         let (stream, continuation) = AsyncStream.makeStream(
             of: VolumeSourceEvent.self,
             bufferingPolicy: .bufferingNewest(1)
         )
-        eventContinuation = continuation
+        let relay = GlanceActivationEventRelay(continuation: continuation)
+        eventRelay = relay
         eventConsumerTask = Task { [weak self] in
             for await event in stream {
                 guard !Task.isCancelled else { return }
                 await self?.receive(event, generation: generation)
             }
         }
-        return continuation
+        return relay
     }
 
     private func finishEventRelay() -> Task<Void, Never>? {
-        eventContinuation?.finish()
-        eventContinuation = nil
+        eventRelay?.finish()
+        eventRelay = nil
         let consumer = eventConsumerTask
         eventConsumerTask = nil
         consumer?.cancel()
@@ -413,6 +526,16 @@ public actor VolumeGlanceProvider {
 
         switch event {
         case let .snapshot(snapshot):
+            let previous = lastSnapshot
+            lastSnapshot = snapshot
+            guard previous != nil else {
+                currentStatus = GlanceProviderStatus(
+                    isEnabled: true,
+                    capability: .available,
+                    health: .healthy
+                )
+                return
+            }
             do {
                 _ = try await broker.submit(GlanceRequestFactory.volume(snapshot))
                 currentStatus = GlanceProviderStatus(

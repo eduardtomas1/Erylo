@@ -2,7 +2,7 @@
 
 ## Current state
 
-This repository contains a Swift 6, macOS 14+ SwiftPM foundation. `Scripts/ci.sh` is the complete canonical local entry point: it builds with warnings as errors, runs the activity, foundation, File Hold, Glance, Media, Trust, Local Integrations, surface, updater, application-runtime, and release harnesses, and uses `shellcheck` when that optional local tool is installed.
+This repository contains a Swift 6, macOS 14+ SwiftPM foundation. `Scripts/ci.sh` is the complete canonical local entry point: it builds with warnings as errors, checks the activity, media, and system-Glance API surfaces, runs the activity, foundation, File Hold, Glance, Media, Trust, Local Integrations, surface, updater, application-runtime, and release harnesses, and uses `shellcheck` when that optional local tool is installed.
 
 Pull-request CI runs the build, API-surface controls, and each Swift executable
 test target as independent fast jobs. The exhaustive deterministic release

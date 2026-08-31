@@ -242,8 +242,7 @@ extension ActivityBroker: GlanceOwnershipActivityBroker, GlanceRevisionActivityB
     /// overload performs the comparison and removal in this same actor turn.
     @discardableResult
     public func cancel(_ identity: ActivityIdentity, ifRevision revision: UInt64) async -> Bool {
-        let atomicCancel: (ActivityIdentity, UInt64) -> Bool = cancel(_:ifRevision:)
-        return atomicCancel(identity, revision)
+        await cancelAndWait(identity, ifRevision: revision)
     }
 
     /// Exact async protocol witness with one actor entry and no suspension before
@@ -253,11 +252,14 @@ extension ActivityBroker: GlanceOwnershipActivityBroker, GlanceRevisionActivityB
         _ identity: ActivityIdentity,
         ifOwnedBy lease: ActivityOwnershipLease
     ) async -> Bool {
-        let ownedCancel: (
-            ActivityIdentity,
-            ActivityOwnershipLease
-        ) -> Bool = cancel(_:ifOwnedBy:)
-        return ownedCancel(identity, lease)
+        await cancelAndWait(identity, ifOwnedBy: lease)
+    }
+
+    /// Exact async protocol witness. Record removal remains atomic and return is
+    /// delayed until every predecessor expiry task for the identity has joined.
+    @discardableResult
+    public func cancel(_ identity: ActivityIdentity) async -> Bool {
+        await cancelAndWait(identity)
     }
 }
 

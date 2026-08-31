@@ -83,7 +83,7 @@ Do this on a clean standard-user Apple Silicon Mac that has never built Erylo:
 2. Compare its SHA-256 with separately retained release evidence.
 3. Confirm the download retains quarantine, expand it, and run `codesign --verify --deep --strict --verbose=2`, `spctl --assess --type execute --verbose=4`, and `xcrun stapler validate` on the app.
 4. Copy to `/Applications`, disconnect the network, and launch. Confirm first launch succeeds offline, the app is an agent with no Dock icon, no unrelated permission prompt appears, and no updater request occurs.
-5. Enable Calendar and media automation separately. Confirm each explanation is contextual, denial is usable, and disabled modules retain no work.
+5. Enable Battery and Volume separately, relaunch to verify prompt-free restore, then exercise charging/unplugging, mute, sleep/wake, and default-output device switches. Disable and reset them and confirm no observer or expiry work remains. Confirm Calendar, media, File Hold, and local integrations stay unavailable and initiate no work.
 6. Quit, relaunch, reboot, uninstall, and reinstall. Confirm no orphan helper/XPC service, launch item, cache, or protected user data remains unexpectedly.
 7. Record Mac model, chip, OS build, displays, scaling, test operator, artifact hash, and results in the compatibility evidence.
 

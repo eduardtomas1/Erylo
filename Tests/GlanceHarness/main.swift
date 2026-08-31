@@ -12,6 +12,7 @@ enum GlanceHarnessMain {
         await harness.verifyLegacyBrokerRuntimeCompatibility()
         await harness.verifyDisabledStateAndLifecycleIdempotence()
         await harness.verifyConcurrentLifecycleRaces()
+        await harness.verifyActivationRelayHandoffOrdering()
         await harness.verifyQuietPresentationPolicies()
         await harness.verifyPowerDedupeAndStaleGenerations()
         await harness.verifyVolumeDeviceChangesAndFloodDisable()
@@ -191,6 +192,124 @@ private struct GlanceHarness {
         }
     }
 
+    mutating func verifyActivationRelayHandoffOrdering() async {
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: Int.self,
+            bufferingPolicy: .unbounded
+        )
+        let handoffGate = RelayPendingDeliveryGate()
+        let relay = GlanceActivationEventRelay(
+            continuation: continuation,
+            beforePendingDelivery: { handoffGate.pause() }
+        )
+
+        relay.yield(0)
+        check(
+            relay.beginActivationSettlement() == 0,
+            "activation relay extracts its synchronous baseline"
+        )
+        relay.yield(1)
+
+        let completion = Task.detached {
+            relay.completeActivation()
+        }
+        check(
+            handoffGate.waitUntilPaused(),
+            "activation relay reaches its pending-delivery handoff gate"
+        )
+
+        let laterStarted = ThreadSafeFlag()
+        let laterFinished = ThreadSafeFlag()
+        Thread.detachNewThread {
+            laterStarted.set()
+            relay.yield(2)
+            laterFinished.set()
+        }
+        check(
+            await waitUntil { laterStarted.value },
+            "later serial source callback reaches the relay handoff"
+        )
+        try? await Task.sleep(for: .milliseconds(20))
+        check(
+            !laterFinished.value,
+            "later callback cannot overtake pending delivery before live admission"
+        )
+
+        handoffGate.release()
+        await completion.value
+        check(
+            await waitUntil { laterFinished.value },
+            "later callback completes after pending delivery opens live admission"
+        )
+        relay.finish()
+
+        var delivered: [Int] = []
+        for await event in stream {
+            delivered.append(event)
+        }
+        check(
+            delivered == [1, 2],
+            "pending callback A is delivered before newer live callback B"
+        )
+
+        let (newestStream, newestContinuation) = AsyncStream.makeStream(
+            of: Int.self,
+            bufferingPolicy: .bufferingNewest(1)
+        )
+        let newestHandoffGate = RelayPendingDeliveryGate()
+        let newestRelay = GlanceActivationEventRelay(
+            continuation: newestContinuation,
+            beforePendingDelivery: { newestHandoffGate.pause() }
+        )
+        newestRelay.yield(0)
+        check(
+            newestRelay.beginActivationSettlement() == 0,
+            "newest-only relay extracts its synchronous baseline"
+        )
+        newestRelay.yield(1)
+
+        let newestCompletion = Task.detached {
+            newestRelay.completeActivation()
+        }
+        check(
+            newestHandoffGate.waitUntilPaused(),
+            "newest-only relay gates pending recovery A before live admission"
+        )
+        let newestLaterStarted = ThreadSafeFlag()
+        let newestLaterFinished = ThreadSafeFlag()
+        Thread.detachNewThread {
+            newestLaterStarted.set()
+            newestRelay.yield(2)
+            newestLaterFinished.set()
+        }
+        check(
+            await waitUntil { newestLaterStarted.value },
+            "newer recovery B reaches the production-faithful relay handoff"
+        )
+        try? await Task.sleep(for: .milliseconds(20))
+        check(
+            !newestLaterFinished.value,
+            "newer recovery B waits until pending A is ordered"
+        )
+
+        newestHandoffGate.release()
+        await newestCompletion.value
+        check(
+            await waitUntil { newestLaterFinished.value },
+            "newer recovery B enters after the ordered handoff"
+        )
+        newestRelay.finish()
+
+        var newestDelivered: [Int] = []
+        for await event in newestStream {
+            newestDelivered.append(event)
+        }
+        check(
+            newestDelivered == [2],
+            "delayed newest-only consumption retains recovery B and never stale A"
+        )
+    }
+
     mutating func verifyConditionalBrokerConformance() async {
         let scheduler = ManualBrokerScheduler()
         let concreteBroker = ActivityBroker(expirationScheduler: scheduler)
@@ -256,8 +375,10 @@ private struct GlanceHarness {
                 "rejected conditional cancel publishes no mutation"
             )
             check(
-                await concreteBroker.workState().scheduledExpiryCount == 1,
-                "rejected conditional cancel preserves replacement expiry work"
+                await waitUntil {
+                    await concreteBroker.workState().scheduledExpiryCount == 1
+                },
+                "rejected conditional cancel preserves only replacement expiry work after predecessor settlement"
             )
             check(
                 await broker.cancel(identity, ifRevision: replacementRevision),
@@ -712,7 +833,8 @@ private struct GlanceHarness {
     }
 
     mutating func verifyPowerDedupeAndStaleGenerations() async {
-        let broker = makeBroker()
+        let scheduler = ManualBrokerScheduler()
+        let broker = ActivityBroker(expirationScheduler: scheduler)
         let source = ManualPowerSource()
         let provider = PowerGlanceProvider(broker: broker, source: source)
         do {
@@ -743,7 +865,30 @@ private struct GlanceHarness {
 
             await source.emit(.snapshot(actionable), handlerIndex: 1)
             check(await waitUntil { !(await broker.snapshot().ordered.isEmpty) }, "current power callback can submit")
+
+            await source.emit(.unavailable, handlerIndex: 1)
+            check(
+                await waitUntil { await broker.snapshot().ordered.isEmpty },
+                "sleep/wake-style Battery unavailability clears stale ambient state"
+            )
+            check(
+                await provider.status().health == .unavailable(.eventSourceUnavailable),
+                "Battery unavailability remains observable while the source can recover"
+            )
+            await source.emit(.snapshot(first), handlerIndex: 1)
+            check(
+                await waitUntil { !(await broker.snapshot().ordered.isEmpty) },
+                "post-wake Battery delivery converges through the current source generation"
+            )
+            if case let .expires(ttl) = await broker.snapshot().current?.activity.lifecycle {
+                check(ttl.rawValue == 1_800, "post-wake Battery acknowledgement remains bounded")
+            } else {
+                check(false, "post-wake Battery acknowledgement remains bounded")
+            }
+            check(await scheduler.pendingCount == 1, "post-wake Battery convergence owns one cancellable expiry")
             await provider.disable()
+            check(await scheduler.pendingCount == 0, "Battery disable drains the post-wake expiry")
+            check(await broker.workState().activeOwnershipCount == 0, "Battery lifecycle retains no broker ownership")
         } catch {
             recordUnexpected(error, context: "power event lifecycle")
         }
@@ -752,28 +897,60 @@ private struct GlanceHarness {
     mutating func verifyVolumeDeviceChangesAndFloodDisable() async {
         let scheduler = ManualBrokerScheduler()
         let broker = ActivityBroker(expirationScheduler: scheduler)
-        let source = ManualVolumeSource()
-        let provider = VolumeGlanceProvider(broker: broker, source: source)
         do {
             let builtIn = try VolumeSnapshot(deviceID: 1, scalar: 0.35, isMuted: false)
-            let external = try VolumeSnapshot(deviceID: 2, scalar: 0.35, isMuted: false)
-            let muted = try VolumeSnapshot(deviceID: 2, scalar: 0.35, isMuted: true)
+            let builtInChanged = try VolumeSnapshot(deviceID: 1, scalar: 0.45, isMuted: false)
+            let external = try VolumeSnapshot(deviceID: 2, scalar: 0.45, isMuted: false)
+            let muted = try VolumeSnapshot(deviceID: 2, scalar: 0.45, isMuted: true)
+            let source = ManualVolumeSource(initialEvent: .snapshot(builtIn))
+            let provider = VolumeGlanceProvider(broker: broker, source: source)
             await provider.enable()
-            await source.emit(.snapshot(builtIn))
+            check(await broker.snapshot().ordered.isEmpty, "synchronous initial Volume snapshot establishes a quiet baseline")
+            check(await broker.snapshot().version == 0, "quiet Volume activation performs no broker mutation")
+            check(await scheduler.pendingCount == 0, "quiet Volume activation schedules no expiry work")
+
+            await source.emit(.snapshot(builtInChanged))
             check(await waitUntil { await broker.snapshot().version == 1 }, "volume event reaches broker")
+            if case let .expires(ttl) = await broker.snapshot().current?.activity.lifecycle {
+                check(ttl.rawValue == 1_800, "volume acknowledgement uses the bounded transient lifetime")
+            } else {
+                check(false, "volume acknowledgement uses the bounded transient lifetime")
+            }
+            check(await scheduler.pendingCount == 1, "volume acknowledgement owns one cancellable expiry")
             let firstRevision = await broker.snapshot().current?.revision
 
-            await source.emit(.snapshot(builtIn))
+            await source.emit(.snapshot(builtInChanged))
             await yieldSeveralTimes()
             check(await broker.snapshot().version == 1, "duplicate volume callback is deduplicated")
 
             await source.emit(.snapshot(external))
             check(await waitUntil { await broker.snapshot().version == 2 }, "default-device change refreshes volume activity")
             check(await broker.snapshot().current?.revision != firstRevision, "device change creates a new broker revision")
+            check(await scheduler.pendingCount == 1, "default-device switch replaces rather than accumulates expiry work")
 
             await source.emit(.snapshot(muted))
             check(await waitUntil { await broker.snapshot().version == 3 }, "mute change refreshes volume activity")
             check(await broker.snapshot().current?.activity.presentation.detail == "Muted", "mute callback produces honest HUD detail")
+            if case let .expires(ttl) = await broker.snapshot().current?.activity.lifecycle {
+                check(ttl.rawValue == 1_800, "mute acknowledgement remains bounded")
+            } else {
+                check(false, "mute acknowledgement remains bounded")
+            }
+            check(await scheduler.pendingCount == 1, "mute change retains one bounded expiry")
+
+            await source.emit(.unavailable)
+            check(
+                await waitUntil { await broker.snapshot().ordered.isEmpty },
+                "missing default output clears the stale Volume acknowledgement"
+            )
+            check(await scheduler.pendingCount == 0, "missing default output cancels Volume expiry work")
+            await source.emit(.snapshot(external))
+            check(
+                await waitUntil { await broker.snapshot().version == 5 },
+                "restored default output converges without restarting the observer"
+            )
+            check(await source.startCount == 1, "default-output recovery retains one event observer")
+            check(await provider.status().health == .healthy, "default-output recovery restores healthy status")
 
             await source.emitFlood(count: 5_000)
             let floodWork = await provider.workState()
@@ -783,6 +960,33 @@ private struct GlanceHarness {
             check(await provider.workState().isIdle, "volume flood disable drains all provider work")
             check(!(await source.isActive), "volume flood disable removes source callback")
             check(await provider.status() == .disabled, "volume flood disable completes lifecycle state")
+            check(await scheduler.pendingCount == 0, "volume disable drains every transient expiry")
+            check(await broker.workState().activeOwnershipCount == 0, "Volume lifecycle retains no broker ownership")
+
+            let versionBeforeReenable = await broker.snapshot().version
+            await provider.enable()
+            check(await source.startCount == 2, "Volume re-enable installs exactly one new observer")
+            check(await broker.snapshot().ordered.isEmpty, "synchronous Volume re-enable baseline remains quiet")
+            check(
+                await broker.snapshot().version == versionBeforeReenable,
+                "Volume re-enable baseline performs no broker mutation"
+            )
+            check(await scheduler.pendingCount == 0, "Volume re-enable baseline schedules no expiry")
+
+            await source.emit(.snapshot(builtInChanged))
+            check(
+                await waitUntil { await broker.snapshot().version == versionBeforeReenable + 1 },
+                "first true Volume change after re-enable publishes exactly once"
+            )
+            check(await scheduler.pendingCount == 1, "post-re-enable Volume change owns one bounded expiry")
+            if case let .expires(ttl) = await broker.snapshot().current?.activity.lifecycle {
+                check(ttl.rawValue == 1_800, "post-re-enable Volume HUD retains its bounded lifetime")
+            } else {
+                check(false, "post-re-enable Volume HUD retains its bounded lifetime")
+            }
+            await provider.disable()
+            check(await provider.workState().isIdle, "post-re-enable Volume disable drains all work")
+            check(await scheduler.pendingCount == 0, "post-re-enable Volume disable cancels its expiry")
         } catch {
             recordUnexpected(error, context: "volume device changes")
         }
@@ -2421,6 +2625,8 @@ private struct GlanceHarness {
             await countdown.enable()
             await powerSource.emit(.snapshot(low))
             await volumeSource.emit(.snapshot(volumeSnapshot))
+            let changedVolumeSnapshot = try VolumeSnapshot(deviceID: 1, scalar: 0.6, isMuted: false)
+            await volumeSource.emit(.snapshot(changedVolumeSnapshot))
             check(
                 await waitUntil { await broker.snapshot().ordered.count == 3 },
                 "shutdown fixture starts physical provider work"
@@ -3970,6 +4176,37 @@ private actor CompletionFlag {
     }
 }
 
+private final class RelayPendingDeliveryGate: @unchecked Sendable {
+    private let paused = DispatchSemaphore(value: 0)
+    private let resume = DispatchSemaphore(value: 0)
+
+    func pause() {
+        paused.signal()
+        resume.wait()
+    }
+
+    func waitUntilPaused() -> Bool {
+        paused.wait(timeout: .now() + 1) == .success
+    }
+
+    func release() {
+        resume.signal()
+    }
+}
+
+private final class ThreadSafeFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = false
+
+    var value: Bool {
+        lock.withLock { storage }
+    }
+
+    func set() {
+        lock.withLock { storage = true }
+    }
+}
+
 private final class WeakProviderReference<Value: AnyObject>: @unchecked Sendable {
     private let lock = NSLock()
     private weak var value: Value?
@@ -4276,6 +4513,11 @@ private actor ManualVolumeSource: VolumeEventSource {
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var stopObservedCancellation = false
+    private let initialEvent: VolumeSourceEvent?
+
+    init(initialEvent: VolumeSourceEvent? = nil) {
+        self.initialEvent = initialEvent
+    }
 
     var isActive: Bool { handler != nil }
 
@@ -4283,6 +4525,9 @@ private actor ManualVolumeSource: VolumeEventSource {
         guard self.handler == nil else { return }
         startCount += 1
         self.handler = handler
+        if let initialEvent {
+            handler(initialEvent)
+        }
     }
 
     func stop() async {

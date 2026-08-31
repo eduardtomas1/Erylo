@@ -83,9 +83,10 @@ ends, the activity disappears.
       menu commands, and VoiceOver-friendly actions.
     </td>
     <td width="50%" valign="top">
-      <strong>Built for the whole Mac</strong><br>
-      Erylo adapts to notched and non-notched displays, multiple displays,
-      Spaces, sleep, wake, and the system's Reduce Motion setting.
+      <strong>Designed for the whole Mac</strong><br>
+      Erylo is built for notched and non-notched displays, multiple displays,
+      Spaces, sleep, wake, and the system's Reduce Motion setting. The complete
+      hardware matrix remains a release gate.
     </td>
   </tr>
 </table>
@@ -106,8 +107,25 @@ ends, the activity disappears.
 - Replace a running session safely by starting another preset.
 - Let natural completion clear the activity without leaving timer work behind.
 
-That is the complete live utility today. Erylo does not pretend unfinished
-foundations are product features.
+### Battery and charging
+
+- Enable it explicitly in Settings; persisted enablement restores at app startup
+  without a permission prompt.
+- Keep an ordinary first reading quiet, briefly acknowledge later power changes,
+  and retain an ambient warning only while an unplugged battery is at or below 20%.
+- Use local IOPowerSources notifications with no polling or network work.
+
+### Volume
+
+- Enable it explicitly in Settings; it needs no permission or network access.
+- Treat the current default-output state at enable/restore as a quiet baseline,
+  then briefly acknowledge later volume, mute, and output-device changes.
+- Use CoreAudio property listeners and cancellable 1.8-second presentations, not
+  polling or a permanent HUD.
+
+These are the complete live utilities today. The screenshots above show the real
+Focus Timer; Battery and Volume still require the manual hardware validation
+listed in the compatibility matrix before a signed release.
 
 ## What Erylo is growing into
 
@@ -119,8 +137,6 @@ run in the background**:
 | --- | --- |
 | **Now Playing** | See and control Apple Music or Spotify without leaving the current task. |
 | **Meetings** | Notice an upcoming meeting only when it becomes relevant. |
-| **Battery & charging** | Get a short, useful signal instead of another persistent widget. |
-| **Volume** | Confirm output level and mute changes without a large overlay. |
 | **File Hold** | Keep one file close while moving between tasks. |
 | **External activities** | Let trusted local tools show and dismiss their own progress. |
 
@@ -136,8 +152,8 @@ swift run Erylo
 ```
 
 Look for **Erylo** in the menu bar. From there you can start or cancel a Focus
-Timer, show or hide the surface, open Settings, check for updates when a signed
-feed is configured, or quit cleanly.
+Timer, show or hide the surface, open Settings to enable Battery or Volume, check
+for updates when a signed feed is configured, or quit cleanly.
 
 > Erylo does not publish a signed end-user download yet. The release pipeline is
 > in place, but real Developer ID signing, notarization, and update publication

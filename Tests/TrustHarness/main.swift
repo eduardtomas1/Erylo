@@ -25,6 +25,7 @@ private final class TrustHarness {
         await verifyMigrationCorruptionAndBounds()
         await verifyAtomicPersistence()
         await verifyNoWorkWhileBrowsingOrDisabled()
+        await verifyPromptFreePersistedRestore()
         await verifyConcurrentToggleSerialization()
         await verifyQueueCancellationCoalescingAndCapacity()
         await verifyCancellationDuringPermissionAndStart()
@@ -52,8 +53,8 @@ private final class TrustHarness {
         check(EryloModule.spotify.permissionRequirement == .appleEvents, "Spotify owns the Apple Events policy")
         check(EryloModule.fileHold.permissionRequirement == nil, "File Hold does not pre-request a generic permission")
         check(EryloModule.localIntegrations.permissionRequirement == nil, "local integrations do not pre-request a system permission")
-        check(ModuleCopy.explanation(for: .appleMusic).contains("macOS may ask"), "Apple Music copy explains Automation consent")
-        check(ModuleCopy.explanation(for: .spotify).contains("macOS may ask"), "Spotify copy explains Automation consent")
+        check(ModuleCopy.explanation(for: .appleMusic).contains("not included"), "Apple Music copy is explicit future work")
+        check(ModuleCopy.explanation(for: .spotify).contains("not included"), "Spotify copy is explicit future work")
 
         let main = display(10, isMain: true)
         let external = display(20)
@@ -231,6 +232,74 @@ private final class TrustHarness {
         await unavailableModel.setFullscreen(.remainAvailable)
         check(await fixture.repository.current().motion == .systemDefault, "unavailable motion control cannot persist")
         check(await fixture.repository.current().fullscreenBehavior == .hide, "unavailable fullscreen control cannot persist")
+    }
+
+    private func verifyPromptFreePersistedRestore() async {
+        do {
+            var persisted = EryloSettings.safeDefaults
+            persisted.modules.battery = true
+            persisted.modules.volume = true
+            let storage = TestAtomicSettingsStorage(
+                initialData: try SettingsCodec().encode(persisted)
+            )
+            let provider = TestLifecycleProvider()
+            let permissions = TestPermissionRequester()
+            let fixture = makeFixture(
+                storage: storage,
+                provider: provider,
+                permissionRequester: permissions
+            )
+
+            let firstRestore = await fixture.coordinator.startEnabledModules()
+            check(firstRestore.count == 2, "persisted restore evaluates exactly the two enabled modules")
+            check(
+                await fixture.factory.madeModules == [.battery, .volume],
+                "persisted Battery and Volume restore through the provider factory"
+            )
+            check(await provider.startCount == 2, "persisted Battery and Volume each start once")
+            check(await permissions.requestCount == 0, "persisted restore never requests permission")
+            check(
+                await fixture.coordinator.activeModules() == [.battery, .volume],
+                "persisted restore retains exactly the enabled module lifecycles"
+            )
+            check(
+                await fixture.repository.current().modules.enabledModules == [.battery, .volume],
+                "successful restore preserves persisted enable intent"
+            )
+
+            let repeatedRestore = await fixture.coordinator.startEnabledModules()
+            check(
+                repeatedRestore.allSatisfy { $0.outcome == .noChange },
+                "repeated persisted restore is lifecycle-idempotent"
+            )
+            check(await fixture.factory.makeCount == 2, "repeated persisted restore constructs no duplicate providers")
+            check(await provider.startCount == 2, "repeated persisted restore starts no duplicate work")
+
+            let stopped = await fixture.coordinator.stopAll()
+            check(stopped.stoppedModules == [.battery, .volume], "terminal restore cleanup reports both modules")
+            check(await provider.stopCount == 2, "terminal restore cleanup awaits both provider stops")
+            check(await fixture.coordinator.activeModules().isEmpty, "terminal restore cleanup releases provider ownership")
+        } catch {
+            check(false, "persisted restore fixture encodes valid settings: \(error)")
+        }
+
+        do {
+            var persisted = EryloSettings.safeDefaults
+            persisted.modules.battery = true
+            let storage = TestAtomicSettingsStorage(
+                initialData: try SettingsCodec().encode(persisted)
+            )
+            let provider = TestLifecycleProvider()
+            await provider.failNextStart()
+            let fixture = makeFixture(storage: storage, provider: provider)
+            let results = await fixture.coordinator.startEnabledModules()
+            check(results.first?.failure == .providerStartFailed, "persisted start failure is surfaced")
+            check(!(await fixture.repository.current().modules.battery), "persisted start failure converges intent to off")
+            check(await provider.stopCount == 1, "persisted start failure awaits provider cleanup")
+            check(await fixture.coordinator.activeModules().isEmpty, "persisted start failure retains no lifecycle ownership")
+        } catch {
+            check(false, "persisted failure fixture encodes valid settings: \(error)")
+        }
     }
 
     private func verifyConcurrentToggleSerialization() async {

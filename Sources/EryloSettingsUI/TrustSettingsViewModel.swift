@@ -144,6 +144,12 @@ public final class TrustSettingsViewModel {
         availableModules.contains(module)
     }
 
+    /// Package-only startup reconciliation after the application restores enabled
+    /// providers. This mutates view state only and performs no provider work.
+    package func synchronize(settings: EryloSettings) {
+        self.settings = settings
+    }
+
     public func setDisplaySurfaceEnabled(_ enabled: Bool) async {
         var displays = settings.displays
         displays.isEnabled = enabled

@@ -86,7 +86,10 @@ private struct ActivityHarness {
                 await waitUntil { await broker.snapshot().current?.activity.identity.identifier.rawValue == "fallback" },
                 "expiry removes current and selects queued fallback"
             )
-            check(await broker.workState().scheduledExpiryCount == 0, "fired expiry task is released")
+            check(
+                await waitUntil { await broker.workState().scheduledExpiryCount == 0 },
+                "fired expiry task is released"
+            )
 
             _ = try await broker.submit(request(id: "replace", priority: 50, ttlMilliseconds: 10))
             check(await waitUntil { await scheduler.totalSleepCount == 2 }, "first replacement expiry starts")
@@ -122,7 +125,10 @@ private struct ActivityHarness {
             }
             check(await broker.snapshot().current == nil, "explicit cancellation clears current")
             check(await waitUntil { await scheduler.cancellationCount == 1 }, "explicit cancellation stops expiry task")
-            check(await broker.workState().scheduledExpiryCount == 0, "explicit cancellation releases scheduled work")
+            check(
+                await waitUntil { await broker.workState().scheduledExpiryCount == 0 },
+                "explicit cancellation releases scheduled work after physical settlement"
+            )
         } catch {
             recordUnexpected(error, context: "explicit cancellation")
         }
@@ -196,9 +202,16 @@ private struct ActivityHarness {
             check(await waitUntil { await scheduler.totalSleepCount == 1 }, "stale-generation expiry starts")
             let replacement = try await broker.submit(request(id: "generation", priority: 50, title: "New"))
             check(replacement.current?.activity.presentation.title == "New", "replacement removes expiry lifecycle")
+            check(
+                await broker.workState().scheduledExpiryCount == 1,
+                "retired non-cooperative expiry remains accounted before physical settlement"
+            )
 
             await scheduler.fireOldestIgnoringCancellation()
-            for _ in 0..<20 { await Task.yield() }
+            check(
+                await waitUntil { await broker.workState().scheduledExpiryCount == 0 },
+                "retired non-cooperative expiry leaves accounting after physical settlement"
+            )
             check(
                 await broker.snapshot().current?.activity.presentation.title == "New",
                 "revision check rejects a late non-cooperative expiry"

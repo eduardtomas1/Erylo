@@ -28,20 +28,24 @@ The operation queue is FIFO, capped at eight waiting operations, cancellation-aw
 
 Permission policy is closed and module-specific:
 
-- Calendar may request Calendar access after its contextual enable action.
-- Apple Music and Spotify may request Apple Events Automation control after their contextual enable actions.
-- File Hold requests no permission when enabled; file access comes from a later user drop/open action.
-- Local integrations request no system permission; enabling the validated local listener is the explicit action.
+- Mounted Battery and Volume request no permission.
+- The unmounted Calendar foundation defines a contextual Calendar-access policy.
+- The unmounted Apple Music and Spotify foundations define contextual Apple Events policies.
+- File Hold and local integrations remain unmounted; their library-level policies do not make them product features.
 
 Opening or loading the settings view only reads settings and `SMAppService` status. It never constructs a provider, starts work, or asks permission.
 
-No utility provider is registered by the application control plane. Focus Timer is
-owned separately by `ApplicationRuntime` and starts only from a deliberate Erylo
-menu command; its Settings row points to that menu and does not mutate provider
-state. Every planned module control remains visibly unavailable and defensively
-rejected in the view model, so browsing or interacting with Settings cannot start
-the Focus Timer, request permission, open a socket or file, invoke media
-automation, or perform network work.
+The application control plane mounts only Battery and Volume through package-only
+lifecycle adapters backed by the one application `ActivityBroker`. Factory and
+source construction are inert. `startEnabledModules()` runs once at application
+startup with `.doNotRequest`, while opening/loading Settings remains read-only.
+Battery and Volume toggles are live; synchronous initial unavailability retains
+enabled intent with honest unavailable health, while disable and reset await full
+provider and retired-expiry cleanup.
+Focus Timer is owned separately by `ApplicationRuntime` and starts only from a
+deliberate menu command. Calendar, media, File Hold, and local-integration rows
+remain visibly unavailable and defensively rejected, so they cannot request
+permission, open a socket or file, invoke media automation, or perform network work.
 
 ## Launch at login
 
@@ -69,6 +73,6 @@ The schema has no message, path, URL, file, media, meeting, attendee, payload, t
 
 ## Verification boundary
 
-`EryloTrustTests` is a deterministic standard-library harness covering migration, corrupt/oversized fallback, atomic persistence, display bounds and round trips, cancellation/coalescing/queue capacity, permission and start cancellation, lifecycle rollback, terminal/cancellation-insensitive awaited shutdown, reset, the `SMAppService` seam, diagnostics rebounding/redaction/schema/export failures, stale UI completions, and accessibility copy. `EryloAppRuntimeTests` adds menu routing, first-launch presentation, unavailable controls, repeated control requests, update availability, display-policy application, lifecycle overlap, and resource release without launching a real user session.
+`EryloTrustTests` is a deterministic standard-library harness covering migration, corrupt/oversized fallback, atomic persistence, prompt-free persisted restore, display bounds and round trips, cancellation/coalescing/queue capacity, permission and start cancellation, lifecycle rollback, terminal/cancellation-insensitive awaited shutdown, reset, the `SMAppService` seam, diagnostics rebounding/redaction/schema/export failures, stale UI completions, and accessibility copy. `EryloAppRuntimeTests` adds the injected Battery/Volume factory and source slice, quiet synchronous Volume activation, gated initial-unavailable settlement for both providers, and cancellation-ignoring retired-expiry drain across reset, provider disable, and terminal shutdown in both entry orderings, plus shared-broker publication, exact available controls, menu routing, first-launch presentation, unavailable controls, repeated control requests, update availability, display-policy application, lifecycle overlap, and resource release without launching a real user session.
 
-SwiftPM does not produce the signed `.app` bundle needed to manually verify Login Items approval, window-level keyboard traversal, VoiceOver announcements, the save panel, or final visual contrast. Those remain app-bundle/manual gates for the integration branch.
+SwiftPM does not produce the signed `.app` bundle needed to manually verify Battery and Volume on real hardware, sleep/wake and audio-device switching, Instruments energy, Login Items approval, window-level keyboard traversal, VoiceOver announcements, the save panel, or final visual contrast. Those remain app-bundle/manual gates; none is claimed by the deterministic harnesses.

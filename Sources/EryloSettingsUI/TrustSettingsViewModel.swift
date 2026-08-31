@@ -5,6 +5,17 @@ import Foundation
 import Observation
 import UniformTypeIdentifiers
 
+package struct TrustSettingsSuccessfulChange: Sendable {
+    package enum Kind: Sendable {
+        case persistedSettings
+        case module(EryloModule, enabled: Bool)
+        case resetToSafeDefaults
+    }
+
+    package let kind: Kind
+    package let settings: EryloSettings
+}
+
 public enum DisplayChoiceLimits {
     public static let maximumChoices = SettingsLimits.maximumEnabledDisplayIDs
     public static let maximumNameBytes = 80
@@ -81,6 +92,12 @@ public final class TrustSettingsViewModel {
     private let settingsDidChange: @MainActor (EryloSettings) -> Void
 
     @ObservationIgnored
+    private var successfulSettingsChangeHandler: @MainActor (TrustSettingsSuccessfulChange) -> Void = { _ in }
+
+    @ObservationIgnored
+    private var startupFailureFeedbackModules: Set<EryloModule> = []
+
+    @ObservationIgnored
     private var operationCount = 0
 
     @ObservationIgnored
@@ -116,6 +133,12 @@ public final class TrustSettingsViewModel {
         self.displayChoices = Self.normalizedDisplayChoices(displayChoices)
     }
 
+    package func setSuccessfulSettingsChangeHandler(
+        _ handler: @escaping @MainActor (TrustSettingsSuccessfulChange) -> Void
+    ) {
+        successfulSettingsChangeHandler = handler
+    }
+
     /// Browsing settings performs reads only. It does not construct providers, start work, or
     /// request a permission.
     public func load() async {
@@ -143,13 +166,20 @@ public final class TrustSettingsViewModel {
             enabled: enabled,
             permissionPolicy: module.permissionRequirement == nil ? .doNotRequest : .requestIfNeeded
         )
-        if apply(result, sequence: sequence) {
-            statusMessage = nil
+        if apply(
+            result,
+            sequence: sequence,
+            successfulChangeKind: .module(module, enabled: enabled)
+        ) {
             updateModuleFeedback(
                 for: module,
                 requestedEnabled: enabled,
                 result: result
             )
+            if result.failure != nil {
+                // Module failures already have more specific row-local copy.
+                statusMessage = nil
+            }
         }
         endOperation()
     }
@@ -164,8 +194,27 @@ public final class TrustSettingsViewModel {
 
     /// Package-only startup reconciliation after the application restores enabled
     /// providers. This mutates view state only and performs no provider work.
-    package func synchronize(settings: EryloSettings) {
+    package func synchronize(
+        settings: EryloSettings,
+        statusMessage: String? = nil,
+        startupFailureModules: Set<EryloModule>? = nil
+    ) {
         self.settings = settings
+        self.statusMessage = statusMessage
+        guard let startupFailureModules else { return }
+
+        for module in startupFailureFeedbackModules.subtracting(startupFailureModules) {
+            moduleFeedback.removeValue(forKey: module)
+            modulesWithFailureFeedback.remove(module)
+        }
+        for module in startupFailureModules {
+            moduleFeedback[module] = Self.moduleFailureMessage(
+                for: module,
+                failure: .providerStartFailed
+            )
+            modulesWithFailureFeedback.insert(module)
+        }
+        startupFailureFeedbackModules = startupFailureModules
     }
 
     public func setDisplaySurfaceEnabled(_ enabled: Bool) async {
@@ -235,7 +284,7 @@ public final class TrustSettingsViewModel {
     public func setLaunchAtLoginEnabled(_ enabled: Bool) async {
         let sequence = beginOperation()
         let result = await coordinator.setLaunchAtLoginEnabled(enabled)
-        apply(result, sequence: sequence)
+        apply(result, sequence: sequence, successfulChangeKind: .persistedSettings)
         endOperation()
     }
 
@@ -250,7 +299,7 @@ public final class TrustSettingsViewModel {
     public func resetToSafeDefaults() async {
         let sequence = beginOperation()
         let result = await coordinator.resetToSafeDefaults()
-        let didApply = apply(result, sequence: sequence)
+        let didApply = apply(result, sequence: sequence, successfulChangeKind: .resetToSafeDefaults)
         if didApply, result.failure == nil {
             moduleFeedback.removeAll(keepingCapacity: true)
             modulesWithFailureFeedback.removeAll(keepingCapacity: true)
@@ -289,7 +338,7 @@ public final class TrustSettingsViewModel {
         applyLocally(change)
         let sequence = beginOperation()
         let result = await coordinator.apply(change)
-        apply(result, sequence: sequence)
+        apply(result, sequence: sequence, successfulChangeKind: .persistedSettings)
         endOperation()
     }
 
@@ -322,7 +371,11 @@ public final class TrustSettingsViewModel {
             return
         }
 
+        if !requestedEnabled, startupFailureFeedbackModules.contains(module) {
+            return
+        }
         modulesWithFailureFeedback.remove(module)
+        startupFailureFeedbackModules.remove(module)
         guard requestedEnabled, result.settings.modules[module] else {
             moduleFeedback.removeValue(forKey: module)
             return
@@ -365,7 +418,11 @@ public final class TrustSettingsViewModel {
     }
 
     @discardableResult
-    private func apply(_ result: TrustSettingsUpdateResult, sequence: UInt64) -> Bool {
+    private func apply(
+        _ result: TrustSettingsUpdateResult,
+        sequence: UInt64,
+        successfulChangeKind: TrustSettingsSuccessfulChange.Kind?
+    ) -> Bool {
         guard accept(sequence) else { return false }
         settings = result.settings
         settingsDidChange(settings)
@@ -393,6 +450,16 @@ public final class TrustSettingsViewModel {
             statusMessage = "Too many changes are pending. Please try again in a moment."
         case .coordinatorShutDown:
             statusMessage = "Erylo is shutting down. No further changes can run."
+        }
+        if result.outcome == .applied,
+           result.failure == nil,
+           let successfulChangeKind {
+            successfulSettingsChangeHandler(
+                TrustSettingsSuccessfulChange(
+                    kind: successfulChangeKind,
+                    settings: settings
+                )
+            )
         }
         return true
     }

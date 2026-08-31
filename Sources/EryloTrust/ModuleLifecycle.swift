@@ -76,6 +76,23 @@ public struct TrustSettingsUpdateResult: Equatable, Sendable {
     }
 }
 
+/// One result for each module that was enabled in the persisted launch snapshot.
+/// Keeping the module identity beside the update result lets the application
+/// present bounded recovery copy without exposing provider or persistence errors.
+package struct PersistedModuleRestoreResult: Equatable, Sendable {
+    package let module: EryloModule
+    package let update: TrustSettingsUpdateResult
+
+    package init(module: EryloModule, update: TrustSettingsUpdateResult) {
+        self.module = module
+        self.update = update
+    }
+
+    package var settings: EryloSettings { update.settings }
+    package var outcome: TrustUpdateOutcome { update.outcome }
+    package var failure: TrustUpdateFailure? { update.failure }
+}
+
 public struct DiagnosticsContext: Sendable {
     public let settings: EryloSettings
     public let providerHealth: [ProviderHealthSnapshot]
@@ -191,6 +208,45 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
                     permissionPolicy: .doNotRequest
                 )
             )
+        }
+        await gate.release()
+        return results
+    }
+
+    /// Identity-preserving launch restoration for application owners that need
+    /// to aggregate one bounded recovery outcome per persisted module.
+    package func restoreEnabledModules() async -> [PersistedModuleRestoreResult] {
+        let launchSettings = await repository.current()
+        let modules = launchSettings.modules.enabledModules.sorted { $0.rawValue < $1.rawValue }
+        guard !modules.isEmpty else { return [] }
+        guard !shutdownHasBegun else {
+            let result = await shutDownResult()
+            return modules.map { PersistedModuleRestoreResult(module: $0, update: result) }
+        }
+        do {
+            try await gate.acquire(key: .startup)
+        } catch let error {
+            let result = await gateFailureResult(error)
+            return modules.map { PersistedModuleRestoreResult(module: $0, update: result) }
+        }
+        if shutdownHasBegun {
+            await gate.release()
+            let result = await shutDownResult()
+            return modules.map { PersistedModuleRestoreResult(module: $0, update: result) }
+        }
+        if Task.isCancelled {
+            await gate.release()
+            let result = await cancelledResult()
+            return modules.map { PersistedModuleRestoreResult(module: $0, update: result) }
+        }
+        var results: [PersistedModuleRestoreResult] = []
+        for module in modules {
+            let update = await performSetModuleEnabled(
+                    module,
+                    enabled: true,
+                    permissionPolicy: .doNotRequest
+                )
+            results.append(PersistedModuleRestoreResult(module: module, update: update))
         }
         await gate.release()
         return results

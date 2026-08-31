@@ -20,6 +20,7 @@ enum AppRuntimeHarnessMain {
         await harness.verifyDeterministicLifecycleAndResourceRelease()
         await harness.verifyStartShutdownOverlapAndRepeatedTermination()
         await harness.verifyCallerCancellationDoesNotAbandonStartup()
+        await harness.verifyGatedStartupReadinessAndRestorationShutdown()
         await harness.verifyControlPlanePresentationAndSafeSettings()
         await harness.verifySystemGlanceProductionSlice()
         await harness.verifyVolumePriorityHandoffPreservesFocusTimer()
@@ -244,6 +245,285 @@ private struct AppRuntimeHarness {
         check(await fixture.broker.workState() == .stopped, "caller-cancellation fixture releases broker work")
     }
 
+    mutating func verifyGatedStartupReadinessAndRestorationShutdown() async {
+        let coreGateEvents = EventLog()
+        let coreGateOwner = RecordingApplicationSettingsOwner(settings: .safeDefaults)
+        let coreGatePresenter = RecordingControlPresenter()
+        let coreGatePlane = ApplicationControlPlane(
+            settingsOwner: coreGateOwner,
+            diagnosticsExporter: DiagnosticsExporter(
+                collector: PrivacyPreservingDiagnosticsCollector(
+                    eventSource: InMemoryDiagnosticEventBuffer()
+                ),
+                writer: RejectingDiagnosticsWriter()
+            ),
+            presenter: coreGatePresenter,
+            makeDisplayChoices: { [] }
+        )
+        let termination = Counter()
+        let coreGateFixture = Self.makeRuntime(
+            events: coreGateEvents,
+            controlPlane: coreGatePlane,
+            requestApplicationTermination: { termination.value += 1 }
+        )
+        let coreService = GatedService(events: coreGateEvents)
+        check(coreGateFixture.runtime.register(coreService), "core-start gate registers before launch")
+        let coreStart = Task { @MainActor in await coreGateFixture.runtime.start() }
+        check(
+            await waitUntil { coreService.startCount == 1 },
+            "core-start fixture gates after early status installation"
+        )
+        check(coreGatePresenter.statusItemCount == 1, "status item is discoverable while core startup is gated")
+        let startingMenu = coreGatePresenter.menu
+        check(
+            startingMenu?.items.filter {
+                if case .command = $0.kind { return $0.kind != .command(.quit) }
+                return false
+            }.allSatisfy { !$0.isEnabled && $0.keyEquivalent.isEmpty } == true,
+            "non-live commands are disabled without shortcuts during core startup"
+        )
+        check(
+            startingMenu?.items.first(where: { $0.kind == .command(.showSettings) })?.title
+                == ApplicationControlCopy.startingSettings,
+            "Settings names its core-starting gate truthfully"
+        )
+        coreGateFixture.eventSource.emit(.primaryShortcut)
+        check(
+            coreGateFixture.panel.primaryActionCount == 0,
+            "global shortcut obeys runtime admission while core startup is gated"
+        )
+        check(
+            coreGateFixture.runtime.handle(.quit) && coreGateFixture.runtime.handle(.quit)
+                && termination.value == 1,
+            "Quit remains safe and idempotent during core startup"
+        )
+        coreService.releaseStart()
+        _ = await coreStart.value
+        check(
+            await waitUntil { coreGatePlane.readinessSnapshot.state == .setupRequired },
+            "core-start fixture settles first-launch readiness"
+        )
+        coreGateFixture.eventSource.emit(.primaryShortcut)
+        check(
+            coreGateFixture.panel.primaryActionCount == 1,
+            "global shortcut becomes live only after the runtime admission boundary"
+        )
+        await coreGateFixture.runtime.shutdown()
+
+        var settledSettings = EryloSettings.safeDefaults
+        settledSettings.onboardingCompleted = true
+        let settingsOwner = GatedApplicationSettingsOwner(settings: settledSettings)
+        let presenter = RecordingControlPresenter()
+        let plane = ApplicationControlPlane(
+            settingsOwner: settingsOwner,
+            diagnosticsExporter: DiagnosticsExporter(
+                collector: PrivacyPreservingDiagnosticsCollector(
+                    eventSource: InMemoryDiagnosticEventBuffer()
+                ),
+                writer: RejectingDiagnosticsWriter()
+            ),
+            presenter: presenter,
+            makeDisplayChoices: { [] }
+        )
+        let events = EventLog()
+        let broker = ActivityBroker()
+        let focusTimer = FocusTimerRuntimeService(broker: broker)
+        let model = SurfaceActivityModel(broker: broker)
+        let eventSource = RecordingLifecycleEventSource(events: events)
+        let panel = RecordingPanel(displayIdentity: DisplayIdentity(rawValue: 1), events: events)
+        let displayProvider = MutableDisplayProvider()
+        let panelCoordinator = PanelCoordinator(
+            displayProvider: displayProvider,
+            policy: .safeDefault,
+            lifecycleEventSource: eventSource,
+            activityModel: model,
+            panelFactory: { _, _ in panel }
+        )
+        let measurement = RecordingStartupMeasurer()
+        let updateDriver = RecordingUpdateDriver(events: events)
+        let runtime = ApplicationRuntime(
+            activityBroker: broker,
+            activityModel: model,
+            panelCoordinator: panelCoordinator,
+            updateRuntime: UpdateRuntime(
+                configuration: Self.readyUpdateConfiguration(),
+                enforcePreferencePolicy: { true },
+                makeDriver: { updateDriver }
+            ),
+            controlPlane: plane,
+            focusTimer: focusTimer,
+            startupMeasurements: measurement
+        )
+        check(runtime.register(focusTimer), "gated launch registers its core Focus Timer service")
+        check(panelCoordinator.selectedSurfaceState == .temporarilyUnavailable, "unstarted selected surface is temporarily unavailable")
+        runtime.applicationDidFinishLaunching()
+        runtime.applicationDidFinishLaunching()
+
+        check(await runtime.start(), "gated launch reaches core running without awaiting persisted utilities")
+        check(
+            await waitUntil { await settingsOwner.restoreStartCount == 1 },
+            "gated launch enters its separately owned restoration tail"
+        )
+        check(runtime.phase == .running, "core runtime is running while persisted restoration remains gated")
+        check(plane.readinessSnapshot.state == .starting, "readiness stays starting until persistence settles")
+        check(presenter.statusItemCount == 1, "one status item is already installed before gated restoration")
+        check(presenter.presentationCount == 0, "gated restoration presents no stale Settings model")
+        check(panelCoordinator.selectedSurfaceState == .hidden, "ready selected surface snapshot starts hidden")
+
+        presenter.refreshMenu()
+        let restoringMenu = presenter.menu
+        check(
+            restoringMenu?.items.first(where: { $0.kind == .command(.toggleSurface) })?.isEnabled == true,
+            "surface control is admitted before optional restoration completes"
+        )
+        check(
+            restoringMenu?.items.first(where: { $0.kind == .command(.startFocusTimer25) })?.isEnabled == true,
+            "Focus control is admitted before optional restoration completes"
+        )
+        check(
+            restoringMenu?.items.first(where: { $0.kind == .command(.checkForUpdates) })?.isEnabled == true,
+            "update control is admitted before optional restoration completes"
+        )
+        check(
+            restoringMenu?.items.first(where: { $0.kind == .command(.showSettings) }).map {
+                !$0.isEnabled && $0.keyEquivalent.isEmpty
+                    && $0.title == ApplicationControlCopy.restoringSettings
+            } == true,
+            "Settings is truthfully disabled without a shortcut during restoration"
+        )
+        check(
+            restoringMenu?.items.first(where: { $0.kind == .command(.quit) }).map {
+                $0.isEnabled && $0.keyEquivalent == "q"
+            } == true,
+            "Quit remains a deliberate safe action during restoration"
+        )
+        check(!runtime.handle(.showSettings), "runtime rejects the same gated Settings command the menu disables")
+        check(presenter.presentationCount == 0, "gated Settings cannot mutate or present stale state")
+        check(await runtime.start(), "repeated start remains successful during restoration")
+        check(await settingsOwner.restoreStartCount == 1, "repeated start does not duplicate restoration")
+
+        check(runtime.handle(.toggleSurface), "admitted surface command succeeds during restoration")
+        check(panelCoordinator.selectedSurfaceState == .visible, "selected surface snapshot becomes visible without polling")
+        presenter.refreshMenu()
+        let visibleToggle = presenter.menu?.items.first(where: { $0.kind == .command(.toggleSurface) })
+        check(
+            visibleToggle?.title == ApplicationControlCopy.hideSurface
+                && visibleToggle?.accessibilityLabel == ApplicationControlCopy.surfaceAccessibilityLabel
+                && visibleToggle?.accessibilityIdentifier == "erylo.surface.toggle",
+            "visible surface exposes stateful copy with stable accessibility metadata"
+        )
+        eventSource.emit(.workspaceWillSleep)
+        check(panelCoordinator.selectedSurfaceState == .temporarilyUnavailable, "sleep makes the selected surface temporarily unavailable")
+        presenter.refreshMenu()
+        let sleepingToggle = presenter.menu?.items.first(where: { $0.kind == .command(.toggleSurface) })
+        check(
+            sleepingToggle.map {
+                !$0.isEnabled && $0.keyEquivalent.isEmpty
+                    && $0.accessibilityHint == ApplicationControlCopy.unavailableSurfaceHint
+            } == true,
+            "sleeping surface command is disabled with truthful accessibility help"
+        )
+        eventSource.emit(.workspaceDidWake)
+        check(panelCoordinator.selectedSurfaceState == .visible, "wake restores the deliberately visible selected surface")
+        eventSource.emit(.activeSpaceChanged)
+        check(panelCoordinator.selectedSurfaceState == .visible, "active-Space reconciliation preserves truthful visible state")
+        displayProvider.snapshots = []
+        eventSource.emit(.displayConfigurationChanged)
+        check(
+            panelCoordinator.selectedSurfaceState == .temporarilyUnavailable,
+            "selected-display removal becomes temporarily unavailable without stale visibility"
+        )
+        displayProvider.snapshots = MutableDisplayProvider.defaultSnapshots
+        eventSource.emit(.displayConfigurationChanged)
+        check(
+            panelCoordinator.selectedSurfaceState == .hidden,
+            "selected-display restoration returns to a truthful hidden state"
+        )
+        await panelCoordinator.updateAndWait(policy: DisplayPolicy(isEnabled: false))
+        check(panelCoordinator.selectedSurfaceState == .disabled, "disabled display policy has an exact selected-surface state")
+        presenter.refreshMenu()
+        check(
+            presenter.menu?.items.first(where: { $0.kind == .command(.toggleSurface) }).map {
+                !$0.isEnabled && $0.accessibilityHint == ApplicationControlCopy.disabledSurfaceHint
+            } == true,
+            "disabled surface copy is exact and non-actionable"
+        )
+        await panelCoordinator.updateAndWait(policy: .safeDefault)
+
+        await settingsOwner.releaseRestoration()
+        check(
+            await waitUntil { plane.readinessSnapshot.state == .ready },
+            "readiness updates only after the restoration persistence barrier releases"
+        )
+        check(
+            measurement.milestones == [
+                .applicationDidFinishLaunching,
+                .statusItemInstalled,
+                .restorationStarted,
+                .restorationCompleted,
+            ],
+            "startup measurement seam orders launch, early discovery, and restoration completion"
+        )
+        presenter.refreshMenu()
+        check(
+            presenter.menu?.items.first(where: { $0.kind == .command(.showSettings) }).map {
+                $0.isEnabled && $0.keyEquivalent == ","
+            } == true,
+            "Settings becomes live only after persistence settles"
+        )
+        await runtime.shutdown()
+        check(presenter.shutdownCount == 1 && presenter.statusItemCount == 0, "normal shutdown removes the one status item once")
+        check(await settingsOwner.stopCount == 1, "normal shutdown stops restored settings ownership once")
+
+        let shutdownOwner = GatedApplicationSettingsOwner(settings: settledSettings)
+        let shutdownPresenter = RecordingControlPresenter()
+        let shutdownPlane = ApplicationControlPlane(
+            settingsOwner: shutdownOwner,
+            diagnosticsExporter: DiagnosticsExporter(
+                collector: PrivacyPreservingDiagnosticsCollector(
+                    eventSource: InMemoryDiagnosticEventBuffer()
+                ),
+                writer: RejectingDiagnosticsWriter()
+            ),
+            presenter: shutdownPresenter,
+            makeDisplayChoices: { [] }
+        )
+        let shutdownFixture = Self.makeRuntime(events: EventLog(), controlPlane: shutdownPlane)
+        check(await shutdownFixture.runtime.start(), "shutdown-race core launch succeeds")
+        check(
+            await waitUntil { await shutdownOwner.restoreStartCount == 1 },
+            "shutdown-race restoration reaches its deterministic gate"
+        )
+        let shutdownCompletion = CompletionFlag()
+        let shutdownTask = Task { @MainActor in
+            await shutdownFixture.runtime.shutdown()
+            shutdownCompletion.isComplete = true
+        }
+        check(
+            await waitUntil { await shutdownOwner.restoreCancellationCount == 1 },
+            "shutdown cancels the owned restoration tail"
+        )
+        check(!shutdownCompletion.isComplete, "shutdown joins cancellation-ignoring restoration work")
+        check(shutdownPresenter.statusItemCount == 1, "status ownership remains stable while shutdown joins restoration")
+        shutdownPresenter.refreshMenu()
+        check(
+            shutdownPresenter.menu?.items.first(where: { $0.kind == .command(.quit) }).map {
+                !$0.isEnabled && $0.keyEquivalent.isEmpty
+            } == true,
+            "Quit is visibly disabled while terminal shutdown still owns the status item"
+        )
+        check(!shutdownFixture.runtime.handle(.quit), "terminal runtime rejects the same disabled Quit command")
+        await shutdownOwner.releaseRestoration()
+        await shutdownTask.value
+        await shutdownFixture.runtime.shutdown()
+        check(shutdownCompletion.isComplete, "shutdown completes after restoration physically settles")
+        check(shutdownPresenter.shutdownCount == 1 && shutdownPresenter.statusItemCount == 0, "shutdown race removes one status item exactly once")
+        check(await shutdownOwner.stopCount == 1, "shutdown race stops persisted providers once")
+        check(shutdownFixture.eventSource.stopCount == 1, "shutdown race leaves panel event work idle")
+        check(shutdownFixture.model.workState == .stopped, "shutdown race leaves panel model work stopped")
+        check(await shutdownFixture.broker.workState() == .stopped, "shutdown race leaves broker work stopped")
+    }
+
     mutating func verifyControlPlanePresentationAndSafeSettings() async {
         let settingsOwner = RecordingApplicationSettingsOwner(settings: .safeDefaults)
         let presenter = RecordingControlPresenter()
@@ -268,55 +548,95 @@ private struct AppRuntimeHarness {
         var routedCommands: [ApplicationControlCommand] = []
         var appliedPolicies: [DisplayPolicy] = []
         let menuContextProbe = FocusTimerMenuContextProbe()
-        await plane.start(
-            canCheckForUpdates: true,
-            focusTimerContextProvider: { menuContextProbe.evaluate() },
+        let runtimeSnapshot = RuntimeControlSnapshotProbe(focusTimer: menuContextProbe)
+        check(plane.installEarlyControls(
+            runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
             commandHandler: { routedCommands.append($0) },
             displayPolicyHandler: { appliedPolicies.append($0) }
-        )
-        await plane.start(
-            canCheckForUpdates: true,
-            focusTimerContextProvider: { .idle },
+        ), "early control installation succeeds after inert preparation")
+        check(!plane.installEarlyControls(
+            runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
             commandHandler: { routedCommands.append($0) },
             displayPolicyHandler: { appliedPolicies.append($0) }
-        )
+        ), "repeated early control installation is rejected")
 
-        check(presenter.statusItemCount == 1, "repeated control-plane start installs one status item")
-        check(await settingsOwner.startEnabledCount == 1, "repeated control-plane start restores persisted modules once")
-        check(presenter.settingsWindowCount == 1, "first launch presents one contained settings window")
-        check(presenter.presentationCount == 1, "first-launch presentation occurs once")
+        check(presenter.statusItemCount == 1, "repeated early installation creates exactly one status item")
+        check(await settingsOwner.startEnabledCount == 0, "status installation does not restore a persisted module")
+        check(presenter.settingsWindowCount == 0, "early control installation does not present onboarding")
+        check(plane.readinessSnapshot.state == .starting, "readiness remains starting before persistence settles")
+        check(
+            presenter.menu?.items.contains(where: {
+                $0.kind == .information && $0.title == ApplicationControlCopy.starting
+            }) == true,
+            "early menu exposes truthful non-actionable startup copy"
+        )
+        check(
+            presenter.menu?.items.filter {
+                if case .command = $0.kind { return $0.kind != .command(.quit) }
+                return false
+            }.allSatisfy { !$0.isEnabled && $0.keyEquivalent.isEmpty } == true,
+            "commands that cannot yet succeed are disabled without shortcuts"
+        )
+        check(!plane.presentSettings(), "Settings cannot race a gated persisted restoration")
+
+        runtimeSnapshot.coreCommandsAreAdmitted = true
+        runtimeSnapshot.focusCommandsAreAdmitted = true
+        runtimeSnapshot.canCheckForUpdates = true
+        presenter.refreshMenu()
+        check(
+            presenter.menu?.items.first(where: { $0.kind == .command(.toggleSurface) })?.isEnabled == true,
+            "surface commands become live at the explicit core admission point"
+        )
+        check(
+            presenter.menu?.items.first(where: { $0.kind == .command(.showSettings) })?.isEnabled == false,
+            "Settings remains restoring while core commands are already live"
+        )
         check(
             presenter.menu?.items.contains(where: { $0.kind == .command(.checkForUpdates) }) == true,
-            "ready updater includes the manual update command"
+            "ready updater appears only after core command admission"
         )
+
+        check(await plane.restorePersistedModules(), "the explicitly owned restoration tail settles")
+        check(!(await plane.restorePersistedModules()), "persisted restoration runs once")
+        presenter.refreshMenu()
+        check(await settingsOwner.startEnabledCount == 1, "persisted modules restore exactly once")
+        check(presenter.settingsWindowCount == 1, "first launch presents one contained settings window after restore")
+        check(presenter.presentationCount == 1, "first-launch presentation occurs once after persistence settles")
+        check(plane.readinessSnapshot.state == .setupRequired, "missing first-launch settings become setup-required, not attention")
         check(
             presenter.menu?.items.contains(where: { $0.title == ApplicationControlCopy.shortcutReminder }) == true,
-            "status menu includes the keyboard shortcut reminder"
+            "admitted visible-surface controls include the keyboard shortcut reminder"
         )
-        check(menuContextProbe.evaluationCount == 1, "status menu performs no background context polling")
+        check(menuContextProbe.evaluationCount == 2, "status menu performs no background context polling")
         menuContextProbe.context = .active(remainingText: "18:07")
         check(
             presenter.menu?.items.contains(where: { $0.title.contains("18:07") }) == false
-                && menuContextProbe.evaluationCount == 1,
+                && menuContextProbe.evaluationCount == 2,
             "active remaining time is not computed before the menu opens"
         )
         presenter.refreshMenu()
         check(
-            menuContextProbe.evaluationCount == 2
+            menuContextProbe.evaluationCount == 3
                 && presenter.menu?.items.contains(where: {
                     $0.title.contains("18:07") && $0.kind == .information && !$0.isEnabled
                 }) == true,
             "menu-open refresh computes one contextual remaining-time snapshot"
         )
 
-        plane.presentSettings()
-        plane.presentSettings()
+        check(plane.presentSettings(), "ready Settings request succeeds")
+        check(plane.presentSettings(), "repeated ready Settings request succeeds")
         check(presenter.settingsWindowCount == 1, "repeated Settings requests reuse one contained window")
         check(presenter.presentationCount == 3, "repeated Settings requests bring the same window forward")
 
         let modelReference = WeakReference<TrustSettingsViewModel>()
         modelReference.value = presenter.presentedModel
         if let model = presenter.presentedModel {
+            await model.completeOnboarding()
+            check(
+                plane.readinessSnapshot.state == .ready
+                    && plane.readinessSnapshot.notices.isEmpty,
+                "successful onboarding immediately clears setup-required readiness"
+            )
             await model.setModuleEnabled(.timer, enabled: true)
             check(await settingsOwner.moduleMutationCount == 0, "unavailable timer control cannot reach provider mutation")
             check(
@@ -360,7 +680,7 @@ private struct AppRuntimeHarness {
         check(presenter.shutdownCount == 1, "repeated control-plane shutdown releases native resources once")
         check(presenter.statusItemCount == 0 && presenter.settingsWindowCount == 0, "control-plane shutdown leaves no menu or window resource")
         check(modelReference.value == nil, "control-plane shutdown releases the settings model")
-        plane.presentSettings()
+        _ = plane.presentSettings()
         check(presenter.presentationCount == 3, "settings cannot reopen after terminal shutdown")
 
         var completedSettings = EryloSettings.safeDefaults
@@ -379,16 +699,192 @@ private struct AppRuntimeHarness {
             makeDisplayChoices: { [] }
         )
         _ = await returningPlane.prepareForStartup()
-        await returningPlane.start(
-            canCheckForUpdates: false,
-            focusTimerContextProvider: { .idle },
+        _ = returningPlane.installEarlyControls(
+            runtimeSnapshotProvider: {
+                ApplicationRuntimeControlSnapshot(
+                    coreCommandsAreAdmitted: true,
+                    focusCommandsAreAdmitted: false,
+                    quitCommandIsAdmitted: true,
+                    canCheckForUpdates: false,
+                    focusTimer: .idle,
+                    surface: .hidden
+                )
+            },
             commandHandler: { _ in },
             displayPolicyHandler: { _ in }
         )
+        _ = await returningPlane.restorePersistedModules()
         check(returningPresenter.presentationCount == 0, "completed onboarding does not reopen Settings on launch")
-        returningPlane.presentSettings()
+        _ = returningPlane.presentSettings()
         check(returningPresenter.presentationCount == 1, "returning users can reopen Settings deliberately")
         await returningPlane.shutdown()
+
+        var recoveredSettings = EryloSettings.safeDefaults
+        recoveredSettings.onboardingCompleted = true
+        let failedBattery = PersistedModuleRestoreResult(
+            module: .battery,
+            update: TrustSettingsUpdateResult(
+                settings: recoveredSettings,
+                outcome: .failed,
+                failure: .providerStartFailed
+            )
+        )
+        let failedVolume = PersistedModuleRestoreResult(
+            module: .volume,
+            update: TrustSettingsUpdateResult(
+                settings: recoveredSettings,
+                outcome: .failed,
+                failure: .providerFactoryFailed
+            )
+        )
+        let recoveryOwner = RecordingApplicationSettingsOwner(
+            settings: recoveredSettings,
+            report: SettingsLoadReport(disposition: .corrupt),
+            restoreResults: [failedBattery, failedVolume],
+            moduleFailureQueues: [.battery: [.providerStartFailed]]
+        )
+        let recoveryPresenter = RecordingControlPresenter()
+        let recoveryPlane = ApplicationControlPlane(
+            settingsOwner: recoveryOwner,
+            diagnosticsExporter: DiagnosticsExporter(
+                collector: PrivacyPreservingDiagnosticsCollector(
+                    eventSource: InMemoryDiagnosticEventBuffer()
+                ),
+                writer: RejectingDiagnosticsWriter()
+            ),
+            presenter: recoveryPresenter,
+            availableModules: [.battery, .volume],
+            makeDisplayChoices: { [] }
+        )
+        _ = await recoveryPlane.prepareForStartup()
+        _ = recoveryPlane.installEarlyControls(
+            runtimeSnapshotProvider: {
+                ApplicationRuntimeControlSnapshot(
+                    coreCommandsAreAdmitted: true,
+                    focusCommandsAreAdmitted: false,
+                    quitCommandIsAdmitted: true,
+                    canCheckForUpdates: false,
+                    focusTimer: .idle,
+                    surface: .hidden
+                )
+            },
+            commandHandler: { _ in },
+            displayPolicyHandler: { _ in }
+        )
+        _ = await recoveryPlane.restorePersistedModules()
+        recoveryPresenter.refreshMenu()
+        check(recoveryPlane.readinessSnapshot.state == .needsAttention, "unsafe fallback and restore failures produce needs-attention readiness")
+        check(
+            recoveryPlane.readinessSnapshot.notices == [
+                "Safe defaults were used.",
+                "Battery could not start and was left off.",
+                "Volume could not start and was left off.",
+            ],
+            "every restore result is aggregated into bounded user-facing recovery copy"
+        )
+        let recoveryCopy = recoveryPresenter.menu?.items.map(\.title).joined(separator: " ") ?? ""
+        check(
+            recoveryCopy.contains("Safe defaults were used.")
+                && recoveryCopy.contains("Battery could not start and was left off.")
+                && !recoveryCopy.contains("provider-start-failed")
+                && !recoveryCopy.contains("provider-factory-failed"),
+            "recovery surfaces safe outcomes without raw errors"
+        )
+        _ = recoveryPlane.presentSettings()
+        check(
+            recoveryPresenter.presentedModel?.statusMessage?.contains("Volume could not start") == true,
+            "Settings receives the same bounded recovery outcome after settlement"
+        )
+        if let recoveryModel = recoveryPresenter.presentedModel {
+            await recoveryModel.setLaunchAtLoginEnabled(true)
+            check(
+                recoveryPlane.readinessSnapshot.state == .needsAttention
+                    && recoveryPlane.readinessSnapshot.notices == [
+                        "Battery could not start and was left off.",
+                        "Volume could not start and was left off.",
+                    ],
+                "a successful Login Item write persists recovery but retains provider failures"
+            )
+            await recoveryModel.setCrashAndDiagnosticSharingConsent(false)
+            check(
+                recoveryPlane.readinessSnapshot.state == .needsAttention
+                    && recoveryPlane.readinessSnapshot.notices == [
+                        "Battery could not start and was left off.",
+                        "Volume could not start and was left off.",
+                    ],
+                "an unrelated successful Settings write clears only the recovered-file notice"
+            )
+            await recoveryModel.completeOnboarding()
+            check(
+                recoveryPlane.readinessSnapshot.state == .needsAttention
+                    && recoveryPlane.readinessSnapshot.notices == [
+                        "Battery could not start and was left off.",
+                        "Volume could not start and was left off.",
+                    ],
+                "completed onboarding cannot hide unresolved provider failures"
+            )
+            await recoveryModel.setModuleEnabled(.battery, enabled: true)
+            check(
+                recoveryPlane.readinessSnapshot.notices == [
+                    "Battery could not start and was left off.",
+                    "Volume could not start and was left off.",
+                ]
+                    && recoveryModel.moduleFeedbackIsFailure(for: .battery)
+                    && recoveryModel.moduleFeedbackIsFailure(for: .volume)
+                    && recoveryModel.moduleFeedback[.volume]
+                        == "Volume could not start and remains off.",
+                "a failed Battery retry keeps both unresolved failures visible in Settings"
+            )
+            await recoveryModel.setModuleEnabled(.battery, enabled: false)
+            check(
+                recoveryPlane.readinessSnapshot.notices.count == 2
+                    && recoveryModel.moduleFeedbackIsFailure(for: .battery)
+                    && recoveryModel.moduleFeedbackIsFailure(for: .volume),
+                "an already-off Battery write cannot dismiss unresolved startup failures"
+            )
+            await recoveryModel.setModuleEnabled(.battery, enabled: true)
+            check(
+                recoveryPlane.readinessSnapshot.state == .needsAttention
+                    && recoveryPlane.readinessSnapshot.notices == [
+                        "Volume could not start and was left off.",
+                    ],
+                "successful Battery remediation clears only Battery's startup failure"
+            )
+            check(
+                recoveryModel.statusMessage?.contains("Volume could not start") == true
+                    && recoveryModel.statusMessage?.contains("Battery could not start") == false,
+                "partial remediation keeps the unresolved startup failure visible in Settings"
+            )
+            recoveryPresenter.refreshMenu()
+            let partiallyRemediatedCopy = recoveryPresenter.menu?.items.map(\.title).joined(separator: " ") ?? ""
+            check(
+                !partiallyRemediatedCopy.contains("Safe defaults were used.")
+                    && !partiallyRemediatedCopy.contains("Battery could not start")
+                    && partiallyRemediatedCopy.contains("Volume could not start"),
+                "partial remediation keeps the exact unresolved notice in the menu"
+            )
+            await recoveryModel.setModuleEnabled(.volume, enabled: true)
+            check(
+                recoveryPlane.readinessSnapshot.state == .ready
+                    && recoveryPlane.readinessSnapshot.notices.isEmpty,
+                "every failed module must succeed before startup attention clears"
+            )
+        } else {
+            for message in [
+                "recovery remediation fixture retains its contained Settings model",
+                "Login Item persistence clears only the recovered-file notice",
+                "unrelated Settings changes retain module failures",
+                "onboarding completion retains module failures",
+                "failed remediation retains every unresolved Settings row",
+                "already-off module intent cannot dismiss startup failure rows",
+                "one module remediation retains the other failure",
+                "partial remediation retains Settings failure copy",
+                "partial remediation refreshes bounded menu copy",
+            ] {
+                check(false, message)
+            }
+        }
+        await recoveryPlane.shutdown()
     }
 
     mutating func verifySystemGlanceProductionSlice() async {
@@ -443,12 +939,14 @@ private struct AppRuntimeHarness {
             check(await sources.volume.startCount == 0, "preparing settings starts no Volume observer")
             check(await permissions.requestCount == 0, "preparing settings requests no permission")
 
-            await plane.start(
-                canCheckForUpdates: false,
-                focusTimerContextProvider: { .idle },
+            _ = plane.installEarlyControls(
+                runtimeSnapshotProvider: { .starting },
                 commandHandler: { _ in },
                 displayPolicyHandler: { _ in }
             )
+            check(presenter.statusItemCount == 1, "status item is installed before persisted Glance restoration")
+            check(await sources.constructionCount == 0, "early status installation constructs no system Glance source")
+            _ = await plane.restorePersistedModules()
             check(await sources.powerConstructionCount == 1, "persisted Battery restore constructs one inert source")
             check(await sources.volumeConstructionCount == 1, "persisted Volume restore constructs one inert source")
             check(await sources.power.startCount == 1, "persisted Battery restore starts one observer")
@@ -831,6 +1329,10 @@ private struct AppRuntimeHarness {
             )
 
             check(await runtime.start(), "retired-expiry fixture starts through the application runtime")
+            check(
+                await waitUntil { plane.readinessSnapshot.state == .ready },
+                "retired-expiry persisted Volume restore settles before its event fixture"
+            )
             let changed = try VolumeSnapshot(deviceID: 9, scalar: 0.4, isMuted: false)
             await source.emit(.snapshot(changed))
             check(
@@ -1195,6 +1697,10 @@ private struct AppRuntimeHarness {
         )
 
         check(await runtime.start(), "command-routing runtime starts")
+        check(
+            await waitUntil { controlPlane.readinessSnapshot.state == .ready },
+            "command-routing restoration tail settles independently"
+        )
         check(controlPlane.lastCanCheckForUpdates == true, "ready updater is advertised to the control plane")
         check(runtime.handle(.toggleSurface), "first menu show/hide request reaches the selected surface")
         check(runtime.handle(.toggleSurface), "repeated menu show/hide request remains routable")
@@ -1230,6 +1736,10 @@ private struct AppRuntimeHarness {
             controlPlane: disabledControlPlane
         )
         check(await disabledRuntime.start(), "disabled-update runtime starts")
+        check(
+            await waitUntil { disabledControlPlane.readinessSnapshot.state == .ready },
+            "disabled-update restoration tail settles independently"
+        )
         check(disabledControlPlane.lastCanCheckForUpdates == false, "disabled updater is not advertised")
         check(!disabledRuntime.handle(.checkForUpdates), "disabled updater rejects a manual check command")
         check(
@@ -1286,6 +1796,10 @@ private struct AppRuntimeHarness {
         )
 
         check(await runtime.start(), "Focus Timer application runtime starts")
+        check(
+            await waitUntil { controlPlane.readinessSnapshot.state == .ready },
+            "Focus Timer restoration tail settles before Settings admission"
+        )
         check(await focusTimer.provider.status() == .disabled, "application startup does not enable the timer provider")
         check(await focusTimer.provider.workState().isIdle, "application startup creates no countdown boundary")
         check(
@@ -1301,7 +1815,25 @@ private struct AppRuntimeHarness {
             "Settings browsing creates no timer broker ownership"
         )
 
-        let menu = ApplicationMenuDescriptor(canCheckForUpdates: false)
+        let menu = ApplicationMenuDescriptor(canCheckForUpdates: true)
+        let commandItems = menu.items.filter {
+            if case .command = $0.kind { return true }
+            return false
+        }
+        let commandIdentifiers = commandItems.compactMap(\.accessibilityIdentifier)
+        check(
+            commandItems.allSatisfy {
+                $0.accessibilityLabel?.isEmpty == false
+                    && $0.accessibilityHint?.isEmpty == false
+                    && $0.accessibilityIdentifier?.isEmpty == false
+            },
+            "every menu command has a stable accessibility label, hint, and identifier"
+        )
+        check(
+            commandIdentifiers.count == commandItems.count
+                && Set(commandIdentifiers).count == commandIdentifiers.count,
+            "menu command accessibility identifiers are unique"
+        )
         let timerItems = menu.items.filter {
             switch $0.kind {
             case .command(.startFocusTimer15), .command(.startFocusTimer25),
@@ -1313,8 +1845,8 @@ private struct AppRuntimeHarness {
         }
         check(timerItems.count == 4, "status menu exposes three Focus Timer presets and Cancel")
         check(
-            timerItems.map(\.keyEquivalent) == ["1", "2", "5", "."],
-            "Focus Timer menu commands provide keyboard equivalents"
+            timerItems.map(\.keyEquivalent) == ["1", "2", "5", ""],
+            "only actionable Focus Timer commands provide keyboard equivalents"
         )
         check(
             timerItems.allSatisfy {
@@ -1944,30 +2476,36 @@ private struct AppRuntimeHarness {
         await barrierBroker.shutdown()
     }
 
-    private static func makeRuntime(events: EventLog) -> RuntimeFixture {
+    private static func makeRuntime(
+        events: EventLog,
+        controlPlane: (any ApplicationControlPlaneOwning)? = nil,
+        requestApplicationTermination: @escaping @MainActor () -> Void = {}
+    ) -> RuntimeFixture {
         let broker = ActivityBroker()
         let model = SurfaceActivityModel(broker: broker)
         let eventSource = RecordingLifecycleEventSource(events: events)
+        let panel = RecordingPanel(displayIdentity: DisplayIdentity(rawValue: 1), events: events)
         let coordinator = PanelCoordinator(
             displayProvider: FixedDisplayProvider(),
             policy: .safeDefault,
             lifecycleEventSource: eventSource,
             activityModel: model,
-            panelFactory: { snapshot, _ in
-                RecordingPanel(displayIdentity: snapshot.identity, events: events)
-            }
+            panelFactory: { _, _ in panel }
         )
         let runtime = ApplicationRuntime(
             activityBroker: broker,
             activityModel: model,
             panelCoordinator: coordinator,
-            updateRuntime: UpdateRuntime(configuration: disabledUpdateConfiguration())
+            updateRuntime: UpdateRuntime(configuration: disabledUpdateConfiguration()),
+            controlPlane: controlPlane,
+            requestApplicationTermination: requestApplicationTermination
         )
         return RuntimeFixture(
             runtime: runtime,
             broker: broker,
             model: model,
-            eventSource: eventSource
+            eventSource: eventSource,
+            panel: panel
         )
     }
 
@@ -2052,17 +2590,20 @@ private final class RuntimeFixture {
     let broker: ActivityBroker
     let model: SurfaceActivityModel
     let eventSource: RecordingLifecycleEventSource
+    let panel: RecordingPanel
 
     init(
         runtime: ApplicationRuntime,
         broker: ActivityBroker,
         model: SurfaceActivityModel,
-        eventSource: RecordingLifecycleEventSource
+        eventSource: RecordingLifecycleEventSource,
+        panel: RecordingPanel
     ) {
         self.runtime = runtime
         self.broker = broker
         self.model = model
         self.eventSource = eventSource
+        self.panel = panel
     }
 }
 
@@ -2072,6 +2613,15 @@ private final class EventLog {
 
     func append(_ value: String) {
         values.append(value)
+    }
+}
+
+@MainActor
+private final class RecordingStartupMeasurer: ApplicationStartupMeasuring {
+    private(set) var milestones: [ApplicationStartupMilestone] = []
+
+    func record(_ milestone: ApplicationStartupMilestone) {
+        milestones.append(milestone)
     }
 }
 
@@ -2092,31 +2642,72 @@ private final class FocusTimerMenuContextProbe {
 }
 
 @MainActor
+private final class RuntimeControlSnapshotProbe {
+    var coreCommandsAreAdmitted = false
+    var focusCommandsAreAdmitted = false
+    var quitCommandIsAdmitted = true
+    var canCheckForUpdates = false
+    var surface = SelectedSurfaceState.hidden
+    private let focusTimer: FocusTimerMenuContextProbe
+
+    init(focusTimer: FocusTimerMenuContextProbe) {
+        self.focusTimer = focusTimer
+    }
+
+    func evaluate() -> ApplicationRuntimeControlSnapshot {
+        ApplicationRuntimeControlSnapshot(
+            coreCommandsAreAdmitted: coreCommandsAreAdmitted,
+            focusCommandsAreAdmitted: focusCommandsAreAdmitted,
+            quitCommandIsAdmitted: quitCommandIsAdmitted,
+            canCheckForUpdates: canCheckForUpdates,
+            focusTimer: focusCommandsAreAdmitted ? focusTimer.evaluate() : .idle,
+            surface: surface
+        )
+    }
+}
+
+@MainActor
 private final class RecordingControlPlane: ApplicationControlPlaneOwning {
-    private(set) var lastCanCheckForUpdates: Bool?
     private(set) var presentationCount = 0
     private(set) var shutdownCount = 0
+    private(set) var installCount = 0
+    private(set) var restoreCount = 0
     private var isShutDown = false
+    private var runtimeSnapshotProvider: (@MainActor () -> ApplicationRuntimeControlSnapshot)?
+    private(set) var readinessSnapshot = ApplicationReadinessSnapshot.starting
+
+    var lastCanCheckForUpdates: Bool? {
+        runtimeSnapshotProvider?().canCheckForUpdates
+    }
 
     func prepareForStartup() async -> DisplayPolicy {
         .safeDefault
     }
 
-    func start(
-        canCheckForUpdates: Bool,
-        focusTimerContextProvider: @escaping @MainActor () -> ApplicationFocusTimerMenuContext,
+    func installEarlyControls(
+        runtimeSnapshotProvider: @escaping @MainActor () -> ApplicationRuntimeControlSnapshot,
         commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
-    ) async {
+    ) -> Bool {
+        guard installCount == 0, !isShutDown else { return false }
         _ = commandHandler
         _ = displayPolicyHandler
-        _ = focusTimerContextProvider
-        lastCanCheckForUpdates = canCheckForUpdates
+        self.runtimeSnapshotProvider = runtimeSnapshotProvider
+        installCount += 1
+        return true
     }
 
-    func presentSettings() {
-        guard !isShutDown else { return }
+    func restorePersistedModules() async -> Bool {
+        guard !isShutDown, restoreCount == 0 else { return false }
+        restoreCount += 1
+        readinessSnapshot = ApplicationReadinessSnapshot(state: .ready)
+        return true
+    }
+
+    func presentSettings() -> Bool {
+        guard !isShutDown, readinessSnapshot.state != .starting else { return false }
         presentationCount += 1
+        return true
     }
 
     func shutdown() async {
@@ -2171,12 +2762,23 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
 
 private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     private var settings: EryloSettings
+    private let report: SettingsLoadReport
+    private let restoreResults: [PersistedModuleRestoreResult]
+    private var moduleFailureQueues: [EryloModule: [TrustUpdateFailure]]
     private(set) var moduleMutationCount = 0
     private(set) var startEnabledCount = 0
     private(set) var stopCount = 0
 
-    init(settings: EryloSettings) {
+    init(
+        settings: EryloSettings,
+        report: SettingsLoadReport = SettingsLoadReport(disposition: .missing),
+        restoreResults: [PersistedModuleRestoreResult] = [],
+        moduleFailureQueues: [EryloModule: [TrustUpdateFailure]] = [:]
+    ) {
         self.settings = settings
+        self.report = report
+        self.restoreResults = restoreResults
+        self.moduleFailureQueues = moduleFailureQueues
     }
 
     func currentSettings() -> EryloSettings {
@@ -2194,6 +2796,15 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     ) -> TrustSettingsUpdateResult {
         _ = permissionPolicy
         moduleMutationCount += 1
+        if var failures = moduleFailureQueues[module], !failures.isEmpty {
+            let failure = failures.removeFirst()
+            moduleFailureQueues[module] = failures
+            return TrustSettingsUpdateResult(
+                settings: settings,
+                outcome: .failed,
+                failure: failure
+            )
+        }
         settings.modules[module] = enabled
         return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
     }
@@ -2228,14 +2839,111 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
         DiagnosticsContext(settings: settings, providerHealth: [])
     }
 
-    func startEnabledModules() -> [TrustSettingsUpdateResult] {
+    func loadReport() -> SettingsLoadReport {
+        report
+    }
+
+    func restoreEnabledModules() -> [PersistedModuleRestoreResult] {
         startEnabledCount += 1
-        return []
+        if let settledSettings = restoreResults.last?.settings {
+            settings = settledSettings
+        }
+        return restoreResults
     }
 
     func stopAll() -> StopAllResult {
         stopCount += 1
         return StopAllResult(stoppedModules: [])
+    }
+}
+
+private actor GatedApplicationSettingsOwner: ApplicationSettingsOwning {
+    private var settings: EryloSettings
+    private var restorationContinuation: CheckedContinuation<Void, Never>?
+    private(set) var restoreStartCount = 0
+    private(set) var restoreCancellationCount = 0
+    private(set) var stopCount = 0
+
+    init(settings: EryloSettings) {
+        self.settings = settings
+    }
+
+    func currentSettings() -> EryloSettings { settings }
+
+    func loadReport() -> SettingsLoadReport {
+        SettingsLoadReport(
+            disposition: .current,
+            storedSchemaVersion: EryloSettings.currentSchemaVersion
+        )
+    }
+
+    func launchAtLoginSnapshot() -> LaunchAtLoginSnapshot { .unavailable }
+
+    func setModuleEnabled(
+        _ module: EryloModule,
+        enabled: Bool,
+        permissionPolicy: PermissionRequestPolicy
+    ) -> TrustSettingsUpdateResult {
+        _ = permissionPolicy
+        settings.modules[module] = enabled
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func apply(_ change: TrustSettingsChange) -> TrustSettingsUpdateResult {
+        switch change {
+        case let .displays(displays):
+            settings.displays = displays
+        case let .motion(motion):
+            settings.motion = motion
+        case let .fullscreen(fullscreen):
+            settings.fullscreenBehavior = fullscreen
+        case let .crashAndDiagnosticSharingConsent(consent):
+            settings.crashAndDiagnosticSharingConsent = consent
+        case let .onboardingCompleted(completed):
+            settings.onboardingCompleted = completed
+        }
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) -> TrustSettingsUpdateResult {
+        settings.launchAtLogin = enabled
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func resetToSafeDefaults() -> TrustSettingsUpdateResult {
+        settings = .safeDefaults
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func diagnosticsContext() -> DiagnosticsContext {
+        DiagnosticsContext(settings: settings, providerHealth: [])
+    }
+
+    func restoreEnabledModules() async -> [PersistedModuleRestoreResult] {
+        restoreStartCount += 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                restorationContinuation = continuation
+            }
+        } onCancel: {
+            Task { await self.recordRestorationCancellation() }
+        }
+        return []
+    }
+
+    func releaseRestoration() {
+        let continuation = restorationContinuation
+        restorationContinuation = nil
+        continuation?.resume()
+    }
+
+    func stopAll() -> StopAllResult {
+        stopCount += 1
+        return StopAllResult(stoppedModules: [])
+    }
+
+    private func recordRestorationCancellation() {
+        restoreCancellationCount += 1
     }
 }
 
@@ -2571,6 +3279,20 @@ private final class FixedDisplayProvider: EnabledDisplayProviding {
 }
 
 @MainActor
+private final class MutableDisplayProvider: EnabledDisplayProviding {
+    static let defaultSnapshots = FixedDisplayProvider().enabledDisplays()
+    var snapshots: [DisplaySnapshot]
+
+    init(snapshots: [DisplaySnapshot] = defaultSnapshots) {
+        self.snapshots = snapshots
+    }
+
+    func enabledDisplays() -> [DisplaySnapshot] {
+        snapshots
+    }
+}
+
+@MainActor
 private final class RecordingLifecycleEventSource: PanelLifecycleEventSourcing {
     private let events: EventLog
     private(set) var isRunning = false
@@ -2586,6 +3308,10 @@ private final class RecordingLifecycleEventSource: PanelLifecycleEventSourcing {
         isRunning = true
         self.handler = handler
         events.append("panel-events.start")
+    }
+
+    func emit(_ event: PanelLifecycleEvent) {
+        handler?(event)
     }
 
     func stop() {

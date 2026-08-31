@@ -16,6 +16,7 @@ fi
 swift build -Xswiftc -warnings-as-errors
 Scripts/check-activity-api-surface.sh
 Scripts/check-media-api-surface.sh
+Scripts/check-system-glance-api-surface.sh
 swift run EryloActivityTests
 swift run EryloFoundationTests
 swift run EryloFileHoldTests

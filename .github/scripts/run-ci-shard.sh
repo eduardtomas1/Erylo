@@ -113,6 +113,7 @@ case "$1" in
         swift build --jobs 2 -Xswiftc -warnings-as-errors
         Scripts/check-activity-api-surface.sh
         Scripts/check-media-api-surface.sh
+        Scripts/check-system-glance-api-surface.sh
         ;;
     target)
         [[ $# -eq 2 ]] || usage

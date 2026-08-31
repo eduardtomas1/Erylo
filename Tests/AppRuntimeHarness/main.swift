@@ -21,6 +21,8 @@ enum AppRuntimeHarnessMain {
         await harness.verifyStartShutdownOverlapAndRepeatedTermination()
         await harness.verifyCallerCancellationDoesNotAbandonStartup()
         await harness.verifyControlPlanePresentationAndSafeSettings()
+        await harness.verifySystemGlanceProductionSlice()
+        await harness.verifyRetiredVolumeExpiryDrainAcrossResetAndShutdown()
         await harness.verifyMenuCommandRoutingAndUpdateAvailability()
         await harness.verifyFocusTimerVerticalSlice()
         harness.finish()
@@ -275,6 +277,7 @@ private struct AppRuntimeHarness {
         )
 
         check(presenter.statusItemCount == 1, "repeated control-plane start installs one status item")
+        check(await settingsOwner.startEnabledCount == 1, "repeated control-plane start restores persisted modules once")
         check(presenter.settingsWindowCount == 1, "first launch presents one contained settings window")
         check(presenter.presentationCount == 1, "first-launch presentation occurs once")
         check(
@@ -365,6 +368,649 @@ private struct AppRuntimeHarness {
         returningPlane.presentSettings()
         check(returningPresenter.presentationCount == 1, "returning users can reopen Settings deliberately")
         await returningPlane.shutdown()
+    }
+
+    mutating func verifySystemGlanceProductionSlice() async {
+        do {
+            var persisted = EryloSettings.safeDefaults
+            persisted.modules.battery = true
+            persisted.modules.volume = true
+            let storage = RuntimeAtomicSettingsStorage(
+                initialData: try SettingsCodec().encode(persisted)
+            )
+            let repository = SettingsRepository(storage: storage)
+            let expirationScheduler = ManualExpirationScheduler()
+            let broker = ActivityBroker(expirationScheduler: expirationScheduler)
+            let initialVolume = try VolumeSnapshot(
+                deviceID: 7,
+                scalar: 0.35,
+                isMuted: false
+            )
+            let sources = RuntimeSystemSourceFactory(
+                volume: RuntimeVolumeSource(initialEvent: .snapshot(initialVolume))
+            )
+            let factory = SystemGlanceModuleProviderFactory(
+                broker: broker,
+                makePowerSource: { await sources.makePowerSource() },
+                makeVolumeSource: { await sources.makeVolumeSource() }
+            )
+            let permissions = RuntimePermissionRequester()
+            let coordinator = TrustSettingsCoordinator(
+                repository: repository,
+                providerFactory: factory,
+                permissionRequester: permissions,
+                launchAtLoginController: RuntimeLaunchAtLoginController(),
+                events: InMemoryDiagnosticEventBuffer()
+            )
+            let presenter = RecordingControlPresenter()
+            let plane = ApplicationControlPlane(
+                settingsOwner: coordinator,
+                diagnosticsExporter: DiagnosticsExporter(
+                    collector: PrivacyPreservingDiagnosticsCollector(
+                        eventSource: InMemoryDiagnosticEventBuffer()
+                    ),
+                    writer: RejectingDiagnosticsWriter()
+                ),
+                presenter: presenter,
+                availableModules: [.battery, .volume],
+                makeDisplayChoices: { [] }
+            )
+
+            _ = await plane.prepareForStartup()
+            check(await sources.constructionCount == 0, "preparing settings constructs no system Glance source")
+            check(await sources.power.startCount == 0, "preparing settings starts no Battery observer")
+            check(await sources.volume.startCount == 0, "preparing settings starts no Volume observer")
+            check(await permissions.requestCount == 0, "preparing settings requests no permission")
+
+            await plane.start(
+                canCheckForUpdates: false,
+                commandHandler: { _ in },
+                displayPolicyHandler: { _ in }
+            )
+            check(await sources.powerConstructionCount == 1, "persisted Battery restore constructs one inert source")
+            check(await sources.volumeConstructionCount == 1, "persisted Volume restore constructs one inert source")
+            check(await sources.power.startCount == 1, "persisted Battery restore starts one observer")
+            check(await sources.volume.startCount == 1, "persisted Volume restore starts one observer")
+            check(await permissions.requestCount == 0, "persisted system Glance restore is prompt-free")
+            check(
+                await broker.snapshot().ordered.allSatisfy { $0.activity.identity.source != .volume },
+                "production-faithful synchronous Volume baseline is quiet on restore"
+            )
+            check(await expirationScheduler.pendingCount == 0, "quiet Volume baseline schedules no HUD expiry")
+            check(
+                presenter.presentedModel?.availableModules == [.battery, .volume],
+                "settings exposes exactly Battery and Volume as working module controls"
+            )
+            if let model = presenter.presentedModel {
+                let constructionCount = await sources.constructionCount
+                await model.setModuleEnabled(.calendar, enabled: true)
+                check(!model.settings.modules.calendar, "unmounted Calendar remains off in production settings")
+                check(
+                    model.statusMessage?.contains("not connected") == true,
+                    "unmounted Calendar settings action reports that no work started"
+                )
+                check(
+                    await sources.constructionCount == constructionCount,
+                    "unmounted Calendar settings action constructs no source"
+                )
+                check(await permissions.requestCount == 0, "unmounted Calendar settings action requests no permission")
+            } else {
+                check(false, "unmounted Calendar settings fixture receives its model")
+                check(false, "unmounted Calendar status fixture receives its model")
+                check(false, "unmounted Calendar source fixture receives its model")
+                check(false, "unmounted Calendar permission fixture receives its model")
+            }
+
+            let resting = try PowerSnapshot(
+                chargeLevel: 0.52,
+                isCharging: false,
+                isConnectedToPower: false
+            )
+            await sources.power.emit(.snapshot(resting))
+            for _ in 0..<20 { await Task.yield() }
+            check(
+                await broker.snapshot().ordered.allSatisfy { $0.activity.identity.source != .battery },
+                "restored Battery consumes an ordinary initial snapshot quietly"
+            )
+
+            let low = try PowerSnapshot(
+                chargeLevel: 0.18,
+                isCharging: false,
+                isConnectedToPower: false
+            )
+            let volume = try VolumeSnapshot(deviceID: 7, scalar: 0.42, isMuted: false)
+            await sources.power.emit(.snapshot(low))
+            await sources.volume.emit(.snapshot(volume))
+            check(
+                await waitUntil {
+                    Set((await broker.snapshot()).ordered.map(\.activity.identity.source))
+                        == [.battery, .volume]
+                },
+                "Battery and Volume publish through the one injected application broker"
+            )
+            check(
+                await broker.workState().activeOwnershipCount == 0,
+                "system Glances introduce no retained broker ownership"
+            )
+
+            if let model = presenter.presentedModel {
+                await model.setModuleEnabled(.battery, enabled: false)
+                check(await sources.power.stopCount == 1, "Battery settings disable awaits observer removal")
+                check(!(await repository.current().modules.battery), "Battery settings disable persists off")
+                check(await sources.volume.isActive, "Battery disable leaves the independent Volume observer active")
+
+                await model.resetToSafeDefaults()
+                check(await sources.volume.stopCount == 1, "safe reset awaits Volume observer removal")
+                check(await repository.current() == .safeDefaults, "safe reset persists every module off")
+            } else {
+                check(false, "system Glance settings fixture receives its model")
+                check(false, "system Glance Battery disable fixture receives its model")
+                check(false, "system Glance persisted disable fixture receives its model")
+                check(false, "system Glance independent Volume fixture receives its model")
+                check(false, "system Glance reset fixture receives its model")
+                check(false, "system Glance reset persistence fixture receives its model")
+            }
+            let powerIsActiveAfterReset = await sources.power.isActive
+            let volumeIsActiveAfterReset = await sources.volume.isActive
+            check(!powerIsActiveAfterReset && !volumeIsActiveAfterReset, "reset leaves zero system observers")
+            check(await broker.snapshot().ordered.isEmpty, "reset clears system Glance activities")
+            check(await broker.workState() == .idle, "reset leaves zero broker tasks and ownership")
+
+            let constructionCount = await sources.constructionCount
+            do {
+                _ = try await factory.makeProvider(for: .calendar)
+                check(false, "unmounted Calendar factory request is rejected")
+            } catch let error {
+                check(
+                    error as? SystemGlanceRuntimeError == .unsupportedModule(.calendar),
+                    "unmounted Calendar reports a closed factory error"
+                )
+            }
+            check(
+                await sources.constructionCount == constructionCount,
+                "unmounted utility rejection constructs no system source"
+            )
+
+            await plane.shutdown()
+            let powerIsActiveAfterShutdown = await sources.power.isActive
+            let volumeIsActiveAfterShutdown = await sources.volume.isActive
+            check(!powerIsActiveAfterShutdown && !volumeIsActiveAfterShutdown, "terminal control-plane shutdown retains zero observers")
+            check(await broker.workState() == .idle, "terminal control-plane shutdown retains zero broker work")
+            await broker.shutdown()
+            check(await broker.workState() == .stopped, "terminal broker shutdown remains fully drained")
+        } catch {
+            recordUnexpected(error, context: "system Glance production slice")
+        }
+
+        let failedBroker = ActivityBroker()
+        let failedSource = RuntimePowerSource(failStart: true)
+        let failedProvider = PowerGlanceProvider(broker: failedBroker, source: failedSource)
+        let adapter = PowerGlanceLifecycleAdapter(provider: failedProvider)
+        do {
+            try await adapter.start()
+            check(false, "Battery lifecycle adapter rejects failed source activation")
+        } catch {
+            check(
+                error as? SystemGlanceRuntimeError
+                    == .activationFailed(
+                        GlanceProviderStatus(
+                            isEnabled: true,
+                            capability: .unavailable,
+                            health: .unavailable(.eventSourceUnavailable)
+                        )
+                    ),
+                "Battery lifecycle adapter preserves normalized activation status"
+            )
+        }
+        check(await failedProvider.workState().isIdle, "failed Battery activation leaves zero observer or consumer work")
+        check(!(await failedSource.isActive), "failed Battery activation leaves its source stopped")
+        check(await failedBroker.workState() == .idle, "failed Battery activation leaves zero broker work")
+        await failedBroker.shutdown()
+
+        let unavailablePowerBroker = ActivityBroker()
+        let unavailablePowerSource = RuntimePowerSource(initialEvent: .unavailable)
+        let unavailablePowerProvider = PowerGlanceProvider(
+            broker: unavailablePowerBroker,
+            source: unavailablePowerSource
+        )
+        let unavailablePowerAdapter = PowerGlanceLifecycleAdapter(provider: unavailablePowerProvider)
+        do {
+            try await unavailablePowerAdapter.start()
+            check(true, "synchronous initial Battery unavailability preserves enabled lifecycle intent")
+        } catch {
+            check(false, "synchronous initial Battery unavailability preserves enabled lifecycle intent")
+        }
+        check(
+            await unavailablePowerProvider.status().health == .unavailable(.eventSourceUnavailable),
+            "synchronous initial Battery unavailability settles to honest enabled health"
+        )
+        check(
+            await unavailablePowerProvider.workState().activeObserverCount == 1,
+            "synchronous initial Battery unavailability retains its recovery observer"
+        )
+        await unavailablePowerAdapter.stop()
+        check(await unavailablePowerProvider.workState().isIdle, "initially unavailable Battery stop drains all work")
+        await unavailablePowerBroker.shutdown()
+
+        let gatedPowerBroker = ActivityBroker()
+        let gatedPowerSource = GatedInitialUnavailablePowerSource()
+        let gatedPowerProvider = PowerGlanceProvider(broker: gatedPowerBroker, source: gatedPowerSource)
+        let gatedPowerAdapter = PowerGlanceLifecycleAdapter(provider: gatedPowerProvider)
+        let gatedPowerStart = Task {
+            do {
+                try await gatedPowerAdapter.start()
+                return true
+            } catch {
+                return false
+            }
+        }
+        check(
+            await waitUntil { await gatedPowerSource.didEmitInitialEvent },
+            "gated Battery source emits unavailable synchronously before start returns"
+        )
+        check(
+            await gatedPowerProvider.status().health == .starting,
+            "gated synchronous Battery baseline remains in activation settlement"
+        )
+        await gatedPowerSource.releaseStart()
+        check(await gatedPowerStart.value, "gated synchronous Battery unavailability completes as enabled")
+        check(
+            await gatedPowerProvider.status().health == .unavailable(.eventSourceUnavailable),
+            "gated synchronous Battery unavailability settles before adapter completion"
+        )
+        check(
+            await gatedPowerProvider.workState().activeObserverCount == 1,
+            "gated synchronous Battery unavailability retains one recovery observer"
+        )
+        await gatedPowerAdapter.stop()
+        check(await gatedPowerProvider.workState().isIdle, "gated unavailable Battery stop drains all work")
+        await gatedPowerBroker.shutdown()
+
+        let failedVolumeBroker = ActivityBroker()
+        let failedVolumeSource = RuntimeVolumeSource(failStart: true)
+        let failedVolumeProvider = VolumeGlanceProvider(
+            broker: failedVolumeBroker,
+            source: failedVolumeSource
+        )
+        let volumeAdapter = VolumeGlanceLifecycleAdapter(provider: failedVolumeProvider)
+        do {
+            try await volumeAdapter.start()
+            check(false, "Volume lifecycle adapter rejects failed source activation")
+        } catch {
+            check(
+                error as? SystemGlanceRuntimeError
+                    == .activationFailed(
+                        GlanceProviderStatus(
+                            isEnabled: true,
+                            capability: .unavailable,
+                            health: .unavailable(.eventSourceUnavailable)
+                        )
+                    ),
+                "Volume lifecycle adapter preserves normalized activation status"
+            )
+        }
+        check(await failedVolumeProvider.workState().isIdle, "failed Volume activation leaves zero observer or consumer work")
+        check(!(await failedVolumeSource.isActive), "failed Volume activation leaves its source stopped")
+        check(await failedVolumeBroker.workState() == .idle, "failed Volume activation leaves zero broker work")
+        await failedVolumeBroker.shutdown()
+
+        let unavailableBroker = ActivityBroker()
+        let unavailableSource = RuntimeVolumeSource(initialEvent: .unavailable)
+        let unavailableProvider = VolumeGlanceProvider(
+            broker: unavailableBroker,
+            source: unavailableSource
+        )
+        let unavailableAdapter = VolumeGlanceLifecycleAdapter(provider: unavailableProvider)
+        do {
+            try await unavailableAdapter.start()
+            check(true, "synchronous initial Volume unavailability preserves enabled lifecycle intent")
+        } catch {
+            check(false, "synchronous initial Volume unavailability preserves enabled lifecycle intent")
+        }
+        check(
+            await unavailableProvider.status().health == .unavailable(.eventSourceUnavailable),
+            "synchronous initial Volume unavailability settles to honest enabled health"
+        )
+        check(
+            await unavailableProvider.workState().activeObserverCount == 1,
+            "synchronous initial Volume unavailability retains its recovery observer"
+        )
+        await unavailableAdapter.stop()
+        check(await unavailableProvider.workState().isIdle, "initially unavailable Volume stop drains all work")
+        await unavailableBroker.shutdown()
+
+        let gatedBroker = ActivityBroker()
+        let gatedSource = GatedInitialUnavailableVolumeSource()
+        let gatedProvider = VolumeGlanceProvider(broker: gatedBroker, source: gatedSource)
+        let gatedAdapter = VolumeGlanceLifecycleAdapter(provider: gatedProvider)
+        let gatedStart = Task {
+            do {
+                try await gatedAdapter.start()
+                return true
+            } catch {
+                return false
+            }
+        }
+        check(
+            await waitUntil { await gatedSource.didEmitInitialEvent },
+            "gated Volume source emits unavailable synchronously before start returns"
+        )
+        check(
+            await gatedProvider.status().health == .starting,
+            "gated synchronous baseline remains in activation settlement"
+        )
+        await gatedSource.releaseStart()
+        check(await gatedStart.value, "gated synchronous unavailability completes as enabled")
+        check(
+            await gatedProvider.status().health == .unavailable(.eventSourceUnavailable),
+            "gated synchronous unavailability settles before adapter completion"
+        )
+        check(
+            await gatedProvider.workState().activeObserverCount == 1,
+            "gated synchronous unavailability retains one recovery observer"
+        )
+        await gatedAdapter.stop()
+        check(await gatedProvider.workState().isIdle, "gated unavailable Volume stop drains all work")
+        await gatedBroker.shutdown()
+
+        do {
+            var persistedUnavailable = EryloSettings.safeDefaults
+            persistedUnavailable.modules.volume = true
+            let unavailableStorage = RuntimeAtomicSettingsStorage(
+                initialData: try SettingsCodec().encode(persistedUnavailable)
+            )
+            let unavailableRepository = SettingsRepository(storage: unavailableStorage)
+            let restoreBroker = ActivityBroker()
+            let restoreSource = RuntimeVolumeSource(initialEvent: .unavailable)
+            let restoreCoordinator = TrustSettingsCoordinator(
+                repository: unavailableRepository,
+                providerFactory: SystemGlanceModuleProviderFactory(
+                    broker: restoreBroker,
+                    makeVolumeSource: { restoreSource }
+                ),
+                permissionRequester: RuntimePermissionRequester(),
+                launchAtLoginController: RuntimeLaunchAtLoginController(),
+                events: InMemoryDiagnosticEventBuffer()
+            )
+            let results = await restoreCoordinator.startEnabledModules()
+            check(results.first?.failure == nil, "initially unavailable persisted Volume restore does not fail")
+            check(
+                await unavailableRepository.current().modules.volume,
+                "initially unavailable persisted Volume restore preserves enable intent"
+            )
+            check(
+                await restoreCoordinator.activeModules() == [.volume],
+                "initially unavailable persisted Volume restore retains lifecycle ownership"
+            )
+            _ = await restoreCoordinator.stopAll()
+            check(!(await restoreSource.isActive), "initially unavailable persisted Volume shutdown removes observer")
+            check(await restoreBroker.workState() == .idle, "initially unavailable persisted Volume shutdown drains broker")
+            await restoreBroker.shutdown()
+        } catch {
+            recordUnexpected(error, context: "initially unavailable persisted Volume restore")
+        }
+    }
+
+    mutating func verifyRetiredVolumeExpiryDrainAcrossResetAndShutdown() async {
+        do {
+            var persisted = EryloSettings.safeDefaults
+            persisted.modules.volume = true
+            persisted.onboardingCompleted = true
+            let storage = RuntimeAtomicSettingsStorage(
+                initialData: try SettingsCodec().encode(persisted)
+            )
+            let repository = SettingsRepository(storage: storage)
+            let scheduler = CancellationIgnoringExpirationScheduler()
+            let broker = ActivityBroker(expirationScheduler: scheduler)
+            let baseline = try VolumeSnapshot(deviceID: 9, scalar: 0.25, isMuted: false)
+            let source = RuntimeVolumeSource(initialEvent: .snapshot(baseline))
+            let provider = VolumeGlanceProvider(broker: broker, source: source)
+            let adapter = VolumeGlanceLifecycleAdapter(provider: provider)
+            let coordinator = TrustSettingsCoordinator(
+                repository: repository,
+                providerFactory: RuntimeSingleModuleProviderFactory(
+                    module: .volume,
+                    provider: adapter
+                ),
+                permissionRequester: RuntimePermissionRequester(),
+                launchAtLoginController: RuntimeLaunchAtLoginController(),
+                events: InMemoryDiagnosticEventBuffer()
+            )
+            let plane = ApplicationControlPlane(
+                settingsOwner: coordinator,
+                diagnosticsExporter: DiagnosticsExporter(
+                    collector: PrivacyPreservingDiagnosticsCollector(
+                        eventSource: InMemoryDiagnosticEventBuffer()
+                    ),
+                    writer: RejectingDiagnosticsWriter()
+                ),
+                presenter: RecordingControlPresenter(),
+                availableModules: [.volume],
+                makeDisplayChoices: { [] }
+            )
+            let events = EventLog()
+            let model = SurfaceActivityModel(broker: broker)
+            let eventSource = RecordingLifecycleEventSource(events: events)
+            let panelCoordinator = PanelCoordinator(
+                displayProvider: FixedDisplayProvider(),
+                policy: .safeDefault,
+                lifecycleEventSource: eventSource,
+                activityModel: model,
+                panelFactory: { snapshot, _ in
+                    RecordingPanel(displayIdentity: snapshot.identity, events: events)
+                }
+            )
+            let runtime = ApplicationRuntime(
+                activityBroker: broker,
+                activityModel: model,
+                panelCoordinator: panelCoordinator,
+                updateRuntime: UpdateRuntime(configuration: Self.disabledUpdateConfiguration()),
+                controlPlane: plane
+            )
+
+            check(await runtime.start(), "retired-expiry fixture starts through the application runtime")
+            let changed = try VolumeSnapshot(deviceID: 9, scalar: 0.4, isMuted: false)
+            await source.emit(.snapshot(changed))
+            check(
+                await waitUntil { await scheduler.activeSleepCount == 1 },
+                "transient Volume acknowledgement starts one physical expiry sleep"
+            )
+            check(
+                await broker.workState().scheduledExpiryCount == 1,
+                "active Volume expiry is represented in broker work accounting"
+            )
+
+            let resetCompletion = CompletionFlag()
+            let resetTask = Task { @MainActor in
+                let result = await coordinator.resetToSafeDefaults()
+                resetCompletion.isComplete = true
+                return result
+            }
+            check(
+                await waitUntil { await scheduler.cancellationCount == 1 },
+                "safe reset cancels the transient Volume expiry"
+            )
+            check(!resetCompletion.isComplete, "safe reset waits for cancellation-ignoring expiry work")
+            check(
+                await scheduler.activeSleepCount == 1,
+                "cancelled Volume expiry remains physically active until scheduler release"
+            )
+            check(
+                await broker.workState().scheduledExpiryCount == 1,
+                "retired Volume expiry remains represented in broker work accounting"
+            )
+
+            let brokerShutdownCompletion = CompletionFlag()
+            let brokerShutdownTask = Task { @MainActor in
+                await broker.shutdown()
+                brokerShutdownCompletion.isComplete = true
+            }
+            for _ in 0..<20 { await Task.yield() }
+            check(
+                !brokerShutdownCompletion.isComplete,
+                "broker shutdown joins an already-retired cancellation-ignoring expiry"
+            )
+            check(
+                await broker.workState().scheduledExpiryCount == 1,
+                "broker shutdown keeps suspended retired work visible"
+            )
+
+            let runtimeShutdownCompletion = CompletionFlag()
+            let runtimeShutdownTask = Task { @MainActor in
+                await runtime.shutdown()
+                runtimeShutdownCompletion.isComplete = true
+            }
+            check(
+                await waitUntil { runtime.phase == .shuttingDown },
+                "application runtime enters terminal shutdown while reset is draining"
+            )
+            check(
+                !runtimeShutdownCompletion.isComplete,
+                "application runtime shutdown cannot outrun retired Volume expiry work"
+            )
+
+            await scheduler.releaseAll()
+            let resetResult = await resetTask.value
+            await brokerShutdownTask.value
+            await runtimeShutdownTask.value
+            check(resetResult.outcome == .applied, "safe reset completes after physical expiry release")
+            check(await scheduler.activeSleepCount == 0, "released expiry scheduler has zero physical work")
+            check(await provider.workState().isIdle, "released Volume provider has zero observer or consumer work")
+            check(!(await source.isActive), "released Volume source has no observer")
+            check(await coordinator.activeModules().isEmpty, "released settings runtime owns no module provider")
+            check(runtime.phase == .stopped, "released application runtime reaches its terminal phase")
+            check(await broker.workState() == .stopped, "released broker retains zero expiry or subscription work")
+        } catch {
+            recordUnexpected(error, context: "retired Volume expiry drain")
+        }
+
+        do {
+            let scheduler = CancellationIgnoringExpirationScheduler()
+            let broker = ActivityBroker(expirationScheduler: scheduler)
+            let baseline = try VolumeSnapshot(deviceID: 10, scalar: 0.3, isMuted: false)
+            let source = RuntimeVolumeSource(initialEvent: .snapshot(baseline))
+            let provider = VolumeGlanceProvider(broker: broker, source: source)
+            let adapter = VolumeGlanceLifecycleAdapter(provider: provider)
+            try await adapter.start()
+            let changed = try VolumeSnapshot(deviceID: 10, scalar: 0.5, isMuted: false)
+            await source.emit(.snapshot(changed))
+            check(
+                await waitUntil { await scheduler.activeSleepCount == 1 },
+                "shutdown-first disable fixture starts one physical Volume expiry"
+            )
+
+            let shutdownCompletion = CompletionFlag()
+            let shutdownTask = Task { @MainActor in
+                await broker.shutdown()
+                shutdownCompletion.isComplete = true
+            }
+            check(
+                await waitUntil { await scheduler.cancellationCount == 1 },
+                "shutdown-first disable retires the physical Volume expiry"
+            )
+            check(!shutdownCompletion.isComplete, "shutdown-first broker waits for physical expiry release")
+
+            let disableCompletion = CompletionFlag()
+            let disableTask = Task { @MainActor in
+                await adapter.stop()
+                disableCompletion.isComplete = true
+            }
+            check(
+                await waitUntil { !(await source.isActive) },
+                "provider disable removes its observer after broker shutdown begins"
+            )
+            check(
+                !disableCompletion.isComplete,
+                "provider disable entering after broker shutdown still joins retired expiry"
+            )
+            check(
+                await broker.workState().scheduledExpiryCount == 1,
+                "shutdown-first provider disable keeps retired physical work visible"
+            )
+
+            await scheduler.releaseAll()
+            await disableTask.value
+            await shutdownTask.value
+            check(await scheduler.activeSleepCount == 0, "shutdown-first disable releases physical scheduler work")
+            check(await provider.workState().isIdle, "shutdown-first disable leaves the provider idle")
+            check(await broker.workState() == .stopped, "shutdown-first disable leaves the broker drained")
+        } catch {
+            recordUnexpected(error, context: "shutdown-first Volume disable drain")
+        }
+
+        do {
+            var persisted = EryloSettings.safeDefaults
+            persisted.modules.volume = true
+            let storage = RuntimeAtomicSettingsStorage(
+                initialData: try SettingsCodec().encode(persisted)
+            )
+            let repository = SettingsRepository(storage: storage)
+            let scheduler = CancellationIgnoringExpirationScheduler()
+            let broker = ActivityBroker(expirationScheduler: scheduler)
+            let baseline = try VolumeSnapshot(deviceID: 11, scalar: 0.2, isMuted: false)
+            let source = RuntimeVolumeSource(initialEvent: .snapshot(baseline))
+            let provider = VolumeGlanceProvider(broker: broker, source: source)
+            let coordinator = TrustSettingsCoordinator(
+                repository: repository,
+                providerFactory: RuntimeSingleModuleProviderFactory(
+                    module: .volume,
+                    provider: VolumeGlanceLifecycleAdapter(provider: provider)
+                ),
+                permissionRequester: RuntimePermissionRequester(),
+                launchAtLoginController: RuntimeLaunchAtLoginController(),
+                events: InMemoryDiagnosticEventBuffer()
+            )
+            let restore = await coordinator.startEnabledModules()
+            check(restore.first?.failure == nil, "shutdown-first reset fixture restores Volume")
+            let changed = try VolumeSnapshot(deviceID: 11, scalar: 0.45, isMuted: false)
+            await source.emit(.snapshot(changed))
+            check(
+                await waitUntil { await scheduler.activeSleepCount == 1 },
+                "shutdown-first reset fixture starts one physical Volume expiry"
+            )
+
+            let shutdownCompletion = CompletionFlag()
+            let shutdownTask = Task { @MainActor in
+                await broker.shutdown()
+                shutdownCompletion.isComplete = true
+            }
+            check(
+                await waitUntil { await scheduler.cancellationCount == 1 },
+                "shutdown-first reset retires the physical Volume expiry"
+            )
+
+            let resetCompletion = CompletionFlag()
+            let resetTask = Task { @MainActor in
+                let result = await coordinator.resetToSafeDefaults()
+                resetCompletion.isComplete = true
+                return result
+            }
+            check(
+                await waitUntil { !(await source.isActive) },
+                "safe reset removes its observer after broker shutdown begins"
+            )
+            check(!shutdownCompletion.isComplete, "shutdown-first reset keeps broker shutdown waiting")
+            check(
+                !resetCompletion.isComplete,
+                "safe reset entering after broker shutdown still joins retired expiry"
+            )
+            check(
+                await broker.workState().scheduledExpiryCount == 1,
+                "shutdown-first reset keeps retired physical work visible"
+            )
+
+            await scheduler.releaseAll()
+            let reset = await resetTask.value
+            await shutdownTask.value
+            check(reset.outcome == .applied, "shutdown-first reset applies after physical expiry release")
+            check(await repository.current() == .safeDefaults, "shutdown-first reset persists safe defaults")
+            check(await scheduler.activeSleepCount == 0, "shutdown-first reset releases physical scheduler work")
+            check(await provider.workState().isIdle, "shutdown-first reset leaves the provider idle")
+            check(await coordinator.activeModules().isEmpty, "shutdown-first reset releases lifecycle ownership")
+            check(await broker.workState() == .stopped, "shutdown-first reset leaves the broker drained")
+        } catch {
+            recordUnexpected(error, context: "shutdown-first Volume reset drain")
+        }
     }
 
     mutating func verifyMenuCommandRoutingAndUpdateAvailability() async {
@@ -1078,6 +1724,7 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
 private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     private var settings: EryloSettings
     private(set) var moduleMutationCount = 0
+    private(set) var startEnabledCount = 0
     private(set) var stopCount = 0
 
     init(settings: EryloSettings) {
@@ -1133,9 +1780,218 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
         DiagnosticsContext(settings: settings, providerHealth: [])
     }
 
+    func startEnabledModules() -> [TrustSettingsUpdateResult] {
+        startEnabledCount += 1
+        return []
+    }
+
     func stopAll() -> StopAllResult {
         stopCount += 1
         return StopAllResult(stoppedModules: [])
+    }
+}
+
+private final class RuntimeAtomicSettingsStorage: AtomicSettingsStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var data: Data?
+
+    init(initialData: Data?) {
+        data = initialData
+    }
+
+    func data(forKey key: String) throws -> Data? {
+        _ = key
+        return lock.withLock { data }
+    }
+
+    func replace(_ data: Data, forKey key: String) throws {
+        _ = key
+        lock.withLock { self.data = data }
+    }
+}
+
+private actor RuntimeSystemSourceFactory {
+    let power: RuntimePowerSource
+    let volume: RuntimeVolumeSource
+    private(set) var powerConstructionCount = 0
+    private(set) var volumeConstructionCount = 0
+
+    init(
+        power: RuntimePowerSource = RuntimePowerSource(),
+        volume: RuntimeVolumeSource = RuntimeVolumeSource()
+    ) {
+        self.power = power
+        self.volume = volume
+    }
+
+    var constructionCount: Int {
+        powerConstructionCount + volumeConstructionCount
+    }
+
+    func makePowerSource() -> any PowerEventSource {
+        powerConstructionCount += 1
+        return power
+    }
+
+    func makeVolumeSource() -> any VolumeEventSource {
+        volumeConstructionCount += 1
+        return volume
+    }
+}
+
+private struct RuntimeSingleModuleProviderFactory: ModuleProviderFactory {
+    let module: EryloModule
+    let provider: any ModuleLifecycleProvider
+
+    func makeProvider(for module: EryloModule) async throws -> any ModuleLifecycleProvider {
+        guard module == self.module else { throw RuntimeSystemSourceError.requestedFailure }
+        return provider
+    }
+}
+
+private actor RuntimePowerSource: PowerEventSource {
+    private var handler: (@Sendable (PowerSourceEvent) -> Void)?
+    private let failStart: Bool
+    private let initialEvent: PowerSourceEvent?
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private(set) var isActive = false
+
+    init(failStart: Bool = false, initialEvent: PowerSourceEvent? = nil) {
+        self.failStart = failStart
+        self.initialEvent = initialEvent
+    }
+
+    func start(handler: @escaping @Sendable (PowerSourceEvent) -> Void) async throws {
+        startCount += 1
+        guard !failStart else { throw RuntimeSystemSourceError.requestedFailure }
+        self.handler = handler
+        isActive = true
+        if let initialEvent {
+            handler(initialEvent)
+        }
+    }
+
+    func stop() {
+        stopCount += 1
+        handler = nil
+        isActive = false
+    }
+
+    func emit(_ event: PowerSourceEvent) {
+        handler?(event)
+    }
+}
+
+private actor RuntimeVolumeSource: VolumeEventSource {
+    private var handler: (@Sendable (VolumeSourceEvent) -> Void)?
+    private let failStart: Bool
+    private let initialEvent: VolumeSourceEvent?
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private(set) var isActive = false
+
+    init(failStart: Bool = false, initialEvent: VolumeSourceEvent? = nil) {
+        self.failStart = failStart
+        self.initialEvent = initialEvent
+    }
+
+    func start(handler: @escaping @Sendable (VolumeSourceEvent) -> Void) throws {
+        startCount += 1
+        guard !failStart else { throw RuntimeSystemSourceError.requestedFailure }
+        self.handler = handler
+        isActive = true
+        if let initialEvent {
+            handler(initialEvent)
+        }
+    }
+
+    func stop() {
+        stopCount += 1
+        handler = nil
+        isActive = false
+    }
+
+    func emit(_ event: VolumeSourceEvent) {
+        handler?(event)
+    }
+}
+
+private actor GatedInitialUnavailablePowerSource: PowerEventSource {
+    private var handler: (@Sendable (PowerSourceEvent) -> Void)?
+    private var startContinuation: CheckedContinuation<Void, Never>?
+    private(set) var didEmitInitialEvent = false
+
+    func start(handler: @escaping @Sendable (PowerSourceEvent) -> Void) async throws {
+        self.handler = handler
+        handler(.unavailable)
+        didEmitInitialEvent = true
+        await withCheckedContinuation { continuation in
+            startContinuation = continuation
+        }
+    }
+
+    func releaseStart() {
+        let continuation = startContinuation
+        startContinuation = nil
+        continuation?.resume()
+    }
+
+    func stop() {
+        handler = nil
+        releaseStart()
+    }
+}
+
+private actor GatedInitialUnavailableVolumeSource: VolumeEventSource {
+    private var handler: (@Sendable (VolumeSourceEvent) -> Void)?
+    private var startContinuation: CheckedContinuation<Void, Never>?
+    private(set) var didEmitInitialEvent = false
+
+    func start(handler: @escaping @Sendable (VolumeSourceEvent) -> Void) async throws {
+        self.handler = handler
+        handler(.unavailable)
+        didEmitInitialEvent = true
+        await withCheckedContinuation { continuation in
+            startContinuation = continuation
+        }
+    }
+
+    func releaseStart() {
+        let continuation = startContinuation
+        startContinuation = nil
+        continuation?.resume()
+    }
+
+    func stop() {
+        handler = nil
+        releaseStart()
+    }
+}
+
+private enum RuntimeSystemSourceError: Error {
+    case requestedFailure
+}
+
+private actor RuntimePermissionRequester: ModulePermissionRequesting {
+    private(set) var requestCount = 0
+
+    func requestPermission(
+        _ requirement: ModulePermissionRequirement,
+        for module: EryloModule
+    ) throws {
+        _ = requirement
+        _ = module
+        requestCount += 1
+        throw RuntimeSystemSourceError.requestedFailure
+    }
+}
+
+private final class RuntimeLaunchAtLoginController: LaunchAtLoginControlling, @unchecked Sendable {
+    func snapshot() -> LaunchAtLoginSnapshot { .unavailable }
+    func setEnabled(_ enabled: Bool) -> LaunchAtLoginSnapshot {
+        _ = enabled
+        return .unavailable
     }
 }
 
@@ -1453,6 +2309,35 @@ private actor ManualFocusClock: GlanceClock {
     }
 }
 
+private actor CancellationIgnoringExpirationScheduler: ActivityExpirationScheduling {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var activeSleepCount = 0
+    private(set) var cancellationCount = 0
+
+    func sleep(for duration: Duration) async throws {
+        _ = duration
+        activeSleepCount += 1
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        } onCancel: {
+            Task { await self.recordCancellation() }
+        }
+        activeSleepCount -= 1
+    }
+
+    func releaseAll() {
+        let continuations = waiters
+        waiters.removeAll()
+        continuations.forEach { $0.resume() }
+    }
+
+    private func recordCancellation() {
+        cancellationCount += 1
+    }
+}
+
 private actor ManualExpirationScheduler: ActivityExpirationScheduling {
     private struct Waiter {
         let identifier: UUID
@@ -1496,10 +2381,12 @@ private actor ManualExpirationScheduler: ActivityExpirationScheduling {
 }
 
 private extension ActivityBrokerWorkState {
-    static let stopped = ActivityBrokerWorkState(
+    static let idle = ActivityBrokerWorkState(
         scheduledExpiryCount: 0,
         subscriberCount: 0,
         activeOwnershipCount: 0,
         pendingOwnershipIntentCount: 0
     )
+
+    static let stopped = idle
 }

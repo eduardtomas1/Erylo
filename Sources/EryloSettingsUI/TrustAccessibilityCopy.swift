@@ -7,8 +7,8 @@ public enum TrustAccessibilityCopy {
     public static let onboardingHint = "Explains the top-edge surface, deliberate interaction, safe defaults, settings, quitting, and relaunching."
     public static let onboardingSurfaceExplanation = "Erylo lives in a small surface at the top edge of your display, around the camera notch when one is present. It stays passive until you deliberately use it."
     public static let onboardingInteractionExplanation = "Click the visible Erylo surface, or press Control–Option–Command–E, when you deliberately want to interact. The passive panel does not become a normal app window."
-    public static let onboardingSafetyExplanation = "Browsing Settings cannot start a Focus Timer, request permissions, open sockets or files, control media, or perform network work. A Focus Timer starts only when you choose a duration from the Erylo menu."
-    public static let onboardingControlExplanation = "Use the Erylo menu bar item to start or cancel a Focus Timer, reopen Settings, or quit. After quitting, launch Erylo again the same way you opened it."
+    public static let onboardingSafetyExplanation = "Browsing Settings cannot start a Focus Timer, request permissions, open sockets or files, control media, or perform network work. Battery and Volume start only when you turn on their switches."
+    public static let onboardingControlExplanation = "Use the Erylo menu bar item to start or cancel a Focus Timer, reopen Settings to control Battery and Volume, or quit. After quitting, launch Erylo again the same way you opened it."
     public static let moduleGroupLabel = "Activity modules"
     public static let displayGroupLabel = "Display preferences"
     public static let motionPickerLabel = "Motion behavior"
@@ -82,21 +82,21 @@ public enum ModuleCopy {
     public static func explanation(for module: EryloModule) -> String {
         switch module {
         case .fileHold:
-            "Keeps files available for a short handoff. Access comes only from files you drop or choose."
+            "Future file handoff utility; not included in this build."
         case .appleMusic:
-            "Shows and controls playback. macOS may ask to control Music when you enable it."
+            "Future media utility; Apple Music support is not included in this build."
         case .spotify:
-            "Shows and controls playback. macOS may ask to control Spotify when you enable it."
+            "Future media utility; Spotify support is not included in this build."
         case .battery:
             "Shows charging and battery changes from local system events."
         case .timer:
             "Shows timers you start in Erylo."
         case .calendar:
-            "Reads the next meeting only after you grant Calendar access."
+            "Future meeting utility; Calendar access is not included in this build."
         case .volume:
             "Shows local volume changes without a network connection."
         case .localIntegrations:
-            "Runs a validated local listener only while enabled. It requests no system permission."
+            "Future extension utility; local integrations are not included in this build."
         }
     }
 }

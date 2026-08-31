@@ -107,7 +107,7 @@ package final class ApplicationRuntime {
             activityModel: activityModel,
             panelCoordinator: panelCoordinator,
             updateRuntime: UpdateRuntime(configuration: .mainBundle),
-            controlPlane: ApplicationControlPlane.production(),
+            controlPlane: ApplicationControlPlane.production(activityBroker: activityBroker),
             focusTimer: focusTimer,
             requestApplicationTermination: requestApplicationTermination
         )

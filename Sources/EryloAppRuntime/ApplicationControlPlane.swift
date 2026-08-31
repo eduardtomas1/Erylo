@@ -1,4 +1,5 @@
 import AppKit
+import EryloActivity
 import EryloCore
 import EryloSettingsUI
 import EryloTrust
@@ -153,19 +154,22 @@ package protocol ApplicationControlPlaneOwning: AnyObject {
 }
 
 package protocol ApplicationSettingsOwning: TrustSettingsCoordinating {
+    func startEnabledModules() async -> [TrustSettingsUpdateResult]
     func stopAll() async -> StopAllResult
 }
 
 extension TrustSettingsCoordinator: ApplicationSettingsOwning {}
 
 /// Owns the menu/settings resources and the inert trust-settings composition.
-/// Preparing and browsing perform reads only; utility providers are unavailable in this build.
+/// Preparing and browsing perform reads only. Persisted provider work starts only
+/// from the explicit application-start boundary.
 @MainActor
 package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
     private let settingsOwner: any ApplicationSettingsOwning
     private let diagnosticsExporter: DiagnosticsExporter
     private let presenter: any ApplicationControlPresenting
     private let makeDisplayChoices: @MainActor () -> [DisplayChoice]
+    private let availableModules: Set<EryloModule>
     private var viewModel: TrustSettingsViewModel?
     private var preparedSettings: EryloSettings?
     private var displayPolicyHandler: (@MainActor (DisplayPolicy) -> Void)?
@@ -177,20 +181,22 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
         settingsOwner: any ApplicationSettingsOwning,
         diagnosticsExporter: DiagnosticsExporter,
         presenter: any ApplicationControlPresenting,
+        availableModules: Set<EryloModule> = [],
         makeDisplayChoices: @escaping @MainActor () -> [DisplayChoice]
     ) {
         self.settingsOwner = settingsOwner
         self.diagnosticsExporter = diagnosticsExporter
         self.presenter = presenter
+        self.availableModules = availableModules
         self.makeDisplayChoices = makeDisplayChoices
     }
 
-    package static func production() -> ApplicationControlPlane {
+    package static func production(activityBroker: ActivityBroker) -> ApplicationControlPlane {
         let repository = SettingsRepository(automaticallyPersistsMigrations: false)
         let events = InMemoryDiagnosticEventBuffer()
         let settingsOwner = TrustSettingsCoordinator(
             repository: repository,
-            providerFactory: UnavailableModuleProviderFactory(),
+            providerFactory: SystemGlanceModuleProviderFactory(broker: activityBroker),
             permissionRequester: DenyingModulePermissionRequester(),
             launchAtLoginController: SystemLaunchAtLoginController(),
             events: events
@@ -202,6 +208,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             settingsOwner: settingsOwner,
             diagnosticsExporter: diagnosticsExporter,
             presenter: NativeApplicationControlPresenter(),
+            availableModules: [.battery, .volume],
             makeDisplayChoices: {
                 let snapshots = SystemDisplayProvider().enabledDisplays()
                 var externalIndex = 0
@@ -233,7 +240,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             diagnosticsExporter: diagnosticsExporter,
             initialSettings: settings,
             displayChoices: makeDisplayChoices(),
-            availableModules: [],
+            availableModules: availableModules,
             supportsMotionPreference: false,
             supportsFullscreenPreference: false,
             settingsDidChange: { [weak self] settings in
@@ -254,6 +261,13 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             _ = await prepareForStartup()
         }
         guard !isShutDown, let viewModel else { return }
+
+        let restoreResults = await settingsOwner.startEnabledModules()
+        guard !isShutDown, !Task.isCancelled else { return }
+        if let restoredSettings = restoreResults.last?.settings {
+            preparedSettings = restoredSettings
+            viewModel.synchronize(settings: restoredSettings)
+        }
 
         self.displayPolicyHandler = displayPolicyHandler
         presenter.installStatusMenu(
@@ -431,13 +445,6 @@ private final class NativeSettingsWindowController: NSObject, NSWindowDelegate {
 
 private enum UnavailableModuleProviderError: Error {
     case unavailable
-}
-
-private struct UnavailableModuleProviderFactory: ModuleProviderFactory {
-    func makeProvider(for module: EryloModule) async throws -> any ModuleLifecycleProvider {
-        _ = module
-        throw UnavailableModuleProviderError.unavailable
-    }
 }
 
 private struct DenyingModulePermissionRequester: ModulePermissionRequesting {

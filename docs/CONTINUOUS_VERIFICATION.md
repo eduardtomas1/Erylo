@@ -32,7 +32,9 @@ timeout below 15 minutes:
 - `PR target / EryloAppRuntimeTests`
 
 `Swift build` preserves the warnings-as-errors contract across every product.
-`API surface` preserves both repository-owned public-surface checks. Each test
+`API surface` preserves all three repository-owned public-surface checks, including
+independent package-access probes for every Battery/Volume composition type and a
+closed provider scan across the complete app-runtime source set. Each test
 target gets its own cold checkout and build so one slow or stuck harness cannot
 consume the entire pull-request verification window. Target compilation uses
 two workers, then exits SwiftPM before launching the built executable so the

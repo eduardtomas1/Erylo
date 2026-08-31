@@ -60,7 +60,7 @@ public struct TrustSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Glance. Act. Disappear.")
                         .font(.system(.title2, design: .rounded, weight: .semibold))
-                    Text("Erylo is a quiet, local-first activity layer. Focus Timer starts only when you choose it from the Erylo menu; other utility modules stay off.")
+                    Text("Erylo is a quiet, local-first activity layer. Focus Timer starts from the Erylo menu; Battery and Volume run only when you enable them in Settings.")
                         .foregroundStyle(EryloPalette.mist)
                         .fixedSize(horizontal: false, vertical: true)
                     if !model.settings.onboardingCompleted {
@@ -95,9 +95,7 @@ public struct TrustSettingsView: View {
     private var moduleSection: some View {
         sectionCard(
             title: "Modules",
-            subtitle: model.availableModules.isEmpty
-                ? "Focus Timer is available from the Erylo menu. The planned utility switches below are visible for transparency and cannot start permissions, files, sockets, media automation, or network work."
-                : "Off means stopped: no permission-dependent work, timers, or network activity."
+            subtitle: "Battery and Volume use local system events and are fully stopped when off. Focus Timer is available from the Erylo menu; every other utility row is future work."
         ) {
             VStack(spacing: 0) {
                 ForEach(EryloModule.allCases, id: \.self) { module in
@@ -138,7 +136,7 @@ public struct TrustSettingsView: View {
                 if !model.isModuleAvailable(module) {
                     Text(module == .timer
                         ? "Focus Timer is live from the Erylo menu; this background-module switch is not used."
-                        : "Not connected in this build; this utility is not running.")
+                        : "Future utility; not included or running in this build.")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(EryloPalette.amber)
                         .fixedSize(horizontal: false, vertical: true)

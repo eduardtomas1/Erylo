@@ -32,7 +32,10 @@ Record at least one result for every row; “not available” needs a named owne
 ## Manual release checklist
 
 - Clean standard-user install from the real quarantined public download; validate hash, Developer ID, Hardened Runtime, Gatekeeper, notarization ticket, first offline launch, uninstall, and reinstall.
-- Calendar allow/deny/revoke and Apple Events allow/deny/revoke for every supported media adapter; confirm no permission appears before feature use.
+- Battery enable/disable/relaunch/reset at ordinary, charging, unplugged-low, and unavailable states; confirm the first ordinary snapshot stays quiet and no permission appears.
+- Volume enable/disable/relaunch/reset across built-in, USB, HDMI, Bluetooth, AirPlay, muted, unsupported-volume, disconnect, and default-output switches; confirm the initial current-output snapshot stays quiet and every later acknowledgement is bounded.
+- Sleep/wake and rapid audio-device-switch convergence with zero duplicate observers, stale HUD state, expiry tasks, or broker ownership after disable and quit.
+- Confirm Calendar, Apple Music, Spotify, File Hold, and local-integration controls remain unavailable and initiate no permission or integration work.
 - Disabled-provider zero-work check and collapsed idle Instruments Energy Log on a named reference Mac; record the internal CPU result without turning it into a public claim.
 - 60 Hz and 120 Hz motion with Reduce Motion both off and on; capture dropped frames and main-thread thumbnail/artwork work.
 - Fullscreen, Spaces, Stage Manager, scaling, mirroring, hot-plug, clamshell, screen lock, user switch, sleep/wake, and reboot.
@@ -40,3 +43,7 @@ Record at least one result for every row; “not available” needs a named owne
 - Verify the downloaded archive, published appcast, release notes, EdDSA metadata, and retained SHA-256 evidence all describe the same version/build and bytes.
 
 Unchecked rows are release blockers, not implied passes.
+
+No Battery or Volume hardware row has been executed for this change. Deterministic
+injected-source tests are evidence for lifecycle logic only, not a substitute for
+the manual checks above.

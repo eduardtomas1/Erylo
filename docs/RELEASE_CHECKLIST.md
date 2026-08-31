@@ -19,6 +19,7 @@ Operational commands and artifact boundaries are in [`RELEASE_RUNBOOK.md`](RELEA
 - [ ] The app requires neither root nor Full Disk Access; entitlements and Hardened Runtime exceptions are minimal and reviewed.
 - [ ] Each permission is requested contextually on first feature use, with an accurate explanation and a usable denial path.
 - [ ] Disabled providers perform zero CPU/network work and retain no permission-dependent work.
+- [ ] Battery and default-output Volume pass enable/restore/disable/reset/failure, sleep/wake, audio-device-switch, mute, unsupported-device, and terminal-shutdown validation with zero residual observers, expiry tasks, or broker ownership.
 - [ ] File Hold copy/reference semantics, bookmark scope, expiry, collision handling, failure cleanup, and deletion are verified without data loss.
 - [ ] Diagnostics export is user-initiated and redacted; crash reporting is opt-in; the privacy/support text matches shipped behavior.
 - [ ] URL schemes, App Intents, CLI, and per-user Unix-socket JSON inputs are authenticated or ownership-bounded, schema-validated, size/rate-bounded, and unable to execute arbitrary commands.

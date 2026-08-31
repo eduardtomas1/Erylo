@@ -363,8 +363,9 @@ package enum ActivityBrokerSubscriptionError: Error, Equatable, Sendable {
 /// Ordering is deterministic: higher priority first, then original submission sequence (FIFO),
 /// then canonical `source:identifier` lexical order as a defensive final tie-breaker.
 /// Replacing an existing identity preserves that sequence, so a same-priority update keeps its place.
-/// Each expiring identity owns exactly one cancellable one-shot task. A revision token prevents a
-/// cancelled or delayed task from expiring a newer replacement.
+/// Each current expiring revision owns one cancellable one-shot task. Retired tasks remain tracked
+/// until they physically finish, and a revision token prevents a delayed predecessor from expiring
+/// a newer replacement.
 public actor ActivityBroker {
     private struct Record: Sendable {
         var presented: PresentedActivity
@@ -377,15 +378,28 @@ public actor ActivityBroker {
         let continuation: AsyncStream<ActivityBrokerSnapshot>.Continuation
     }
 
+    private struct ExpiryTask: Sendable {
+        let identifier: UInt64
+        let identity: ActivityIdentity
+        let task: Task<Void, Never>
+    }
+
+    private struct RecordRemoval: Sendable {
+        let removed: Bool
+        let retiredTasks: [Task<Void, Never>]
+    }
+
     private let expirationScheduler: any ActivityExpirationScheduling
     public nonisolated let ownershipCoordinator: ActivityOwnershipCoordinator
     private var records: [ActivityIdentity: Record] = [:]
-    private var expiryTasks: [ActivityIdentity: Task<Void, Never>] = [:]
+    private var expiryTasks: [ActivityIdentity: ExpiryTask] = [:]
+    private var retiredExpiryTasks: [UInt64: ExpiryTask] = [:]
     private var subscribers: [UUID: Subscriber] = [:]
     private var nextSubmissionSequence: UInt64 = 0
     private var nextActivityRevision: UInt64 = 0
     private var nextSubscriberGeneration: UInt64 = 0
     private var nextOwnershipGeneration: UInt64 = 0
+    private var nextExpiryTaskIdentifier: UInt64 = 0
     private var ownershipGenerations: [ActivityIdentity: UInt64] = [:]
     private var version: UInt64 = 0
     private var isShutDown = false
@@ -398,7 +412,8 @@ public actor ActivityBroker {
     }
 
     deinit {
-        expiryTasks.values.forEach { $0.cancel() }
+        expiryTasks.values.forEach { $0.task.cancel() }
+        retiredExpiryTasks.values.forEach { $0.task.cancel() }
         subscribers.values.forEach { $0.continuation.finish() }
     }
 
@@ -444,7 +459,7 @@ public actor ActivityBroker {
         nextOwnershipGeneration += 1
         ownershipGenerations[identity] = nextOwnershipGeneration
         if records.removeValue(forKey: identity) != nil {
-            expiryTasks.removeValue(forKey: identity)?.cancel()
+            _ = retireExpiryTask(for: identity)
             _ = publishMutation()
         }
         return ActivityOwnershipLease(
@@ -515,7 +530,7 @@ public actor ActivityBroker {
         }
 
         let revision = allocateActivityRevision()
-        expiryTasks.removeValue(forKey: identity)?.cancel()
+        _ = retireExpiryTask(for: identity)
         records[identity] = Record(
             presented: PresentedActivity(
                 activity: activity,
@@ -543,6 +558,23 @@ public actor ActivityBroker {
         return removeRecord(identity)
     }
 
+    /// Package async witness used by mounted providers. The record mutation remains
+    /// atomic, then the caller joins every predecessor expiry task already retired
+    /// for this identity. A later successor is not part of this cleanup generation.
+    package func cancelAndWait(_ identity: ActivityIdentity) async -> Bool {
+        guard !isShutDown else {
+            await joinRetiredExpiryTasks(for: identity)
+            return false
+        }
+        ownershipCoordinator.invalidateClaims(for: identity)
+        ownershipGenerations.removeValue(forKey: identity)
+        let removal = removeRecordAndCollectRetiredTasks(identity)
+        for task in removal.retiredTasks {
+            _ = await task.value
+        }
+        return removal.removed
+    }
+
     /// Removes one identity only when it still has the caller-owned revision.
     /// The comparison and removal occur in this single actor-isolated operation,
     /// with no suspension point between them.
@@ -553,6 +585,24 @@ public actor ActivityBroker {
         ownershipCoordinator.invalidateClaims(for: identity)
         ownershipGenerations.removeValue(forKey: identity)
         return removeRecord(identity)
+    }
+
+    package func cancelAndWait(
+        _ identity: ActivityIdentity,
+        ifRevision revision: UInt64
+    ) async -> Bool {
+        guard !isShutDown else {
+            await joinRetiredExpiryTasks(for: identity)
+            return false
+        }
+        guard records[identity]?.presented.revision == revision else { return false }
+        ownershipCoordinator.invalidateClaims(for: identity)
+        ownershipGenerations.removeValue(forKey: identity)
+        let removal = removeRecordAndCollectRetiredTasks(identity)
+        for task in removal.retiredTasks {
+            _ = await task.value
+        }
+        return removal.removed
     }
 
     /// Removes the identity only while this lease remains the latest generation.
@@ -569,6 +619,30 @@ public actor ActivityBroker {
         return lease.withCleanupAdmission {
             removeRecord(identity)
         } ?? false
+    }
+
+    package func cancelAndWait(
+        _ identity: ActivityIdentity,
+        ifOwnedBy lease: ActivityOwnershipLease
+    ) async -> Bool {
+        guard !isShutDown else {
+            await joinRetiredExpiryTasks(for: identity)
+            return false
+        }
+        guard identity == lease.identity,
+              ownershipGenerations[identity] == lease.generation,
+              records[identity]?.ownershipGeneration == lease.generation else {
+            return false
+        }
+        guard let removal = lease.withCleanupAdmission({
+            removeRecordAndCollectRetiredTasks(identity)
+        }) else {
+            return false
+        }
+        for task in removal.retiredTasks {
+            _ = await task.value
+        }
+        return removal.removed
     }
 
     /// Atomically rejects an action that no longer belongs to the current broker revision.
@@ -590,7 +664,7 @@ public actor ActivityBroker {
         ownershipCoordinator.invalidateClaims(for: identity)
         ownershipGenerations.removeValue(forKey: identity)
         records.removeValue(forKey: identity)
-        expiryTasks.removeValue(forKey: identity)?.cancel()
+        _ = retireExpiryTask(for: identity)
         _ = publishMutation()
         return true
     }
@@ -654,7 +728,7 @@ public actor ActivityBroker {
     public func workState() -> ActivityBrokerWorkState {
         let ownershipWork = ownershipCoordinator.workState()
         return ActivityBrokerWorkState(
-            scheduledExpiryCount: expiryTasks.count,
+            scheduledExpiryCount: expiryTasks.count + retiredExpiryTasks.count,
             subscriberCount: subscribers.count,
             activeOwnershipCount: ownershipWork.retainedIdentityCount,
             pendingOwnershipIntentCount: ownershipWork.pendingIntentCount
@@ -664,12 +738,20 @@ public actor ActivityBroker {
     /// Terminal package boundary used by the process composition root. Admission
     /// closes before any suspension, then all one-shot and subscription work is joined.
     package func shutdown() async {
-        guard !isShutDown else { return }
+        guard !isShutDown else {
+            let tasks = retiredExpiryTasks.values.map(\.task)
+            for task in tasks {
+                _ = await task.value
+            }
+            return
+        }
         isShutDown = true
         ownershipCoordinator.shutDown()
 
-        let tasks = Array(expiryTasks.values)
-        expiryTasks.removeAll()
+        for identity in Array(expiryTasks.keys) {
+            _ = retireExpiryTask(for: identity)
+        }
+        let tasks = retiredExpiryTasks.values.map(\.task)
         records.removeAll()
         ownershipGenerations.removeAll()
 
@@ -684,15 +766,28 @@ public actor ActivityBroker {
 
     private func scheduleExpiry(for identity: ActivityIdentity, ttl: ActivityTTL, revision: UInt64) {
         let scheduler = expirationScheduler
-        expiryTasks[identity] = Task { [weak self] in
+        precondition(
+            nextExpiryTaskIdentifier < UInt64.max,
+            "ActivityBroker expiry task identifier space exhausted"
+        )
+        nextExpiryTaskIdentifier += 1
+        let taskIdentifier = nextExpiryTaskIdentifier
+        let task = Task { [weak self] in
             do {
                 try await scheduler.sleep(for: ttl.duration)
             } catch {
                 await self?.expiryStopped(identity, revision: revision)
+                await self?.expiryTaskFinished(taskIdentifier, identity: identity)
                 return
             }
             await self?.expire(identity, revision: revision)
+            await self?.expiryTaskFinished(taskIdentifier, identity: identity)
         }
+        expiryTasks[identity] = ExpiryTask(
+            identifier: taskIdentifier,
+            identity: identity,
+            task: task
+        )
     }
 
     private func expire(_ identity: ActivityIdentity, revision: UInt64) {
@@ -703,22 +798,58 @@ public actor ActivityBroker {
             ownershipGenerations.removeValue(forKey: identity)
         }
         records.removeValue(forKey: identity)
-        expiryTasks.removeValue(forKey: identity)
         _ = publishMutation()
     }
 
     @discardableResult
     private func removeRecord(_ identity: ActivityIdentity) -> Bool {
-        guard records.removeValue(forKey: identity) != nil else { return false }
-        expiryTasks.removeValue(forKey: identity)?.cancel()
-        _ = publishMutation()
-        return true
+        removeRecordAndCollectRetiredTasks(identity).removed
     }
 
     private func expiryStopped(_ identity: ActivityIdentity, revision: UInt64) {
         guard records[identity]?.expiryRevision == revision else { return }
         records[identity]?.expiryRevision = nil
-        expiryTasks.removeValue(forKey: identity)
+    }
+
+    private func removeRecordAndCollectRetiredTasks(
+        _ identity: ActivityIdentity
+    ) -> RecordRemoval {
+        let removed = records.removeValue(forKey: identity) != nil
+        _ = retireExpiryTask(for: identity)
+        let tasks = retiredExpiryTasks.values
+            .filter { $0.identity == identity }
+            .map(\.task)
+        if removed {
+            _ = publishMutation()
+        }
+        return RecordRemoval(removed: removed, retiredTasks: tasks)
+    }
+
+    /// Shutdown closes mutation admission before clearing records, but provider
+    /// cleanup can enter afterward. It still joins physical predecessor work for
+    /// its identity without attempting to mutate a record or ownership successor.
+    private func joinRetiredExpiryTasks(for identity: ActivityIdentity) async {
+        let tasks = retiredExpiryTasks.values
+            .filter { $0.identity == identity }
+            .map(\.task)
+        for task in tasks {
+            _ = await task.value
+        }
+    }
+
+    @discardableResult
+    private func retireExpiryTask(for identity: ActivityIdentity) -> Task<Void, Never>? {
+        guard let expiry = expiryTasks.removeValue(forKey: identity) else { return nil }
+        retiredExpiryTasks[expiry.identifier] = expiry
+        expiry.task.cancel()
+        return expiry.task
+    }
+
+    private func expiryTaskFinished(_ identifier: UInt64, identity: ActivityIdentity) {
+        if expiryTasks[identity]?.identifier == identifier {
+            expiryTasks.removeValue(forKey: identity)
+        }
+        retiredExpiryTasks.removeValue(forKey: identifier)
     }
 
     private func publishMutation() -> ActivityBrokerSnapshot {

@@ -32,6 +32,7 @@ private final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        runtime.applicationDidFinishLaunching()
         Task { @MainActor in
             await runtime.start()
         }

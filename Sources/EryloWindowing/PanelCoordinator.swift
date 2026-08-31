@@ -4,6 +4,15 @@ import EryloCore
 import EryloIntegrations
 import EryloSurface
 
+/// A read-only, event-derived snapshot for the selected display. Consumers read
+/// it on demand (for example, when a menu opens); the coordinator owns no polling.
+package enum SelectedSurfaceState: Equatable, Sendable {
+    case disabled
+    case temporarilyUnavailable
+    case hidden
+    case visible
+}
+
 @MainActor
 private final class PanelCoordinatorOwnedResources {
     let lifecycleEventSource: any PanelLifecycleEventSourcing
@@ -52,6 +61,24 @@ public final class PanelCoordinator {
         Set(panels.values.map(\.displayIdentity))
     }
 
+    package var selectedSurfaceState: SelectedSurfaceState {
+        guard policy.isEnabled else { return .disabled }
+        guard isRunning,
+              !isWorkspaceSleeping,
+              !isShutdown,
+              let selectedDisplayIdentity else {
+            return .temporarilyUnavailable
+        }
+
+        let displayID = CGDirectDisplayID(selectedDisplayIdentity.rawValue)
+        guard displaySnapshots[displayID] != nil else { return .temporarilyUnavailable }
+        guard let panel = panels[displayID] else { return .hidden }
+        let isVisible = (panel as? any PanelActivityVisibilityReporting)?
+            .isActivitySurfaceVisible
+            ?? presentedPanelIDs.contains(displayID)
+        return isVisible ? .visible : .hidden
+    }
+
     private let displayProvider: any EnabledDisplayProviding
     private let panelFactory: ActivityPanelPresentationFactory
     private let activityModel: SurfaceActivityModel
@@ -81,6 +108,7 @@ public final class PanelCoordinator {
     private var activityVisibilityHandler: (@MainActor @Sendable (Bool) -> Void)?
     private var lastReportedActivityVisibility = false
     private var focusTimerStartHandler: (@MainActor @Sendable (Int) -> Bool)?
+    private var primaryShortcutAdmissionHandler: (@MainActor @Sendable () -> Bool)?
 
     /// Preserves the original coordinator entry point with a stopped, zero-work activity model.
     public convenience init(
@@ -234,6 +262,7 @@ public final class PanelCoordinator {
         closeAllPanels()
         activityVisibilityHandler = nil
         focusTimerStartHandler = nil
+        primaryShortcutAdmissionHandler = nil
         finishTerminalCleanup()
     }
 
@@ -254,6 +283,12 @@ public final class PanelCoordinator {
             ($0 as? any PanelFocusTimerLaunching)?
                 .setFocusTimerStartHandler(handler)
         }
+    }
+
+    package func setPrimaryShortcutAdmissionHandler(
+        _ handler: (@MainActor @Sendable () -> Bool)?
+    ) {
+        primaryShortcutAdmissionHandler = handler
     }
 
     /// Source-compatible immediate policy request. Use `updateAndWait(policy:)`
@@ -415,6 +450,7 @@ public final class PanelCoordinator {
             guard !isWorkspaceSleeping else { return }
             updatePointer(screenPoint)
         case .primaryShortcut:
+            guard primaryShortcutAdmissionHandler?() != false else { return }
             _ = performPrimaryActionOnSelectedDisplay()
         }
     }

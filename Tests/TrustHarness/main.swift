@@ -237,6 +237,22 @@ private final class TrustHarness {
 
     private func verifyPromptFreePersistedRestore() async {
         do {
+            let emptyFixture = makeFixture(provider: TestLifecycleProvider())
+            let emptyRestore = await emptyFixture.coordinator.startEnabledModules()
+            check(
+                emptyRestore.isEmpty,
+                "legacy public restore keeps its empty result when no module is enabled"
+            )
+            _ = await emptyFixture.coordinator.stopAll()
+            let terminalRestore = await emptyFixture.coordinator.startEnabledModules()
+            check(
+                terminalRestore.count == 1
+                    && terminalRestore.first?.failure == .coordinatorShutDown,
+                "legacy public restore keeps its singleton terminal result after shutdown"
+            )
+        }
+
+        do {
             var persisted = EryloSettings.safeDefaults
             persisted.modules.battery = true
             persisted.modules.volume = true

@@ -34,13 +34,16 @@ package final class ApplicationRuntime {
     private let controlPlane: (any ApplicationControlPlaneOwning)?
     private let focusTimer: FocusTimerRuntimeService?
     private let requestApplicationTermination: @MainActor () -> Void
+    private let startupMeasurements: any ApplicationStartupMeasuring
     private var registeredServices: [any ApplicationRuntimeService] = []
     private var startedServices: [any ApplicationRuntimeService] = []
     private var admitsRegistrations = true
     private var startupTask: Task<Void, Never>?
+    private var restorationTask: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
     private var canCheckForUpdates = false
     private var isQuitRequested = false
+    private var didRecordApplicationLaunch = false
 
     package init(
         activityBroker: ActivityBroker,
@@ -49,6 +52,7 @@ package final class ApplicationRuntime {
         updateRuntime: UpdateRuntime,
         controlPlane: (any ApplicationControlPlaneOwning)? = nil,
         focusTimer: FocusTimerRuntimeService? = nil,
+        startupMeasurements: any ApplicationStartupMeasuring = ApplicationStartupSignposter(),
         requestApplicationTermination: @escaping @MainActor () -> Void = {}
     ) {
         self.activityBroker = activityBroker
@@ -57,7 +61,11 @@ package final class ApplicationRuntime {
         self.updateRuntime = updateRuntime
         self.controlPlane = controlPlane
         self.focusTimer = focusTimer
+        self.startupMeasurements = startupMeasurements
         self.requestApplicationTermination = requestApplicationTermination
+        panelCoordinator.setPrimaryShortcutAdmissionHandler { [weak self] in
+            self?.phase == .running
+        }
         if let focusTimer {
             panelCoordinator.setFocusTimerStartHandler { [weak focusTimer] minutes in
                 switch minutes {
@@ -72,6 +80,12 @@ package final class ApplicationRuntime {
                 }
             }
         }
+    }
+
+    package func applicationDidFinishLaunching() {
+        guard !didRecordApplicationLaunch else { return }
+        didRecordApplicationLaunch = true
+        startupMeasurements.record(.applicationDidFinishLaunching)
     }
 
     package static func production(
@@ -176,8 +190,13 @@ package final class ApplicationRuntime {
         phase = .shuttingDown
         let startupTask = startupTask
         startupTask?.cancel()
+        restorationTask?.cancel()
         let task = Task { @MainActor [self] in
             _ = await startupTask?.value
+            let restorationTask = restorationTask
+            restorationTask?.cancel()
+            _ = await restorationTask?.value
+            self.restorationTask = nil
             await performShutdown()
             shutdownTask = nil
         }
@@ -189,6 +208,13 @@ package final class ApplicationRuntime {
     /// Commands fail closed before startup and after shutdown begins.
     @discardableResult
     package func handle(_ command: ApplicationControlCommand) -> Bool {
+        if command == .quit {
+            guard phase == .starting || phase == .running else { return false }
+            guard !isQuitRequested else { return true }
+            isQuitRequested = true
+            requestApplicationTermination()
+            return true
+        }
         guard phase == .running else { return false }
         switch command {
         case .toggleSurface:
@@ -203,22 +229,34 @@ package final class ApplicationRuntime {
             return focusTimer?.requestCancel() == true
         case .showSettings:
             guard let controlPlane else { return false }
-            controlPlane.presentSettings()
-            return true
+            return controlPlane.presentSettings()
         case .checkForUpdates:
             guard canCheckForUpdates else { return false }
             return updateRuntime.checkForUpdates()
         case .quit:
-            guard !isQuitRequested else { return true }
-            isQuitRequested = true
-            requestApplicationTermination()
-            return true
+            return false
         }
     }
 
     private func performStartup() async {
         guard phase == .starting, !Task.isCancelled else { return }
         let initialDisplayPolicy = await controlPlane?.prepareForStartup()
+
+        guard phase == .starting, !Task.isCancelled else { return }
+        if let controlPlane,
+           controlPlane.installEarlyControls(
+               runtimeSnapshotProvider: { [weak self] in
+                   self?.runtimeControlSnapshot() ?? .starting
+               },
+               commandHandler: { [weak self] command in
+                   _ = self?.handle(command)
+               },
+               displayPolicyHandler: { [weak panelCoordinator] policy in
+                   panelCoordinator?.update(policy: policy)
+               }
+           ) {
+            startupMeasurements.record(.statusItemInstalled)
+        }
 
         guard phase == .starting, !Task.isCancelled else { return }
         if let initialDisplayPolicy {
@@ -236,36 +274,53 @@ package final class ApplicationRuntime {
             guard phase == .starting, !Task.isCancelled else { return }
         }
 
-        if let controlPlane {
-            await controlPlane.start(
-                canCheckForUpdates: canCheckForUpdates,
-                focusTimerContextProvider: { [weak focusTimer] in
-                    focusTimer?.menuContext(at: Date()) ?? .idle
-                },
-                commandHandler: { [weak self] command in
-                    _ = self?.handle(command)
-                },
-                displayPolicyHandler: { [weak panelCoordinator] policy in
-                    panelCoordinator?.update(policy: policy)
-                }
-            )
-        }
         guard phase == .starting, !Task.isCancelled else { return }
         phase = .running
+        beginPersistedModuleRestoration()
     }
 
     private func performShutdown() async {
+        await controlPlane?.shutdown()
         for service in startedServices.reversed() {
             await service.shutdown()
         }
         startedServices.removeAll()
         registeredServices.removeAll()
 
-        await controlPlane?.shutdown()
         await panelCoordinator.shutdown()
         await activityBroker.shutdown()
         updateRuntime.shutdown()
         canCheckForUpdates = false
         phase = .stopped
+    }
+
+    private func runtimeControlSnapshot() -> ApplicationRuntimeControlSnapshot {
+        let coreCommandsAreAdmitted = phase == .running
+        let focusCommandsAreAdmitted = coreCommandsAreAdmitted && focusTimer != nil
+        return ApplicationRuntimeControlSnapshot(
+            coreCommandsAreAdmitted: coreCommandsAreAdmitted,
+            focusCommandsAreAdmitted: focusCommandsAreAdmitted,
+            quitCommandIsAdmitted: phase == .starting || phase == .running,
+            canCheckForUpdates: coreCommandsAreAdmitted && canCheckForUpdates,
+            focusTimer: focusCommandsAreAdmitted
+                ? (focusTimer?.menuContext(at: Date()) ?? .idle)
+                : .idle,
+            surface: panelCoordinator.selectedSurfaceState
+        )
+    }
+
+    private func beginPersistedModuleRestoration() {
+        guard restorationTask == nil, let controlPlane else { return }
+        startupMeasurements.record(.restorationStarted)
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let didSettle = await controlPlane.restorePersistedModules()
+            guard !Task.isCancelled, self.phase == .running else { return }
+            if didSettle {
+                self.startupMeasurements.record(.restorationCompleted)
+            }
+            self.restorationTask = nil
+        }
+        restorationTask = task
     }
 }

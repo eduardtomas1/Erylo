@@ -92,6 +92,8 @@ probe_package_symbol EryloAppRuntime SystemGlanceRuntimeError
 probe_package_symbol EryloAppRuntime SystemGlanceModuleProviderFactory
 probe_package_symbol EryloAppRuntime PowerGlanceLifecycleAdapter
 probe_package_symbol EryloAppRuntime VolumeGlanceLifecycleAdapter
+probe_package_symbol EryloAppRuntime ProductionUtility
+probe_package_symbol EryloAppRuntime ProductionCapabilities
 probe_package_symbol \
     EryloGlance \
     GlanceActivationEventRelay \
@@ -100,8 +102,16 @@ probe_package_symbol \
 
 control_source="Sources/EryloAppRuntime/ApplicationControlPlane.swift"
 composition_source="Sources/EryloAppRuntime/ApplicationRuntime.swift"
+manifest_source="Sources/EryloAppRuntime/ProductionCapabilities.swift"
 volume_source="Sources/EryloGlance/GlanceEventSources.swift"
-app_runtime_sources=(Sources/EryloAppRuntime/*.swift)
+app_runtime_sources=()
+while IFS= read -r -d '' source; do
+    app_runtime_sources+=("$source")
+done < <(/usr/bin/find Sources/EryloAppRuntime -type f -name '*.swift' -print0)
+[[ "${#app_runtime_sources[@]}" -gt 0 ]] || {
+    printf 'ERROR: EryloAppRuntime source set is empty.\n' >&2
+    exit 1
+}
 
 count_occurrences() {
     local needle="$1"
@@ -203,14 +213,21 @@ expect_assertion_failure providerAllowlist \
 
 assert_source_contains \
     "$control_source" \
-    'availableModules: [.battery, .volume]' \
+    'availableModules: ProductionCapabilities.settingsModules' \
+    || exit 1
+assert_source_contains \
+    "$manifest_source" \
+    'package static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer, .volume]' \
     || exit 1
 assert_source_contains \
     "$composition_source" \
     'ApplicationControlPlane.production(activityBroker: activityBroker)' \
     || exit 1
 expect_assertion_failure availableModules \
-    assert_source_contains "$control_source" 'availableModules: [.battery]'
+    assert_source_contains "$control_source" 'availableModules: [.battery, .volume]'
+expect_assertion_failure productionCapabilities \
+    assert_source_contains "$manifest_source" \
+        'package static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer]'
 expect_assertion_failure sharedActivityBroker \
     assert_source_contains "$composition_source" \
         'ApplicationControlPlane.production(activityBroker: ActivityBroker())'

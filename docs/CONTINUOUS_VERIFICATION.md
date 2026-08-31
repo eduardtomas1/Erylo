@@ -31,10 +31,14 @@ timeout below 15 minutes:
 - `PR target / EryloUpdateTests`
 - `PR target / EryloAppRuntimeTests`
 
-`Swift build` preserves the warnings-as-errors contract across every product.
-`API surface` preserves all three repository-owned public-surface checks, including
-independent package-access probes for every Battery/Volume composition type and a
-closed provider scan across the complete app-runtime source set. Each test
+`Repository controls` remains Linux-portable and owns repository hygiene plus
+scanner regressions. `Swift build` preserves the warnings-as-errors contract
+across every product. The required macOS `API surface` job additionally proves
+that the SwiftPM-derived shipping source closure equals the compiler-input policy
+and runs compiler-syntax permission validation. It also preserves all three
+repository-owned public-surface checks, including independent package-access
+probes for every Battery/Volume composition type and a closed provider scan
+across the complete app-runtime source set. Each test
 target gets its own cold checkout and build so one slow or stuck harness cannot
 consume the entire pull-request verification window. Target compilation uses
 two workers, then exits SwiftPM before launching the built executable so the
@@ -53,7 +57,7 @@ contract.
 
 `nightly-verification.yml` runs daily at 03:17 UTC and supports manual dispatch.
 It proves that the release-shard manifest is the same ordered, duplicate-free
-set as the executable harness phases and that their expected counts sum to 548.
+set as the executable harness phases and that their expected counts sum to 587.
 The resulting 17-way matrix runs every phase in a separate clean checkout. Each
 release shard has a 900-second command deadline inside a 17-minute job deadline;
 the outer owner reports the exact timeout/cancellation classification and uses

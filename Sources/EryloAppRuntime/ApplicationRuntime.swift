@@ -93,6 +93,10 @@ package final class ApplicationRuntime {
         requestApplicationTermination: @escaping @MainActor () -> Void
     ) -> ApplicationRuntime {
         let activityBroker = ActivityBroker()
+        precondition(
+            ProductionCapabilities.mounts(.focusTimer),
+            "Focus Timer must remain in the reviewed production capability set"
+        )
         let focusTimer = FocusTimerRuntimeService(broker: activityBroker)
         let activityModel: SurfaceActivityModel
         let panelCoordinator: PanelCoordinator

@@ -45,6 +45,17 @@ trap 'release_remove_path "$repo_root" "$temp_dir"' EXIT
     || release_die "application is not signed with a Developer ID Application identity"
 /usr/bin/grep -Eq '^flags=.*runtime' "$temp_dir/details.err" \
     || release_die "application signature does not enable Hardened Runtime"
+actual_team_id="$(/usr/bin/sed -nE 's/^TeamIdentifier=([A-Z0-9]{10})$/\1/p' \
+    "$temp_dir/details.err")"
+[[ "$actual_team_id" =~ ^[A-Z0-9]{10}$ ]] \
+    || release_die "application signature TeamIdentifier is missing or invalid"
+if [[ "${ERYLO_RELEASE_EXPECTED_TEAM_ID+x}" == x ]]; then
+    expected_team_id="$ERYLO_RELEASE_EXPECTED_TEAM_ID"
+    [[ "$expected_team_id" =~ ^[A-Z0-9]{10}$ ]] \
+        || release_die "expected Developer ID team identifier is invalid"
+    [[ "$actual_team_id" == "$expected_team_id" ]] \
+        || release_die "application signature TeamIdentifier does not match the selected identity"
+fi
 
 /usr/bin/codesign --display --entitlements :- "$app" >"$temp_dir/entitlements.plist" 2>"$temp_dir/entitlements.err"
 [[ -s "$temp_dir/entitlements.plist" ]] || release_die "signed entitlements could not be extracted"

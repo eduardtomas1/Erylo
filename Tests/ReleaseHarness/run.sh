@@ -14,7 +14,7 @@ release_capture_toolchain 0
 release_harness_shard="${1:-all}"
 release_harness_manifest="Tests/ReleaseHarness/shards.tsv"
 if [[ "$release_harness_shard" == all ]]; then
-    release_harness_expected_checks=548
+    release_harness_expected_checks=587
 else
     release_harness_expected_checks="$(/usr/bin/awk -F '\t' -v shard="$release_harness_shard" \
         '$1 == shard { print $2 }' "$release_harness_manifest")"
@@ -1662,6 +1662,8 @@ release_harness_phase build-artifact
 if [[ "$release_harness_shard" != all ]]; then
     prepare_hostile_path_fixture
 fi
+check "reviewed compiler inputs equal the exact transitive Erylo product source closure" \
+    /usr/bin/ruby Scripts/release/validate-compiler-input-policy.rb "$repo_root"
 /usr/bin/env PATH="$hostile_path:/usr/bin:/bin:/usr/sbin:/sbin" Scripts/release/build-app.sh
 check "closed production PATH and pinned interpreter execute no shadow build tool" \
     test ! -e "$hostile_path_marker"
@@ -1949,6 +1951,28 @@ if [[ "$release_harness_shard" == all ]]; then
 else
     assemble_compiled_fixture --output "$default_app"
 fi
+ambient_source_root="$test_root/caller-selected-source"
+/bin/mkdir -p "$ambient_source_root"
+expect_failure_with_stderr \
+    "standalone bundle validation rejects an ambient source-root redirect" \
+    ambient-source-validate-app \
+    "ambient release source root is not permitted outside an authenticated snapshot" \
+    /usr/bin/env ERYLO_RELEASE_SOURCE_ROOT="$ambient_source_root" \
+        Scripts/release/validate-app.sh "$default_app"
+ambient_assembler=(Scripts/release/assemble-app.sh)
+if [[ "$release_harness_shard" != all ]]; then
+    ambient_assembler+=(
+        --binary "$fixture_binary"
+        --framework "$fixture_framework"
+        --toolchain "$fixture_toolchain"
+    )
+fi
+expect_failure_with_stderr \
+    "standalone assembly rejects an ambient source-root redirect" \
+    ambient-source-assemble \
+    "ambient release source root is not permitted outside an authenticated snapshot" \
+    /usr/bin/env ERYLO_RELEASE_SOURCE_ROOT="$ambient_source_root" \
+        "${ambient_assembler[@]}" --output "$test_root/ambient-source/Erylo.app"
 release_harness_queue_background_success \
     "default bundle passes deterministic validation" default-bundle-valid 720 \
     Scripts/release/validate-app.sh "$default_app"
@@ -1959,17 +1983,224 @@ release_harness_queue_background_failure \
 plist="$default_app/Contents/Info.plist"
 check "bundle identifier matches release metadata" test "$(plutil -extract CFBundleIdentifier raw -o - "$plist")" = "com.erylo.Erylo"
 check "bundle is an agent application" test "$(plutil -extract LSUIElement raw -o - "$plist")" = "true"
-apple_events_usage="Erylo reads current playback and now-playing details when you refresh media, and sends playback commands only when you use media controls."
-check "Apple Events usage copy discloses explicit reads and commands without background monitoring" \
-    test "$(plutil -extract NSAppleEventsUsageDescription raw -o - "$plist")" = "$apple_events_usage"
-tampered_apple_events_app="$test_root/tampered-apple-events-copy/Erylo.app"
-/usr/bin/ditto "$default_app" "$tampered_apple_events_app"
-/usr/bin/plutil -replace NSAppleEventsUsageDescription -string \
-    "Erylo sends playback commands to supported media apps only when you use media controls." \
-    "$tampered_apple_events_app/Contents/Info.plist"
-release_harness_queue_background_failure \
-    "bundle validation rejects incomplete Apple Events usage disclosure" \
-    incomplete-apple-events-copy 720 Scripts/release/validate-app.sh "$tampered_apple_events_app"
+while IFS=$'\t' read -r privacy_key privacy_fixture; do
+    check "$privacy_key is absent from the production bundle" bash -c '
+        ! /usr/bin/plutil -extract "$2" raw -o - "$1" >/dev/null 2>&1
+      ' _ "$plist" "$privacy_key"
+    tampered_privacy_app="$test_root/tampered-${privacy_fixture}/Erylo.app"
+    /usr/bin/ditto "$default_app" "$tampered_privacy_app"
+    /usr/bin/plutil -insert "$privacy_key" -string \
+        "Injected release-harness usage description." \
+        "$tampered_privacy_app/Contents/Info.plist"
+    release_harness_queue_background_failure \
+        "bundle validation rejects unreviewed $privacy_key" \
+        "unreviewed-${privacy_fixture}" 720 \
+        Scripts/release/validate-app.sh "$tampered_privacy_app"
+done <<'PRIVACY_KEYS'
+NSAppleEventsUsageDescription	apple-events-usage
+NSAppleMusicUsageDescription	apple-music-usage
+NSCalendarsFullAccessUsageDescription	calendar-full-access-usage
+NSCalendarsUsageDescription	calendar-legacy-usage
+NSCalendarsWriteOnlyAccessUsageDescription	calendar-write-only-usage
+NSMediaLibraryUsageDescription	media-library-usage
+PRIVACY_KEYS
+
+permission_policy_fixture="$test_root/production-permission-policy"
+/bin/mkdir -p \
+    "$permission_policy_fixture/Config" \
+    "$permission_policy_fixture/Resources/App"
+/bin/cp Config/ProductionCapabilities.json "$permission_policy_fixture/Config/ProductionCapabilities.json"
+/bin/cp Config/ReleaseCompilerInputs.txt "$permission_policy_fixture/Config/ReleaseCompilerInputs.txt"
+/bin/cp Resources/App/Info.plist.in "$permission_policy_fixture/Resources/App/Info.plist.in"
+/bin/cp Resources/App/Erylo.entitlements "$permission_policy_fixture/Resources/App/Erylo.entitlements"
+/usr/bin/ditto Sources "$permission_policy_fixture/Sources"
+check "reviewed production capability policy matches the isolated composition fixture" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+printf 'package func unreviewedCalendarHelper() { _ = CalendarGlanceProvider.self }\n' > \
+    "$permission_policy_fixture/Sources/EryloGlance/UnreviewedCalendarHelper.swift"
+expect_failure_with_stderr \
+    "capability-module source changes require an explicit reviewed digest update" \
+    capability-module-source-digest \
+    "reviewed capability module source digest differs" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/rm "$permission_policy_fixture/Sources/EryloGlance/UnreviewedCalendarHelper.swift"
+permission_manifest="$permission_policy_fixture/Sources/EryloAppRuntime/ProductionCapabilities.swift"
+permission_manifest_backup="$test_root/ProductionCapabilities.valid.swift"
+/bin/cp "$permission_manifest" "$permission_manifest_backup"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    canonical = "package static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer, .volume]"
+    replacement = <<~SWIFT.chomp
+      private static let validatorDecoy = #/package static let mountedUtilities Set ProductionUtility battery focusTimer volume package/#
+          package static var mountedUtilities: Set<ProductionUtility> { [.battery, .volume] }
+    SWIFT
+    data.sub!(canonical, replacement) or abort("typed manifest fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_manifest"
+expect_failure_with_stderr \
+    "regex literals cannot impersonate the runtime capability manifest" \
+    regex-production-capability-manifest \
+    "production mounted-utility declaration must be one static let" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_manifest_backup" "$permission_manifest"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    canonical = "package static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer, .volume]"
+    replacement = <<~SWIFT.chomp
+      #if false
+          #{canonical}
+          package static let inactiveSentinel = 0
+          #endif
+          package static var mountedUtilities: Set<ProductionUtility> { [.battery, .volume] }
+    SWIFT
+    data.sub!(canonical, replacement) or abort("typed manifest fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_manifest"
+expect_failure_with_stderr \
+    "inactive conditional declarations cannot impersonate the runtime capability manifest" \
+    inactive-production-capability-manifest \
+    "production mounted-utility declaration" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_manifest_backup" "$permission_manifest"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    canonical = "package static let mountedUtilities: Set<ProductionUtility> = [.battery, .focusTimer, .volume]"
+    data.sub!(canonical, "package static let mountedUtilities: Set<ProductionUtility> = [.") \
+      or abort("typed manifest fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_manifest"
+expect_failure_with_stderr \
+    "compiler parse admission rejects malformed production capability syntax" \
+    malformed-production-capability-manifest \
+    "does not parse as Swift" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_manifest_backup" "$permission_manifest"
+bracket_permission_fixture="$test_root/production-permission-policy[review]"
+/usr/bin/ditto "$permission_policy_fixture" "$bracket_permission_fixture"
+check "permission validation treats glob metacharacters in a valid root literally" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$bracket_permission_fixture"
+permission_policy_backup="$test_root/ProductionCapabilities.valid.json"
+/bin/cp "$permission_policy_fixture/Config/ProductionCapabilities.json" "$permission_policy_backup"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    data.sub!(%Q{"schemaVersion": 2}, %Q{"schemaVersion": 0,\n  "schemaVersion": 2}) \
+      or abort("schema fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_policy_fixture/Config/ProductionCapabilities.json"
+expect_failure_with_stderr \
+    "duplicate policy keys fail closed instead of selecting one value" \
+    duplicate-permission-policy-key \
+    "production capability policy contains a duplicate key" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_policy_backup" "$permission_policy_fixture/Config/ProductionCapabilities.json"
+/usr/bin/ruby -e '
+    path = ARGV.fetch(0)
+    data = File.binread(path)
+    data.sub!(%Q{"schemaVersion": 2}, %Q{"schemaVersion": 2.0}) \
+      or abort("schema fixture marker missing")
+    File.binwrite(path, data)
+  ' "$permission_policy_fixture/Config/ProductionCapabilities.json"
+expect_failure_with_stderr \
+    "non-integer policy schema values fail closed" \
+    noninteger-permission-policy-schema \
+    "production capability policy schema is unsupported" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_policy_backup" "$permission_policy_fixture/Config/ProductionCapabilities.json"
+permission_runtime="$permission_policy_fixture/Sources/EryloAppRuntime/ApplicationRuntime.swift"
+permission_runtime_backup="$test_root/ApplicationRuntime.valid.swift"
+/bin/cp "$permission_runtime" "$permission_runtime_backup"
+printf '\n// CalendarGlanceProvider and EventKitCalendarEventSource are inert prose.\n' >> \
+    "$permission_runtime"
+printf 'private let inertCalendarCopy = "CalendarGlanceProvider EventKitCalendarEventSource"\n' >> \
+    "$permission_runtime"
+check "comments and strings cannot impersonate a mounted utility" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+printf '\nprivate let importDecoy = """\nimport EryloGlance\n"""\n' >> \
+    "$permission_runtime"
+printf 'private func escapedImportBypass() async {\n' >> \
+    "$permission_runtime"
+printf '    let `import`: EryloGlance = .init(broker: activityBroker)\n' >> \
+    "$permission_runtime"
+printf '    await `import`.calendar.enable()\n}\n' >> \
+    "$permission_runtime"
+expect_failure_with_stderr \
+    "an escaped import identifier cannot hide the public Calendar wrapper" \
+    escaped-import-calendar-wrapper \
+    "mounted utility set differs from the reviewed allowlist" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_runtime_backup" "$permission_runtime"
+printf '\n#if os(macOS)\nprivate func conditionalCalendarWrapperBypass() {\n' >> \
+    "$permission_runtime"
+printf '    _ = EryloGlance.self\n}\n#endif\n' >> "$permission_runtime"
+expect_failure_with_stderr \
+    "active conditional compilation cannot hide the public Calendar wrapper" \
+    conditional-calendar-wrapper \
+    "mounted utility set differs from the reviewed allowlist" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_runtime_backup" "$permission_runtime"
+printf '\nprivate func directMediaExecutionBypass() async {\n' >> \
+    "$permission_runtime"
+printf '    let executor = ProcessMediaScriptExecutor()\n' >> \
+    "$permission_runtime"
+printf '    let request = MediaScriptRequest(route: .appleMusicPlay)\n' >> \
+    "$permission_runtime"
+printf '    _ = try? await executor.execute(request)\n}\n' >> \
+    "$permission_runtime"
+expect_failure_with_stderr \
+    "production composition cannot call the public media script executor directly" \
+    direct-media-execution-seam \
+    "production composition uses a direct media execution seam" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/cp "$permission_runtime_backup" "$permission_runtime"
+permission_nested_runtime="$permission_policy_fixture/Sources/EryloAppRuntime/Nested"
+/bin/mkdir -p "$permission_nested_runtime"
+printf 'import EventKit\nprivate let nestedCalendarStore = EKEventStore()\n' > \
+    "$permission_nested_runtime/CalendarBypass.swift"
+expect_failure_with_stderr \
+    "nested production sources cannot hide direct Calendar access" \
+    nested-calendar-source \
+    "mounted utility set differs from the reviewed allowlist" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/bin/rm "$permission_nested_runtime/CalendarBypass.swift"
+/bin/rmdir "$permission_nested_runtime"
+printf '// bare-CR comment\rprivate let injectedCalendarSource: EventKitCalendarEventSource = .init()\n' >> \
+    "$permission_runtime"
+expect_failure_with_stderr \
+    "a mounted Calendar composition after a bare CR requires an explicit policy update" \
+    unreviewed-calendar-mount \
+    "mounted utility set differs from the reviewed allowlist" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
+/usr/bin/ruby -rjson -e '
+    path = ARGV.fetch(0)
+    policy = JSON.parse(File.read(path))
+    policy.fetch("mountedUtilities") << "calendar"
+    policy.fetch("mountedUtilities").sort!
+    File.write(path, JSON.pretty_generate(policy) + "\n")
+  ' "$permission_policy_fixture/Config/ProductionCapabilities.json"
+expect_failure_with_stderr \
+    "a mounted Calendar policy change cannot omit its reviewed declaration allowlist" \
+    incomplete-calendar-permission-policy \
+    "privacy usage-description allowlist does not match mounted utilities" \
+    /usr/bin/ruby Scripts/release/validate-production-permissions.rb \
+        repository "$permission_policy_fixture"
 check "automatic Sparkle checks are disabled" test "$(plutil -extract SUEnableAutomaticChecks raw -o - "$plist")" = "false"
 check "missing optional plist keys produce no diagnostic payload" bash -c '
     source Scripts/release/lib.sh
@@ -2218,12 +2449,76 @@ release_harness_drain_background_assertions
 fi
 if release_harness_runs output-boundaries; then
 release_harness_phase output-boundaries
+check "Developer ID identity parsing yields the exact selected team" bash -c '
+    source Scripts/release/lib.sh
+    [[ "$(release_developer_id_team_id "Developer ID Application: Erylo Release (ABCDE12345)")" == ABCDE12345 ]]
+  '
+expect_failure_with_stderr \
+    "Developer ID identity parsing rejects a missing team suffix" \
+    missing-developer-team \
+    "identity must exactly match Developer ID Application: ORGANIZATION (TEAMID)" \
+    bash -c 'source Scripts/release/lib.sh; release_developer_id_team_id "$1"' \
+        _ "Developer ID Application: Erylo Release"
+expect_failure_with_stderr \
+    "Developer ID identity parsing rejects a noncanonical team identifier" \
+    noncanonical-developer-team \
+    "identity must exactly match Developer ID Application: ORGANIZATION (TEAMID)" \
+    bash -c 'source Scripts/release/lib.sh; release_developer_id_team_id "$1"' \
+        _ "Developer ID Application: Erylo Release (abcde12345)"
 bad_entitlements="$test_root/bad.entitlements"
 /bin/cp Resources/App/Erylo.entitlements "$bad_entitlements"
 /usr/libexec/PlistBuddy -c 'Add :com.apple.security.network.server bool true' "$bad_entitlements"
-expect_failure "entitlement denylist rejects network server capability" bad-entitlements \
+expect_failure "entitlement allowlist rejects network server capability" bad-entitlements \
     Scripts/release/validate-entitlements.sh "$bad_entitlements"
+apple_events_entitlements="$test_root/apple-events.entitlements"
+/bin/cp Resources/App/Erylo.entitlements "$apple_events_entitlements"
+/usr/libexec/PlistBuddy -c 'Add :com.apple.security.automation.apple-events bool true' \
+    "$apple_events_entitlements"
+expect_failure "entitlement allowlist rejects unmounted Apple Events automation" \
+    apple-events-entitlements Scripts/release/validate-entitlements.sh "$apple_events_entitlements"
+calendar_entitlements="$test_root/calendar.entitlements"
+/bin/cp Resources/App/Erylo.entitlements "$calendar_entitlements"
+/usr/libexec/PlistBuddy -c 'Add :com.apple.security.personal-information.calendars bool true' \
+    "$calendar_entitlements"
+expect_failure "entitlement allowlist rejects unmounted Calendar access" \
+    calendar-entitlements Scripts/release/validate-entitlements.sh "$calendar_entitlements"
+temporary_apple_events_entitlements="$test_root/temporary-apple-events.entitlements"
+/bin/cp Resources/App/Erylo.entitlements "$temporary_apple_events_entitlements"
+/usr/libexec/PlistBuddy -c 'Add :com.apple.security.temporary-exception.apple-events array' \
+    "$temporary_apple_events_entitlements"
+expect_failure "entitlement allowlist rejects temporary Apple Events exceptions" \
+    temporary-apple-events-entitlements \
+    Scripts/release/validate-entitlements.sh "$temporary_apple_events_entitlements"
 check "reviewed entitlements remain minimal" Scripts/release/validate-entitlements.sh Resources/App/Erylo.entitlements
+expect_failure_with_stderr \
+    "standalone entitlement validation rejects an ambient source-root redirect" \
+    ambient-source-entitlements \
+    "ambient release source root is not permitted outside an authenticated snapshot" \
+    /usr/bin/env ERYLO_RELEASE_SOURCE_ROOT="$test_root/caller-selected-source" \
+        Scripts/release/validate-entitlements.sh Resources/App/Erylo.entitlements
+signed_entitlements="$test_root/signed.entitlements"
+/bin/cp Resources/App/Erylo.entitlements "$signed_entitlements"
+check "Developer ID signed output retains the reviewed empty entitlement set" \
+    Scripts/release/validate-entitlements.sh --signed "$signed_entitlements"
+/usr/libexec/PlistBuddy -c \
+    'Add :com.apple.developer.team-identifier string ABCDE12345' "$signed_entitlements"
+/usr/libexec/PlistBuddy -c \
+    'Add :com.apple.application-identifier string ABCDE12345.com.erylo.Erylo' "$signed_entitlements"
+expect_failure_with_stderr \
+    "signature metadata cannot appear as signed capability entitlements" \
+    signature-metadata-in-signed-entitlements \
+    "unreviewed entitlement present" \
+    Scripts/release/validate-entitlements.sh --signed "$signed_entitlements"
+expect_failure_with_stderr \
+    "signature metadata cannot appear in unsigned capability input" \
+    signature-metadata-in-unsigned-entitlements \
+    "unreviewed entitlement present" \
+    Scripts/release/validate-entitlements.sh "$signed_entitlements"
+expect_failure_with_stderr \
+    "signed output still rejects capability entitlement drift" \
+    signed-network-entitlement \
+    "unreviewed entitlement present" \
+    Scripts/release/validate-entitlements.sh --signed "$bad_entitlements"
 
 secret_app="$test_root/secret/Erylo.app"
 /bin/mkdir -p "$secret_app/Contents/Resources"

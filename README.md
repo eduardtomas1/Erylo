@@ -143,7 +143,10 @@ disappears.
 
 These are the complete live utilities today. The screenshots show native
 production-surface renders; Battery and Volume still require the manual hardware
-validation listed in the compatibility matrix before a signed release.
+validation listed in the compatibility matrix before a signed release. Because
+none of these three utilities needs protected-data access or app automation, the
+production bundle declares no privacy usage descriptions and requests no
+capability entitlement.
 
 ## What Erylo is growing into
 

@@ -16,8 +16,8 @@ Operational commands and artifact boundaries are in [`RELEASE_RUNBOOK.md`](RELEA
 
 ## Privacy, permissions, and integrations
 
-- [ ] The app requires neither root nor Full Disk Access; entitlements and Hardened Runtime exceptions are minimal and reviewed.
-- [ ] Each permission is requested contextually on first feature use, with an accurate explanation and a usable denial path.
+- [ ] The typed mounted-utility set and canonical capability-module source hashes match `Config/ProductionCapabilities.json`; the SwiftPM-derived recursive source closure for product `Erylo` exactly matches `Config/ReleaseCompilerInputs.txt`; Focus Timer, Battery, and Volume have no privacy usage descriptions or capability entitlements, and signing leaves that entitlement set unchanged. The team derived from the explicitly selected Developer ID identity is checked separately against signature metadata.
+- [ ] The app requires neither root nor Full Disk Access; entitlements and Hardened Runtime exceptions are minimal and reviewed. Any future permission-bearing mount updates composition, declaration allowlists, accurate explanation, denial behavior, and perturbation tests together.
 - [ ] Disabled providers perform zero CPU/network work and retain no permission-dependent work.
 - [ ] Battery and default-output Volume pass enable/restore/disable/reset/failure, sleep/wake, audio-device-switch, mute, unsupported-device, and terminal-shutdown validation with zero residual observers, expiry tasks, or broker ownership.
 - [ ] File Hold copy/reference semantics, bookmark scope, expiry, collision handling, failure cleanup, and deletion are verified without data loss.
@@ -34,10 +34,10 @@ Operational commands and artifact boundaries are in [`RELEASE_RUNBOOK.md`](RELEA
 
 ## Signing, notarization, and Sparkle 2
 
-- [ ] Developer ID identity, App Store Connect API key, Sparkle private key, notary credentials, and keychains come from approved secret storage and never enter source, logs, artifacts, or diagnostics.
+- [ ] The explicitly selected identity exactly matches `Developer ID Application: ORGANIZATION (TEAMID)` with a ten-character uppercase alphanumeric team ID; the worker derives that ID from the selector, and signing plus every later signature check require the app's exact `TeamIdentifier`. Developer ID identity, App Store Connect API key, Sparkle private key, notary credentials, and keychains come from approved secret storage and never enter source, logs, artifacts, or diagnostics.
 - [ ] The archive is built from the tagged commit with the expected bundle ID, version, entitlements, Hardened Runtime, and designated requirement.
 - [ ] `dsymutil` ran before Swift build objects were cleaned, every dSYM UUID matches the release executable, and the atomic `0600` dSYM/manifest/checksum set is retained under its immutable commit-qualified private directory outside publishable artifacts.
-- [ ] The app and every nested executable/framework pass `codesign --verify --deep --strict --verbose=2` and `spctl --assess --type execute --verbose=4`.
+- [ ] The app and every nested executable/framework pass `codesign --verify --deep --strict --verbose=2` and `spctl --assess --type execute --verbose=4`; the app's `TeamIdentifier` still equals the team derived from the explicitly selected Developer ID identity after signing, notarization, stapling, and final archive verification.
 - [ ] The submitted artifact is notarized, stapled, and passes `xcrun stapler validate`; a clean Mac validates first launch offline after Gatekeeper assessment.
 - [ ] Sparkle 2 feed URL, HTTPS transport, EdDSA signature, version ordering, minimum OS, phased behavior (if used), and release notes are verified from the published feed.
 - [ ] The public appcast config requires a signed feed and pre-extraction verification; effective Info.plist, persisted, argument-domain, and managed Sparkle preferences cannot enable automatic checks/downloads or system profiling; the manual check remains user-initiated; unused XPC services remain disabled.

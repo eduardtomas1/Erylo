@@ -44,10 +44,6 @@
     <true/>
     <key>LSUIElement</key>
     <true/>
-    <key>NSAppleEventsUsageDescription</key>
-    <string>Erylo reads current playback and now-playing details when you refresh media, and sends playback commands only when you use media controls.</string>
-    <key>NSCalendarsFullAccessUsageDescription</key>
-    <string>Erylo reads upcoming events only when Next Meeting is enabled so it can show your next event.</string>
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSPrincipalClass</key>

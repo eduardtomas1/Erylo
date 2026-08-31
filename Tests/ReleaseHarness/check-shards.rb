@@ -2,7 +2,7 @@
 
 require "json"
 
-EXPECTED_TOTAL = 548
+EXPECTED_TOTAL = 587
 manifest = File.expand_path("shards.tsv", __dir__)
 rows = []
 File.readlines(manifest, chomp: true).each do |line|
@@ -56,6 +56,17 @@ abort "output-boundaries must remain fixture-free" if output_body.match?(/^\s+pr
 end
 release_library = File.read(File.expand_path("../../Scripts/release/lib.sh", __dir__))
 build_script = File.read(File.expand_path("../../Scripts/release/build-app.sh", __dir__))
+release_worker = File.read(File.expand_path("../../Scripts/release/release-worker.sh", __dir__))
+app_signer = File.read(File.expand_path("../../Scripts/release/sign-app.sh", __dir__))
+signature_verifier = File.read(File.expand_path("../../Scripts/release/verify-signature.sh", __dir__))
+abort "release worker must bind every signature stage to the explicitly selected Developer ID team" \
+  unless release_worker.include?('expected_team_id="$(release_developer_id_team_id "$identity")"') &&
+    release_worker.include?('export ERYLO_RELEASE_EXPECTED_TEAM_ID="$expected_team_id"')
+abort "signing and verification must both check exact TeamIdentifier metadata" \
+  unless app_signer.include?("TeamIdentifier") &&
+    app_signer.include?("ERYLO_RELEASE_EXPECTED_TEAM_ID") &&
+    signature_verifier.include?("TeamIdentifier") &&
+    signature_verifier.include?("ERYLO_RELEASE_EXPECTED_TEAM_ID")
 abort "production staging and compiled fixtures must share the release-product builder" \
   unless build_script.include?("release_build_swift_product") &&
     harness.include?("release_build_swift_product")

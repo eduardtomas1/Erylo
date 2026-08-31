@@ -10,6 +10,7 @@ source "$script_dir/lib.sh"
 
 repo_root="$(release_repo_root)"
 cd "$repo_root"
+source_root="$(release_validated_source_root "$repo_root")"
 
 require_updater=false
 post_staple=false
@@ -82,12 +83,16 @@ otool_tool="$(release_developer_tool_path otool)"
 
 metadata_file="$(release_repo_file "$repo_root" "Config/ReleaseVersion.env")"
 entitlements_file="$(release_repo_file "$repo_root" "Resources/App/Erylo.entitlements")"
+permissions_validator="$(release_repo_file "$repo_root" "Scripts/release/validate-production-permissions.rb")"
 erylo_license="$(release_repo_file "$repo_root" "LICENSE")"
 third_party_notices="$(release_repo_file "$repo_root" "Resources/App/ThirdPartyNotices.txt")"
 executable_name="$(release_metadata_value "$metadata_file" EXECUTABLE_NAME)"
 binary="$app/Contents/MacOS/$executable_name"
 framework="$app/Contents/Frameworks/Sparkle.framework"
 toolchain_manifest="$app/Contents/Resources/Toolchain.json"
+
+/usr/bin/ruby "$permissions_validator" bundle "$source_root" "$plist" >/dev/null \
+    || release_die "bundle permission declarations do not match production composition"
 
 [[ -f "$binary" && -x "$binary" && ! -L "$binary" ]] || release_die "main executable is missing or unsafe"
 [[ -d "$app/Contents/Resources" && ! -L "$app/Contents/Resources" ]] || release_die "Resources directory is missing or unsafe"
@@ -214,8 +219,6 @@ assert_plist_equals EryloToolchainSHA256 "$toolchain_sha256"
 assert_plist_equals LSApplicationCategoryType public.app-category.utilities
 assert_plist_equals LSMinimumSystemVersion "$(release_metadata_value "$metadata_file" MINIMUM_SYSTEM_VERSION)"
 assert_plist_equals LSUIElement true
-assert_plist_equals NSAppleEventsUsageDescription "Erylo reads current playback and now-playing details when you refresh media, and sends playback commands only when you use media controls."
-assert_plist_equals NSCalendarsFullAccessUsageDescription "Erylo reads upcoming events only when Next Meeting is enabled so it can show your next event."
 assert_plist_equals SUAllowsAutomaticUpdates false
 assert_plist_equals SUAutomaticallyUpdate false
 assert_plist_equals SUEnableAutomaticChecks false

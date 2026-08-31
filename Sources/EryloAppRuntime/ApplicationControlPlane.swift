@@ -447,7 +447,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             settingsOwner: settingsOwner,
             diagnosticsExporter: diagnosticsExporter,
             presenter: NativeApplicationControlPresenter(),
-            availableModules: [.battery, .volume],
+            availableModules: ProductionCapabilities.settingsModules,
             makeDisplayChoices: {
                 let snapshots = SystemDisplayProvider().enabledDisplays()
                 var externalIndex = 0

@@ -51,6 +51,8 @@ done
 
 [[ -n "$identity" && -n "$keychain_profile" && -n "$appcast_config" && -n "$icon" ]] \
     || release_die "identity, Keychain profile, signed appcast config, and reviewed icon are required"
+expected_team_id="$(release_developer_id_team_id "$identity")"
+export ERYLO_RELEASE_EXPECTED_TEAM_ID="$expected_team_id"
 
 source_root="${ERYLO_RELEASE_SOURCE_ROOT}"
 # Repeat source/upstream admission after parsing and before staging mutation.

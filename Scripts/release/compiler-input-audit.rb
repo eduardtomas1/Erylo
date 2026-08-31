@@ -28,7 +28,8 @@ def expected_manifest(repository, commit, tree)
   paths = policy_bytes.lines(chomp: true)
   abort("compiler input policy is empty or unsorted") if paths.empty? || paths != paths.sort || paths.uniq != paths
   abort("compiler input policy has a noncanonical path") unless paths.all? do |path|
-    path == "Package.swift" || /\ASources\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\.swift\z/.match?(path)
+    path == "Package.swift" ||
+      /\ASources\/[A-Za-z0-9._-]+\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.swift\z/.match?(path)
   end
   inputs = paths.map do |path|
     _bytes, object_id, sha256 = canonical_blob(repository, commit, path)

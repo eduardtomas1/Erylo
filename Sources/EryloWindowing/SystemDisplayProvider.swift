@@ -57,7 +57,10 @@ public final class SystemDisplayProvider: EnabledDisplayProviding {
     }
 
     private static func displayUUID(for displayID: CGDirectDisplayID) -> DisplayUUID? {
-        guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID) else { return nil }
+        guard let unmanagedUUID = CGDisplayCreateUUIDFromDisplayID(displayID) else { return nil }
+        // The Core Graphics function follows the Create Rule and hands Swift an
+        // owning Unmanaged reference on current SDKs.
+        let uuid = unmanagedUUID.takeRetainedValue()
         let value = CFUUIDCreateString(nil, uuid) as String
         return DisplayUUID(rawValue: value)
     }

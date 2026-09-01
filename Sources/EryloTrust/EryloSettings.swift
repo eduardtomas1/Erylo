@@ -400,7 +400,7 @@ private struct LegacySettingsV2: Decodable {
 
     let schemaVersion: Int
     let modules: ModulePreferences
-    let displays: LegacyDisplayPreferences
+    private let displays: LegacyDisplayPreferences
     let motion: MotionPreference
     let fullscreenBehavior: FullscreenBehavior
     let launchAtLogin: Bool

@@ -811,8 +811,10 @@ private struct FoundationHarness {
         reduceMotionModel.updateReduceMotion(true)
         reduceMotionModel.send(.primaryAction)
         check(
-            reduceMotionScheduler.lastScheduledDelay == .milliseconds(120),
-            "Reduce Motion uses the crossfade/scale completion duration"
+            reduceMotionScheduler.activeOperationCount == 0
+                && reduceMotionModel.isHitRegionSettled
+                && reduceMotionModel.interactionHitRegion == reduceMotionModel.layout.hitRegion,
+            "Reduce Motion snaps visual geometry and native hit testing without scheduled work"
         )
 
         let notchedDisplay = DisplayGeometry(
@@ -1228,12 +1230,12 @@ private struct FoundationHarness {
         for _ in 0..<2_000 where eventSource.isPointerMonitoringEnabled { await Task.yield() }
         check(!eventSource.isPointerMonitoringEnabled, "final activity hide tears down pointer monitors")
         check(registry.creationCount == 3, "final hide retains the bounded constructed panel set")
-        let retainedMainPanel = registry.latestPanel(for: main.identity)
-        let retainedShowCount = retainedMainPanel?.showCount
+        let retainedSelectedPanel = registry.latestPanel(for: replacement.identity)
+        let retainedShowCount = retainedSelectedPanel?.showCount
         eventSource.emit(.primaryShortcut)
         check(
-            retainedMainPanel?.showCount == retainedShowCount.map { $0 + 1 },
-            "one shortcut re-presents a retained plain presenter after final activity hide"
+            retainedSelectedPanel?.showCount == retainedShowCount.map { $0 + 1 },
+            "one shortcut re-presents the retained selected presenter after final activity hide"
         )
         check(eventSource.isPointerMonitoringEnabled, "plain-presenter shortcut restores pointer monitoring")
         eventSource.emit(.primaryShortcut)
@@ -1362,10 +1364,11 @@ private struct FoundationHarness {
         let request: (String) -> ActivityRequest = { identifier in
             ActivityRequest(
                 identifier: identifier,
-                source: ActivitySource.timer.rawValue,
-                kind: ActivityKind.timer.rawValue,
+                source: ActivitySource.external.rawValue,
+                kind: ActivityKind.generic.rawValue,
                 priority: 50,
-                title: identifier
+                title: identifier,
+                detail: "Inspect result"
             )
         }
 
@@ -1390,12 +1393,15 @@ private struct FoundationHarness {
             _ = await broker.cancel(identity)
         }
         for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
-        check(panel.state == .expanded, "activity expiry preserves deliberate expanded demand")
-        check(panel.isPresented && panel.hideCount == 0, "coordinator does not order out an expanded empty surface")
-        check(events.isPointerMonitoringEnabled, "expanded empty surface retains pointer monitoring")
+        check(panel.state == .hidden, "activity expiry removes a stale expanded composition")
+        check(!panel.isPresented && panel.hideCount == 1, "coordinator orders out the expired empty surface")
+        check(!events.isPointerMonitoringEnabled, "expired expanded content releases pointer monitoring")
         events.emit(.primaryShortcut)
-        check(panel.state == .hidden && !panel.isPresented, "one shortcut hides the still-present expanded empty surface")
-        check(!events.isPointerMonitoringEnabled, "expanded contraction removes final pointer monitoring")
+        check(panel.state == .compact && panel.isPresented, "one shortcut reveals the retained compact surface")
+        check(events.isPointerMonitoringEnabled, "revealed compact surface restores pointer monitoring")
+        events.emit(.primaryShortcut)
+        check(panel.state == .hidden && !panel.isPresented, "second shortcut hides the retained empty surface")
+        check(!events.isPointerMonitoringEnabled, "empty surface contraction removes final pointer monitoring")
 
         do {
             _ = try await broker.submit(request("drop-exit"))

@@ -7,7 +7,23 @@ package enum ExpandedMouseDownDecision: Equatable, Sendable {
     case dismiss
 }
 
+package enum PanelEscapeDecision: Equatable, Sendable {
+    case ignore
+    case dismissPresentation
+    case retireKeyFocus
+}
+
 package enum DeliberatePanelFocusPolicy {
+    package static func shouldFocusExistingControls(
+        state: PanelPresentationState,
+        isWindowPresented: Bool,
+        hasExplicitControls: Bool
+    ) -> Bool {
+        isWindowPresented
+            && hasExplicitControls
+            && (state == .compact || state == .peek)
+    }
+
     package static func shouldRequestKey(
         from oldState: PanelPresentationState,
         to newState: PanelPresentationState,
@@ -56,8 +72,13 @@ package struct ExpandedInteractionPolicy: Equatable, Sendable {
         return hitRegion.contains(localPoint) ? .keepOpen : .dismiss
     }
 
-    package func shouldHandleEscape(panelIsKey: Bool) -> Bool {
-        isWindowPresented && state == .expanded && panelIsKey
+    package func escapeDecision(panelIsKey: Bool) -> PanelEscapeDecision {
+        guard isWindowPresented, panelIsKey else { return .ignore }
+        if state == .expanded { return .dismissPresentation }
+        if hasExplicitControls, state == .compact || state == .peek {
+            return .retireKeyFocus
+        }
+        return .ignore
     }
 }
 

@@ -21,6 +21,16 @@ package struct PanelDeliberateFocusDestination: Equatable, Sendable {
     }
 }
 
+package enum PanelFocusableControl: Hashable, Sendable {
+    case focusTimerPreset(Int)
+    case completionDone
+}
+
+package struct PanelControlFocusRequest: Equatable, Sendable {
+    package let control: PanelFocusableControl
+    package let revision: UInt64
+}
+
 @MainActor
 private final class PanelSurfaceOwnedResources {
     let activityModel: SurfaceActivityModel
@@ -62,6 +72,7 @@ public final class PanelSurfaceModel {
     public private(set) var isHitRegionSettled = true
     public let metrics: PanelMetrics
     public let activityModel: SurfaceActivityModel
+    package private(set) var deliberateControlFocusRequest: PanelControlFocusRequest? = nil
 
     @ObservationIgnored
     public var didChange: (@MainActor @Sendable () -> Void)?
@@ -74,6 +85,9 @@ public final class PanelSurfaceModel {
 
     @ObservationIgnored
     private let ownedResources: PanelSurfaceOwnedResources
+
+    @ObservationIgnored
+    private var nextControlFocusRevision: UInt64 = 0
 
     private var pendingHoverOperation: (any ScheduledOperation)? {
         get { ownedResources.pendingHoverOperation }
@@ -271,6 +285,19 @@ public final class PanelSurfaceModel {
             state: state,
             current: activityModel.current
         )
+    }
+
+    package func requestDeliberateControlFocus() {
+        guard let control = preferredFocusableControl else { return }
+        nextControlFocusRevision &+= 1
+        deliberateControlFocusRequest = PanelControlFocusRequest(
+            control: control,
+            revision: nextControlFocusRevision
+        )
+    }
+
+    package func retireDeliberateControlFocus() {
+        deliberateControlFocusRequest = nil
     }
 
     public var accessibility: PanelSurfaceAccessibility {
@@ -790,6 +817,18 @@ public final class PanelSurfaceModel {
 
     private var currentSurfaceItem: ActivitySurfaceItem? {
         activityModel.current.map(ActivitySurfaceItem.init)
+    }
+
+    private var preferredFocusableControl: PanelFocusableControl? {
+        if showsFocusTimerLauncher(in: state) {
+            return .focusTimerPreset(25)
+        }
+        guard isCompletionAcknowledgement,
+              (state == .compact || state == .peek),
+              activityModel.currentAction?.intent == .dismiss else {
+            return nil
+        }
+        return .completionDone
     }
 
     private var isCompletionAcknowledgement: Bool {

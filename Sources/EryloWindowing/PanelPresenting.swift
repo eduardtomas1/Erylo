@@ -49,6 +49,14 @@ package protocol PanelFocusTimerLaunching: AnyObject {
     )
 }
 
+/// A deliberate shortcut may focus controls that are already on screen without
+/// also invoking the surface's semantic primary action.
+@MainActor
+package protocol PanelExistingControlFocusing: AnyObject {
+    @discardableResult
+    func focusExistingControls() -> Bool
+}
+
 /// Native panels distinguish lifecycle retirement from a user-visible demand
 /// contraction. Sleep must never wait for the outgoing surface animation.
 @MainActor

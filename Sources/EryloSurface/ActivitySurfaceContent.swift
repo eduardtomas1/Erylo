@@ -407,9 +407,9 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
             }
             return false
         case .expanded:
-            action != nil
+            return action != nil
         case .hidden, .dropTarget:
-            false
+            return false
         }
     }
 

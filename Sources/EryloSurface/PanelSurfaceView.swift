@@ -6,6 +6,7 @@ public struct PanelSurfaceView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Namespace private var continuityNamespace
+    @FocusState private var focusedControl: PanelFocusableControl?
 
     private let model: PanelSurfaceModel
 
@@ -157,6 +158,9 @@ public struct PanelSurfaceView: View {
         .animation(surfaceAnimation, value: model.geometryAnimationKey)
         .onChange(of: reduceMotion, initial: true) { _, newValue in
             model.updateReduceMotion(newValue)
+        }
+        .onChange(of: model.deliberateControlFocusRequest) { _, request in
+            focusedControl = request?.control
         }
         .onDisappear {
             model.cancelPendingInteractions()
@@ -389,6 +393,7 @@ public struct PanelSurfaceView: View {
                     .accessibilityLabel("Start \(minutes)-minute Focus Timer")
                     .accessibilityHint(SurfaceStrings.focusTimerLauncherHint)
                     .accessibilityIdentifier("erylo.focus-timer.launcher-\(minutes)")
+                    .focused($focusedControl, equals: .focusTimerPreset(minutes))
                 }
             }
             .padding(3)
@@ -713,6 +718,7 @@ public struct PanelSurfaceView: View {
                 .accessibilityHint(SurfaceStrings.dismissCompletionHint)
                 .accessibilityIdentifier("erylo.focus-timer.completion-done")
                 .accessibilitySortPriority(1)
+                .focused($focusedControl, equals: .completionDone)
             }
         }
         .padding(.horizontal, expanded ? 22 : 16)
@@ -1343,6 +1349,8 @@ private struct SurfaceSignalLine: View {
 }
 
 private struct QuietSurfaceActionButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
     let reduceMotion: Bool
 
     func makeBody(configuration: Configuration) -> some View {
@@ -1350,7 +1358,9 @@ private struct QuietSurfaceActionButtonStyle: ButtonStyle {
             .labelStyle(.titleAndIcon)
             .font(.system(size: 11, weight: .medium))
             .foregroundStyle(
-                configuration.isPressed
+                !isEnabled
+                    ? EryloPalette.mist.opacity(0.48)
+                    : configuration.isPressed
                     ? EryloPalette.cloud
                     : EryloPalette.mist
             )
@@ -1358,7 +1368,11 @@ private struct QuietSurfaceActionButtonStyle: ButtonStyle {
             .padding(.horizontal, 9)
             .background(
                 Capsule(style: .continuous)
-                    .fill(EryloPalette.cloud.opacity(configuration.isPressed ? 0.1 : 0.05))
+                    .fill(
+                        EryloPalette.cloud.opacity(
+                            !isEnabled ? 0.025 : configuration.isPressed ? 0.1 : 0.05
+                        )
+                    )
             )
             .scaleEffect(!reduceMotion && configuration.isPressed ? 0.98 : 1)
             .animation(
@@ -1369,13 +1383,15 @@ private struct QuietSurfaceActionButtonStyle: ButtonStyle {
 }
 
 private struct SurfaceActionButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
     let tint: Color
     let reduceMotion: Bool
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 11, weight: .semibold))
-            .foregroundStyle(EryloPalette.cloud)
+            .foregroundStyle(EryloPalette.cloud.opacity(isEnabled ? 1 : 0.48))
             .frame(minHeight: 28)
             .padding(.horizontal, 14)
             .background(
@@ -1383,11 +1399,11 @@ private struct SurfaceActionButtonStyle: ButtonStyle {
                     .fill(
                         configuration.isPressed
                             ? tint.opacity(0.28)
-                            : tint.opacity(0.16)
+                            : tint.opacity(isEnabled ? 0.16 : 0.06)
                     )
                     .overlay {
                         Capsule(style: .continuous)
-                            .stroke(tint.opacity(0.34), lineWidth: 0.5)
+                            .stroke(tint.opacity(isEnabled ? 0.34 : 0.12), lineWidth: 0.5)
                     }
             )
             .opacity(configuration.isPressed ? 0.86 : 1)

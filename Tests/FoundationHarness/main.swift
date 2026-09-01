@@ -119,6 +119,27 @@ private struct FoundationHarness {
             "rounded-region boundary is interactive"
         )
 
+        let notchlessLauncher = PanelLayout(
+            display: display,
+            state: .compact,
+            showsFocusTimerLauncher: true
+        )
+        check(
+            notchlessLauncher.surfaceFrame.size
+                == PanelMetrics.feasibility.notchlessTimerLauncherSize,
+            "notchless Focus Timer launcher uses its compact control-bearing footprint"
+        )
+        check(
+            notchlessLauncher.surfaceFrame.size == CGSize(width: 300, height: 44)
+                && notchlessLauncher.surfaceTopInset == 8,
+            "notchless Focus Timer launcher stays one native control row below the menu bar"
+        )
+        check(
+            notchlessLauncher.cornerRadius == 19
+                && notchlessLauncher.hitRegion.contains(notchlessLauncher.surfaceFrame.center),
+            "notchless Focus Timer launcher keeps a bounded continuous pill hit region"
+        )
+
         let peek = PanelLayout(display: display, state: .peek)
         let expanded = PanelLayout(display: display, state: .expanded)
         let dropTarget = PanelLayout(display: display, state: .dropTarget)
@@ -159,6 +180,30 @@ private struct FoundationHarness {
         check(notched.surfaceFrame.height == 74, "notch height expands compact surface")
         check(notched.topCornerRadius == 6, "compact notch shoulders use the smallest top curl")
         check(notched.surfaceContentTopInset == 0, "compact content remains in the notch wings")
+
+        let notchedLauncherDisplay = DisplayGeometry(
+            frame: display.frame,
+            visibleFrame: display.visibleFrame,
+            backingScaleFactor: display.backingScaleFactor,
+            topEdgeOcclusion: TopEdgeOcclusion(
+                frame: CGRect(x: 720, y: 906, width: 220, height: 44)
+            )
+        )
+        let notchedLauncher = PanelLayout(
+            display: notchedLauncherDisplay,
+            state: .compact,
+            showsFocusTimerLauncher: true
+        )
+        check(
+            notchedLauncher.surfaceFrame.size == PanelMetrics.feasibility.timerLauncherSize,
+            "notched Focus Timer launcher preserves its camera-safe 316 by 88 geometry"
+        )
+        check(
+            notchedLauncher.surfaceContentTopInset == 44
+                && notchedLauncher.surfaceFrame.height
+                    - notchedLauncher.surfaceContentTopInset == 44,
+            "notched Focus Timer launcher keeps one full control row below the physical occlusion"
+        )
 
         let bodyReservedPeek = PanelLayout(
             display: notchedDisplay,
@@ -388,7 +433,7 @@ private struct FoundationHarness {
                 "\(state.rawValue) owns no outside-click monitors"
             )
             check(
-                !policy.shouldHandleEscape(panelIsKey: true),
+                policy.escapeDecision(panelIsKey: true) == .ignore,
                 "\(state.rawValue) ignores Escape dismissal"
             )
         }
@@ -406,8 +451,8 @@ private struct FoundationHarness {
             )
             check(
                 !controlled.requiresMouseDownMonitoring
-                    && !controlled.shouldHandleEscape(panelIsKey: true),
-                "control-bearing \(state.rawValue) does not inherit Expanded dismissal behavior"
+                    && controlled.escapeDecision(panelIsKey: true) == .retireKeyFocus,
+                "control-bearing \(state.rawValue) retires key focus without invoking its action"
             )
         }
 
@@ -434,11 +479,11 @@ private struct FoundationHarness {
             "clicks beyond the current native hit region dismiss Expanded"
         )
         check(
-            expanded.shouldHandleEscape(panelIsKey: true),
+            expanded.escapeDecision(panelIsKey: true) == .dismissPresentation,
             "Escape dismisses when Expanded owns key interaction"
         )
         check(
-            !expanded.shouldHandleEscape(panelIsKey: false),
+            expanded.escapeDecision(panelIsKey: false) == .ignore,
             "Escape does not act when another window owns key interaction"
         )
         check(

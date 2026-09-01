@@ -10,6 +10,7 @@ public struct PanelMetrics: Equatable, Sendable {
     public let notchHorizontalPadding: CGFloat
     public let notchlessTopInset: CGFloat
     public let timerLauncherSize: CGSize
+    public let notchlessTimerLauncherSize: CGSize
 
     public init(
         maximumSize: CGSize,
@@ -19,7 +20,8 @@ public struct PanelMetrics: Equatable, Sendable {
         dropTargetSize: CGSize,
         notchHorizontalPadding: CGFloat,
         notchlessTopInset: CGFloat = 0,
-        timerLauncherSize: CGSize = CGSize(width: 316, height: 88)
+        timerLauncherSize: CGSize = CGSize(width: 316, height: 88),
+        notchlessTimerLauncherSize: CGSize = CGSize(width: 300, height: 44)
     ) {
         self.maximumSize = maximumSize
         self.compactSize = compactSize
@@ -29,6 +31,7 @@ public struct PanelMetrics: Equatable, Sendable {
         self.notchHorizontalPadding = notchHorizontalPadding
         self.notchlessTopInset = notchlessTopInset
         self.timerLauncherSize = timerLauncherSize
+        self.notchlessTimerLauncherSize = notchlessTimerLauncherSize
     }
 
     public static let feasibility = PanelMetrics(
@@ -39,7 +42,8 @@ public struct PanelMetrics: Equatable, Sendable {
         dropTargetSize: CGSize(width: 404, height: 180),
         notchHorizontalPadding: 30,
         notchlessTopInset: 8,
-        timerLauncherSize: CGSize(width: 316, height: 88)
+        timerLauncherSize: CGSize(width: 316, height: 88),
+        notchlessTimerLauncherSize: CGSize(width: 300, height: 44)
     )
 }
 
@@ -325,7 +329,9 @@ public struct PanelLayout: Equatable, Sendable {
         minimumNotchBodyHeight: CGFloat
     ) -> CGSize {
         var size = if state == .compact && showsFocusTimerLauncher {
-            metrics.timerLauncherSize
+            display.topEdgeOcclusion == nil
+                ? metrics.notchlessTimerLauncherSize
+                : metrics.timerLauncherSize
         } else {
             switch state {
         case .hidden:

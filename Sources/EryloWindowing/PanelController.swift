@@ -115,7 +115,7 @@ package enum DeliberatePanelFocusLeasePolicy {
 @MainActor
 final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     PanelPresentationDemandReporting, PanelFocusTimerLaunching,
-    PanelImmediateEnvironmentalHiding {
+    PanelImmediateEnvironmentalHiding, PanelExistingControlFocusing {
     let directDisplayID: CGDirectDisplayID
 
     var displayIdentity: DisplayIdentity {
@@ -294,6 +294,19 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         }
     }
 
+    func focusExistingControls() -> Bool {
+        guard DeliberatePanelFocusPolicy.shouldFocusExistingControls(
+            state: model.state,
+            isWindowPresented: isVisible,
+            hasExplicitControls: model.logicalContentHasExplicitControls
+        ) else {
+            return false
+        }
+        pendingDeliberateKeyRequest = model.deliberateFocusDestination
+        fulfillPendingDeliberateKeyRequestIfReady()
+        return true
+    }
+
     func performVisibilityToggle() {
         model.send(model.state == .hidden ? .show : .hide)
     }
@@ -325,7 +338,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         panel.isReleasedWhenClosed = false
         panel.ignoresMouseEvents = true
         panel.escapeDismissalHandler = { [weak self] in
-            self?.dismissExpandedSurfaceForEscape() ?? false
+            self?.handleEscape() ?? false
         }
     }
 
@@ -427,6 +440,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         }
         self.pendingDeliberateKeyRequest = nil
         panel.makeKeyAndOrderFront(nil)
+        model.requestDeliberateControlFocus()
     }
 
     private func synchronizeExpandedInteraction() {
@@ -455,11 +469,20 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         model.send(.dismiss)
     }
 
-    private func dismissExpandedSurfaceForEscape() -> Bool {
-        guard expandedInteractionPolicy.shouldHandleEscape(panelIsKey: panel.isKeyWindow) else {
+    private func handleEscape() -> Bool {
+        switch expandedInteractionPolicy.escapeDecision(panelIsKey: panel.isKeyWindow) {
+        case .ignore:
             return false
+        case .dismissPresentation:
+            model.send(.dismiss)
+        case .retireKeyFocus:
+            // Ordering the surface out is the supported AppKit route for
+            // retiring a nonactivating key panel. The current activity remains
+            // in the broker, so hiding a completion never acknowledges Done.
+            model.send(.hide)
         }
-        model.send(.dismiss)
+        pendingDeliberateKeyRequest = nil
+        model.retireDeliberateControlFocus()
         return true
     }
 

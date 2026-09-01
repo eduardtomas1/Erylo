@@ -13,6 +13,8 @@ signal surface at the top edge of the display.
 - Unavailable utilities and controls are absent from production UI.
 - Every visible affordance must work. Never mount placeholder drag targets,
   disabled roadmap modules, or controls whose preference is not applied.
+- Custom controls must expose a visibly quieter disabled state; pressed styling
+  alone is not a complete native interaction contract.
 
 ## Signature device
 
@@ -55,6 +57,10 @@ Do not force every activity through a symbol-title-detail-progress-card template
 
 ### Focus Timer
 
+- Deliberate idle launcher: `316 × 88` on a notched display so one 44-point
+  control row remains below the camera housing; `300 × 44` on a notchless
+  display so the same controls occupy one compact native row. Do not reuse the
+  camera-safe height on an external display.
 - Compact: timer symbol, live remaining time, and progress signal.
 - Hover does not create a larger copy of the same countdown.
 - Expanded: 42–48 pt remaining time, quiet "Focus" context, progress signal,
@@ -118,14 +124,18 @@ Do not force every activity through a symbol-title-detail-progress-card template
   interaction; automatic completion never requests focus. Pointer-driven
   expansion stays nonactivating. A deliberate `Control-Command-E` route waits
   for geometry and hit testing to settle before making a control-bearing panel
-  key.
+  key. When Compact or Peek already contains controls, the shortcut focuses the
+  preferred existing control instead of invoking the surface primary action;
+  completion therefore focuses **Done** without acknowledging it.
 - Expanded alone owns paired local/global mouse-down monitors. A click outside
   its current exact AppKit hit region collapses it; inside clicks pass through
   unchanged to the intended action. The monitors are removed on every collapse,
   hide, close, and release. There is no global keyboard monitor or Accessibility
   permission dependency.
-- Click toggles expansion. Escape collapses only while Expanded owns key
-  interaction.
+- Click toggles expansion. Escape collapses Expanded. In key-capable Compact or
+  Peek it hides the keyed panel through normal AppKit ordering so the prior app
+  regains input; it never dispatches **Done** or another child action, and a
+  hidden completion remains unacknowledged in the broker.
 - Hover enters Peek only when a standard activity adds distinct detail. A click
   expands only when the destination adds detail, queue context, or a real action.
   Passive system acknowledgements ignore both transitions. Escape and outside

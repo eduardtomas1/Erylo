@@ -131,8 +131,8 @@ jobs:
           .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
           shopt -s nullglob
           surface_visual_files=("$ERYLO_VISUAL_QA_DIRECTORY"/*.png)
-          if (( ${#surface_visual_files[@]} != 14 )); then
-            echo "Expected exactly 14 native surface QA images; found ${#surface_visual_files[@]}." >&2
+          if (( ${#surface_visual_files[@]} != 15 )); then
+            echo "Expected exactly 15 native surface QA images; found ${#surface_visual_files[@]}." >&2
             exit 1
           fi
           expected_surface_visual_names=(
@@ -145,6 +145,7 @@ jobs:
             erylo-timer-expanded-light-desktop.png
             erylo-timer-expanded.png
             erylo-timer-launcher.png
+            erylo-timer-launcher-notchless.png
             erylo-volume-muted-notched.png
             erylo-volume-muted-notchless.png
             erylo-volume-output-notched.png

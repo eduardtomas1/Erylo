@@ -32,6 +32,7 @@ enum SurfaceHarnessMain {
         harness.verifyStateContentAccessibilityAndPreviews()
         await harness.verifyFocusTimerProjectionAndLauncher()
         await harness.verifyProductInteractionSemantics()
+        await harness.verifyKeyboardFocusAndEscapeSemantics()
         await harness.verifyTemporalProjectionPhysicalVisibility()
         harness.verifyWindowTransitionStaging()
         harness.verifyReduceMotionAndRapidStateChanges()
@@ -3358,6 +3359,126 @@ private struct SurfaceHarness {
         await broker.shutdown()
     }
 
+    mutating func verifyKeyboardFocusAndEscapeSemantics() async {
+        check(
+            DeliberatePanelFocusPolicy.shouldFocusExistingControls(
+                state: .peek,
+                isWindowPresented: true,
+                hasExplicitControls: true
+            ),
+            "visible completion controls use the focus route instead of the semantic primary action"
+        )
+        check(
+            !DeliberatePanelFocusPolicy.shouldFocusExistingControls(
+                state: .peek,
+                isWindowPresented: true,
+                hasExplicitControls: false
+            ),
+            "passive Peek content remains outside deliberate key focus"
+        )
+
+        let compactPolicy = ExpandedInteractionPolicy(
+            state: .compact,
+            isWindowPresented: true,
+            hitRegion: .empty,
+            hasExplicitControls: true
+        )
+        let peekPolicy = ExpandedInteractionPolicy(
+            state: .peek,
+            isWindowPresented: true,
+            hitRegion: .empty,
+            hasExplicitControls: true
+        )
+        check(
+            compactPolicy.escapeDecision(panelIsKey: true) == .retireKeyFocus
+                && peekPolicy.escapeDecision(panelIsKey: true) == .retireKeyFocus,
+            "Escape retires key-capable Compact and Peek without invoking their controls"
+        )
+        check(
+            peekPolicy.escapeDecision(panelIsKey: false) == .ignore,
+            "a passive non-key Peek never intercepts Escape"
+        )
+
+        do {
+            let completion = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.timerCompletion,
+                displayGeometry: makeDisplaySnapshot(identity: 73).geometry,
+                scheduler: ManualOneShotScheduler()
+            )
+            let completionIdentity = completion.activityModel.current?.activity.identity
+            completion.requestDeliberateControlFocus()
+            check(
+                completion.deliberateControlFocusRequest?.control == .completionDone
+                    && completion.state == .peek
+                    && completion.activityModel.current?.activity.identity == completionIdentity,
+                "requesting completion focus targets Done without acknowledging or contracting it"
+            )
+            completion.retireDeliberateControlFocus()
+            check(
+                completion.deliberateControlFocusRequest == nil
+                    && completion.activityModel.current?.activity.identity == completionIdentity,
+                "retiring completion focus preserves the pending acknowledgement"
+            )
+            completion.send(.hide)
+            check(
+                completion.state == .hidden
+                    && completion.activityModel.current?.activity.identity == completionIdentity,
+                "Escape-style hiding orders out completion without acknowledging Done"
+            )
+        } catch {
+            recordUnexpected(error, context: "completion keyboard focus")
+        }
+
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
+        let displays = FakeDisplayProvider(displays: [
+            makeDisplaySnapshot(identity: 74, isMain: true),
+        ])
+        let events = FakeLifecycleEventSource()
+        let registry = SharedModelPanelRegistry()
+        let coordinator = makeCoordinator(
+            displays: displays,
+            events: events,
+            registry: registry,
+            model: activityModel
+        )
+        await coordinator.startAndWait()
+        do {
+            let submitted = try await broker.submit(
+                request(
+                    id: "shortcut-completion",
+                    priority: 90,
+                    title: "Focus complete",
+                    actionIdentifier: "timer.dismiss-completion",
+                    actionLabel: "Done",
+                    actionIntent: .dismiss,
+                    presentationRole: .completionAcknowledgement
+                )
+            )
+            check(
+                await waitUntil {
+                    activityModel.snapshotVersion == submitted.version
+                        && registry.latestOpenPanel?.state == .peek
+                },
+                "completion shortcut fixture reaches a visible Peek"
+            )
+            let panel = registry.latestOpenPanel
+            events.emitCurrent(.primaryShortcut)
+            check(
+                panel?.focusExistingControlsCount == 1
+                    && panel?.primaryActionCount == 0
+                    && panel?.state == .peek
+                    && activityModel.current?.activity.identity
+                        == submitted.current?.activity.identity,
+                "Control-Command-E focuses an existing Done control without dispatching Done"
+            )
+        } catch {
+            recordUnexpected(error, context: "completion shortcut routing")
+        }
+        await coordinator.shutdown()
+        await broker.shutdown()
+    }
+
     mutating func verifyTemporalProjectionPhysicalVisibility() async {
         let broker = ActivityBroker()
         let activityModel = SurfaceActivityModel(broker: broker)
@@ -4358,7 +4479,7 @@ private final class SharedModelPanelRegistry {
 }
 
 @MainActor
-private final class FakePanel: PanelPresenting {
+private final class FakePanel: PanelPresenting, PanelExistingControlFocusing {
     let displayIdentity: DisplayIdentity
     private let surfaceModel: PanelSurfaceModel
     private(set) var isClosed = false
@@ -4368,6 +4489,7 @@ private final class FakePanel: PanelPresenting {
     private(set) var updateCount = 0
     private(set) var pointerUpdateCount = 0
     private(set) var primaryActionCount = 0
+    private(set) var focusExistingControlsCount = 0
 
     var isTemporalProjectionActive: Bool {
         surfaceModel.isTemporalProjectionActive
@@ -4412,6 +4534,18 @@ private final class FakePanel: PanelPresenting {
     func performPrimaryAction() {
         primaryActionCount += 1
         surfaceModel.send(.primaryAction)
+    }
+
+    func focusExistingControls() -> Bool {
+        guard DeliberatePanelFocusPolicy.shouldFocusExistingControls(
+            state: surfaceModel.state,
+            isWindowPresented: surfaceModel.isWindowPresented,
+            hasExplicitControls: surfaceModel.logicalContentHasExplicitControls
+        ) else {
+            return false
+        }
+        focusExistingControlsCount += 1
+        return true
     }
 
     func performVisibilityToggle() {
@@ -4497,6 +4631,12 @@ private func writeNativeVisualQA(to directory: URL) throws {
             filename: "erylo-timer-launcher.png",
             scenario: { ActivitySurfacePreviewCatalog.focusTimerLauncher },
             geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-timer-launcher-notchless.png",
+            scenario: { ActivitySurfacePreviewCatalog.focusTimerLauncher },
+            geometry: notchlessGeometry,
             desktop: .dark
         ),
         NativeVisualQAFixture(

@@ -412,6 +412,9 @@ public final class PanelCoordinator {
             return false
         }
         let displayID = CGDirectDisplayID(selectedDisplayIdentity.rawValue)
+        if (panel as? any PanelExistingControlFocusing)?.focusExistingControls() == true {
+            return true
+        }
         guard !(panel is any PanelPresentationDemandReporting) else {
             panel.performPrimaryAction()
             return true

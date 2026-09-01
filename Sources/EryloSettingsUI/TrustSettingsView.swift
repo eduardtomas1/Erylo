@@ -128,8 +128,7 @@ public struct TrustSettingsView: View {
                         Button("Reset Settings…", role: .destructive) {
                             isResetConfirmationPresented = true
                         }
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.bordered)
                         .accessibilityHint("Replaces the unreadable saved value with safe defaults after confirmation.")
                     }
                     .controlSize(.large)
@@ -637,10 +636,16 @@ public struct TrustSettingsView: View {
     }
 }
 
-/// A truthful first-run product moment: the same compact signal hierarchy the
-/// shipping surface uses, shown without a fake desktop, fake controls, or an
-/// always-running animation.
+/// A truthful first-run product moment: an illustrative compact signal using
+/// the shipping timer color and top-edge hierarchy, without fake controls or
+/// an always-running animation.
 private struct OnboardingSurfacePreview: View {
+    private static let focusTint = Color(
+        red: 255 / 255,
+        green: 180 / 255,
+        blue: 84 / 255
+    )
+
     var body: some View {
         ZStack(alignment: .top) {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -654,7 +659,7 @@ private struct OnboardingSurfacePreview: View {
                     HStack(spacing: 0) {
                         Image(systemName: "timer")
                             .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
+                            .foregroundStyle(Self.focusTint)
                             .frame(width: 66)
                             .accessibilityHidden(true)
 
@@ -671,7 +676,7 @@ private struct OnboardingSurfacePreview: View {
 
                     HStack(spacing: 0) {
                         Capsule(style: .continuous)
-                            .fill(Color.accentColor)
+                            .fill(Self.focusTint)
                             .frame(width: 86, height: 2)
                         Capsule(style: .continuous)
                             .fill(Color.white.opacity(0.16))

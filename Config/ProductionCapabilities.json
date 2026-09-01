@@ -7,7 +7,7 @@
   ],
   "privacyUsageDescriptionAllowlist": [],
   "entitlementAllowlist": [],
-  "productionCompositionSourceSHA256": "ac57d69673490e5951be308180656d399d59f47b3008c9dbc317a1f5d360eae6",
+  "productionCompositionSourceSHA256": "3a876ca3fa59d3771fdac8955433147f55ca17f27cb0d4261c4462d3cb6a5aaa",
   "reviewedModuleSourceSHA256": {
     "Sources/EryloGlance": "28f195016c2e9914cc2b948b408cffb3eb400bcf7cebc56e135e51bcd7be3b38",
     "Sources/EryloIntegrations": "2fbcc028fa02c30996ecfe8c6787b030b26e2ad97a28ec8145d845b34d7547b3"

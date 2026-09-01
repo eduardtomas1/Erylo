@@ -710,7 +710,7 @@ private struct OnboardingSurfacePreview: View {
 /// soften into the screen.
 private struct OnboardingTopEdgeSurfaceShape: Shape {
     func path(in rect: CGRect) -> Path {
-        let radius = min(17, rect.height / 2)
+        let radius = min(17, rect.height * 0.5)
         var path = Path()
         path.move(to: CGPoint(x: rect.minX, y: rect.minY))
         path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))

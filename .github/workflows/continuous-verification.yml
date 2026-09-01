@@ -106,6 +106,22 @@ jobs:
             echo "Expected exactly 4 native settings QA images; found ${#settings_visual_files[@]}." >&2
             exit 1
           fi
+          expected_settings_visual_names=(
+            erylo-onboarding-dark.png
+            erylo-onboarding-light.png
+            erylo-settings-dark.png
+            erylo-settings-light.png
+          )
+          actual_settings_visual_names=()
+          for path in "${settings_visual_files[@]}"; do
+            actual_settings_visual_names+=("${path##*/}")
+          done
+          if ! diff -u \
+            <(printf '%s\n' "${expected_settings_visual_names[@]}" | sort) \
+            <(printf '%s\n' "${actual_settings_visual_names[@]}" | sort); then
+            echo "Native settings QA manifest does not match the required fixtures." >&2
+            exit 1
+          fi
 
       - name: Run EryloSurfaceTests and render native visual QA
         if: matrix.target == 'EryloSurfaceTests'
@@ -115,8 +131,34 @@ jobs:
           .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
           shopt -s nullglob
           surface_visual_files=("$ERYLO_VISUAL_QA_DIRECTORY"/*.png)
-          if (( ${#surface_visual_files[@]} != 10 )); then
-            echo "Expected exactly 10 native surface QA images; found ${#surface_visual_files[@]}." >&2
+          if (( ${#surface_visual_files[@]} != 14 )); then
+            echo "Expected exactly 14 native surface QA images; found ${#surface_visual_files[@]}." >&2
+            exit 1
+          fi
+          expected_surface_visual_names=(
+            erylo-battery-notched.png
+            erylo-charging-notchless.png
+            erylo-generic-peek-notched.png
+            erylo-queued-action-expanded-notched.png
+            erylo-timer-compact.png
+            erylo-timer-completion.png
+            erylo-timer-expanded-light-desktop.png
+            erylo-timer-expanded.png
+            erylo-timer-launcher.png
+            erylo-volume-muted-notched.png
+            erylo-volume-muted-notchless.png
+            erylo-volume-output-notched.png
+            erylo-volume-output-notchless-light.png
+            erylo-volume-output-notchless.png
+          )
+          actual_surface_visual_names=()
+          for path in "${surface_visual_files[@]}"; do
+            actual_surface_visual_names+=("${path##*/}")
+          done
+          if ! diff -u \
+            <(printf '%s\n' "${expected_surface_visual_names[@]}" | sort) \
+            <(printf '%s\n' "${actual_surface_visual_names[@]}" | sort); then
+            echo "Native surface QA manifest does not match the required fixtures." >&2
             exit 1
           fi
 

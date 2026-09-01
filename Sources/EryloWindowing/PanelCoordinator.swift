@@ -452,7 +452,13 @@ public final class PanelCoordinator {
         case .workspaceWillSleep:
             guard !isWorkspaceSleeping else { return }
             isWorkspaceSleeping = true
-            Array(panels.values).forEach { $0.hide() }
+            Array(panels.values).forEach { panel in
+                if let immediatePanel = panel as? any PanelImmediateEnvironmentalHiding {
+                    immediatePanel.hideImmediatelyForEnvironmentalTransition()
+                } else {
+                    panel.hide()
+                }
+            }
             presentedPanelIDs.removeAll()
             lifecycleEventSource.setPointerMonitoringEnabled(false)
         case .workspaceDidWake:

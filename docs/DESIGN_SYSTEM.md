@@ -61,12 +61,15 @@ Do not force every activity through a symbol-title-detail-progress-card template
   and one secondary Cancel action.
 - Completion: concise acknowledgement with a routed Done dismissal and a named
   VoiceOver dismiss action; disappear automatically when untouched.
+- Persist only the immutable session identity and absolute start/end dates.
+  Relaunch restores the same deadline; quit never manufactures a new duration.
 
 ### Volume
 
 - Compact only: speaker state, direct level meter, and value when relevant.
 - Output changes may show the bounded device name as secondary text.
 - Volume acknowledgements never enter Peek or Expanded.
+- Passive acknowledgements remain click-through and have no hover affordance.
 - Never show generic category and event labels such as "VOLUME / Output changed".
 
 ### Battery
@@ -75,6 +78,7 @@ Do not force every activity through a symbol-title-detail-progress-card template
 - Charging and low-battery events show the percentage as the primary datum.
 - Power acknowledgements never enter Peek or Expanded.
 - Persistent low-battery state must remain calm and must not animate repeatedly.
+- Power acknowledgements remain click-through and never impersonate a control.
 
 ### File Hold
 
@@ -87,8 +91,12 @@ Do not force every activity through a symbol-title-detail-progress-card template
 
 - Preserve the identity and position of useful values between compact and
   expanded states; avoid whole-surface replacement fades.
-- Shape opening may use a restrained interruptible spring. Content settles only
-  after geometry begins its transition.
+- Shape opening uses a restrained, interruptible 220 ms smooth curve with no
+  extra bounce. Content settles only after geometry begins its transition.
+- Order a new window while its rendered state is Hidden, then commit Compact
+  after one 60 Hz display frame. Render Hidden before delayed physical order-out.
+- Crossfade identity handoffs briefly when geometry is unchanged; do not flash
+  through Hidden between valid activities.
 - Countdown digits use a numeric content transition where supported.
 - Hover entry waits 120 ms; exit uses a 300 ms corridor delay.
 - Reduce Motion updates geometry immediately and disables scale, numeric motion,
@@ -105,8 +113,9 @@ Do not force every activity through a symbol-title-detail-progress-card template
   invisible, inert, and absent from accessibility until the exact AppKit hit
   region settles. Reduce Motion settles that region immediately.
 - Hover never activates the app. Compact and Peek are never key eligible.
-  Expanded permits key interaction, but does not take it on transition; the
-  nonactivating panel becomes key only when a directly used control needs it.
+  Pointer-driven expansion stays nonactivating. A deliberate global-shortcut
+  expansion makes the already Expanded panel key so keyboard users can reach
+  its controls.
 - Expanded alone owns paired local/global mouse-down monitors. A click outside
   its current exact AppKit hit region collapses it; inside clicks pass through
   unchanged to the intended action. The monitors are removed on every collapse,

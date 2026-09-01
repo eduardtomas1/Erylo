@@ -49,6 +49,13 @@ package protocol PanelFocusTimerLaunching: AnyObject {
     )
 }
 
+/// Native panels distinguish lifecycle retirement from a user-visible demand
+/// contraction. Sleep must never wait for the outgoing surface animation.
+@MainActor
+package protocol PanelImmediateEnvironmentalHiding: AnyObject {
+    func hideImmediatelyForEnvironmentalTransition()
+}
+
 public extension PanelPresenting {
     /// Compatibility fallback for injected presenters that only implement the original action.
     /// The native presenter overrides this with a strict hidden/visible surface toggle.

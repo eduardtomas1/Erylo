@@ -39,6 +39,10 @@ value. Click it or press <kbd>Control</kbd> + <kbd>Option</kbd> +
 directly from the menu. When the session ends, Erylo briefly opens a readable
 **Focus complete** acknowledgement, then disappears.
 
+The session is stored as one absolute deadline, so quitting and reopening Erylo
+restores the same timer instead of restarting or silently losing it. Expired or
+invalid records restore no work and never produce a late completion sound.
+
 <p align="center">
   <img src="docs/images/erylo-timer-launcher.png" width="560" alt="Erylo's compact native Focus Timer launcher with 15, 25, and 50 minute presets below MacBook notch geometry">
 </p>
@@ -82,8 +86,9 @@ directly from the menu. When the session ends, Erylo briefly opens a readable
     </td>
     <td width="50%" valign="top">
       <strong>Calm by default</strong><br>
-      No idle animation or permanent dashboard. Hover reveals only a short,
-      non-activating Peek; full expansion waits for a click or shortcut.
+      No idle animation or permanent dashboard. Hover reveals a short,
+      non-activating Peek only when an activity has useful additional detail;
+      full expansion waits for a click or shortcut.
     </td>
   </tr>
   <tr>
@@ -115,6 +120,7 @@ directly from the menu. When the session ends, Erylo briefly opens a readable
 - Expand for context and a clear **Cancel timer** action.
 - Cancel from the menu when keyboard or VoiceOver navigation is preferable.
 - Replace a running session safely by starting another preset.
+- Quit and relaunch without losing the active deadline or creating background ticks.
 - Let a short **Focus complete** acknowledgement disappear without leaving timer work or ownership behind.
 
 ### Battery and charging
@@ -124,6 +130,7 @@ directly from the menu. When the session ends, Erylo briefly opens a readable
 - Keep an ordinary first reading quiet, briefly acknowledge later power changes,
   and retain an ambient warning only while an unplugged battery is at or below 20%.
 - Use local IOPowerSources notifications with no polling or network work.
+- Stay fully click-through: passive power acknowledgements never become dead controls.
 
 ### Volume
 
@@ -135,6 +142,7 @@ directly from the menu. When the session ends, Erylo briefly opens a readable
   **Sound on**, and an output switch as the bounded device name or **Audio output**.
 - Use CoreAudio property listeners and cancellable 1.8-second presentations, not
   polling or a permanent HUD.
+- Stay fully click-through while passive, so a transient cue cannot swallow a menu-bar click.
 - Keep output names transient: they are not persisted, logged, diagnosed, or exported.
 - Let the short Volume acknowledgement temporarily outrank a Focus Timer, then
   restore the exact same timer and working Cancel action when it expires.

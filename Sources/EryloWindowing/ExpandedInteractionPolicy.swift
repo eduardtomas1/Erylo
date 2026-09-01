@@ -7,6 +7,16 @@ package enum ExpandedMouseDownDecision: Equatable, Sendable {
     case dismiss
 }
 
+package enum DeliberatePanelFocusPolicy {
+    package static func shouldRequestKey(
+        from oldState: PanelPresentationState,
+        to newState: PanelPresentationState,
+        isWindowPresented: Bool
+    ) -> Bool {
+        isWindowPresented && oldState != .expanded && newState == .expanded
+    }
+}
+
 /// Pure policy for the only surface state that may own keyboard focus or
 /// process-wide dismissal monitors. Native resources consume these decisions;
 /// they do not invent broader interaction behavior.

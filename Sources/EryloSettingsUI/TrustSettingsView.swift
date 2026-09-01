@@ -68,77 +68,97 @@ public struct TrustSettingsView: View {
     }
 
     private var onboardingView: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 32)
+        GeometryReader { proxy in
+            ScrollView(.vertical) {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 32)
 
-            EryloSignalMark()
-                .stroke(
-                    Color.accentColor,
-                    style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round)
-                )
-                .frame(width: 48, height: 28)
-                .accessibilityHidden(true)
+                    EryloSignalMark()
+                        .stroke(
+                            Color.accentColor,
+                            style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round)
+                        )
+                        .frame(width: 48, height: 28)
+                        .accessibilityHidden(true)
 
-            Text("Meet Erylo")
-                .font(.system(size: 30, weight: .semibold))
-                .padding(.top, 16)
-                .accessibilityAddTraits(.isHeader)
+                    Text("Meet Erylo")
+                        .font(.system(size: 30, weight: .semibold))
+                        .padding(.top, 16)
+                        .accessibilityAddTraits(.isHeader)
 
-            Text(TrustAccessibilityCopy.onboardingSurfaceExplanation)
-                .font(.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 7)
+                    Text(TrustAccessibilityCopy.onboardingSurfaceExplanation)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 7)
 
-            VStack(alignment: .leading, spacing: 18) {
-                onboardingFeature(
-                    symbol: "timer",
-                    title: "Focus on demand",
-                    detail: "Start a 15, 25, or 50 minute timer from the menu bar."
-                )
-                onboardingFeature(
-                    symbol: "waveform.path",
-                    title: "Only useful signals",
-                    detail: "Battery and Volume appear briefly only when you enable them."
-                )
-                onboardingFeature(
-                    symbol: "hand.raised.fill",
-                    title: "Private by design",
-                    detail: "No account, no telemetry, and no permission request at launch."
-                )
+                    OnboardingSurfacePreview()
+                        .frame(maxWidth: 440)
+                        .padding(.top, 24)
+
+                    VStack(alignment: .leading, spacing: 16) {
+                        onboardingFeature(
+                            symbol: "timer",
+                            title: "A timer that stays in context",
+                            detail: "Start 15, 25, or 50 minutes from the menu bar. The deadline survives a relaunch."
+                        )
+                        onboardingFeature(
+                            symbol: "sparkles",
+                            title: "Signals, not another dashboard",
+                            detail: "Battery and Volume appear briefly, never take focus, and disappear on their own."
+                        )
+                        onboardingFeature(
+                            symbol: "hand.raised.fill",
+                            title: "Quiet by default",
+                            detail: "No account, no analytics, and no permission request until you enable a utility."
+                        )
+                    }
+                    .frame(maxWidth: 430)
+                    .padding(.top, 24)
+
+                    if let failure = model.onboardingActionFailure {
+                        Label(failure, systemImage: "exclamationmark.circle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 20)
+                            .accessibilityLabel("Setup error. \(failure)")
+                    }
+
+                    Spacer(minLength: 28)
+
+                    Button {
+                        Task { await model.completeOnboarding() }
+                    } label: {
+                        HStack(spacing: 8) {
+                            if model.isWorking {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .accessibilityHidden(true)
+                            }
+                            Text("Get Started")
+                        }
+                        .frame(minWidth: 82)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.isWorking)
+
+                    Text("Everything stays off until you choose it in Settings.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 9)
+
+                    Spacer(minLength: 28)
+                }
+                .frame(maxWidth: 520)
+                .padding(.horizontal, 44)
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+                .accessibilityElement(children: .contain)
             }
-            .frame(maxWidth: 430)
-            .padding(.top, 30)
-
-            if let failure = model.onboardingActionFailure {
-                Label(failure, systemImage: "exclamationmark.circle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 20)
-                    .accessibilityLabel("Focus Timer start failed. \(failure)")
-            }
-
-            Spacer(minLength: 28)
-
-            Button("Continue") {
-                Task { await model.completeOnboarding() }
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-            .keyboardShortcut(.defaultAction)
-
-            Text("You can change every utility later in Settings.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .padding(.top, 9)
-
-            Spacer(minLength: 28)
         }
-        .frame(maxWidth: 520)
-        .padding(.horizontal, 44)
-        .accessibilityElement(children: .contain)
     }
 
     private func onboardingFeature(
@@ -509,5 +529,58 @@ public struct TrustSettingsView: View {
         return statusMessage.localizedCaseInsensitiveContains("could not")
             || statusMessage.localizedCaseInsensitiveContains("failed")
             || statusMessage.localizedCaseInsensitiveContains("needs attention")
+    }
+}
+
+/// A truthful first-run product moment: the same compact signal hierarchy the
+/// shipping surface uses, shown without a fake desktop, fake controls, or an
+/// always-running animation.
+private struct OnboardingSurfacePreview: View {
+    var body: some View {
+        VStack(spacing: 11) {
+            ZStack(alignment: .bottom) {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.black)
+
+                HStack(spacing: 0) {
+                    Image(systemName: "timer")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityHidden(true)
+
+                    Spacer(minLength: 28)
+
+                    Text("25:00")
+                        .font(.system(size: 13, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                }
+                .padding(.horizontal, 18)
+                .frame(height: 38)
+
+                Capsule(style: .continuous)
+                    .fill(Color.accentColor)
+                    .frame(width: 138, height: 2)
+                    .padding(.bottom, 1)
+            }
+            .frame(maxWidth: 320, minHeight: 40, maxHeight: 40)
+            .shadow(color: .black.opacity(0.22), radius: 7, y: 3)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Preview: Focus Timer, 25 minutes remaining")
+
+            Text("Glance. Act. Keep going.")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5)
+        }
     }
 }

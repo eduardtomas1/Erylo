@@ -27,6 +27,7 @@ enum AppRuntimeHarnessMain {
         await harness.verifyRetiredVolumeExpiryDrainAcrossResetAndShutdown()
         await harness.verifyMenuCommandRoutingAndUpdateAvailability()
         await harness.verifyFocusTimerVerticalSlice()
+        await harness.verifyFocusTimerPersistenceAcrossRelaunch()
         await harness.verifyNaturalCompletionPresentationAndShutdownBarrier()
         harness.finish()
     }
@@ -2363,6 +2364,459 @@ private struct AppRuntimeHarness {
         check(!runtime.handle(.startFocusTimer15), "Focus Timer commands fail closed after terminal shutdown")
     }
 
+    mutating func verifyFocusTimerPersistenceAcrossRelaunch() async {
+        let now = Date(timeIntervalSinceReferenceDate: 92_000)
+        let clock = ManualFocusClock(now: now)
+        let storage = RuntimeAtomicSettingsStorage()
+        let firstBroker = ActivityBroker()
+        let first = FocusTimerRuntimeService(
+            broker: firstBroker,
+            clock: clock,
+            persistenceStorage: storage
+        )
+
+        check(storage.readCount == 0, "Focus Timer persistence construction performs no storage read")
+        await first.start()
+        check(storage.readCount == 1, "Focus Timer reads its deadline record only during explicit startup")
+        check(await first.provider.status() == .disabled, "missing persisted timer leaves startup inert")
+        check(first.requestStart(duration: 120), "persistent Focus Timer admits a bounded deadline")
+        check(
+            await waitUntil {
+                let countdown = await first.provider.countdown()
+                return countdown != nil && storage.successfulReplacementCount == 1
+            },
+            "starting a Focus Timer atomically stores one active deadline"
+        )
+        guard let originalTimer = await first.provider.countdown(),
+              let originalRecord = storage.currentData else {
+            check(false, "persistent Focus Timer exposes its original deadline")
+            check(false, "persistent Focus Timer exposes its atomic record")
+            await first.shutdown()
+            await firstBroker.shutdown()
+            return
+        }
+
+        storage.failNextReplacement()
+        check(first.requestStart(duration: 300), "replacement remains synchronously admissible before persistence settles")
+        check(
+            await waitUntil {
+                let state = first.workState()
+                return !state.hasWorkerTask && state.pendingOperationCount == 0
+            },
+            "failed persistent replacement drains its bounded command work"
+        )
+        check(
+            await first.provider.countdown() == originalTimer
+                && storage.currentData == originalRecord,
+            "failed atomic replacement preserves the matching live and persisted timer"
+        )
+
+        await first.shutdown()
+        check(storage.currentData == originalRecord, "process shutdown preserves the active timer deadline")
+        check(await first.provider.workState().isIdle, "persistent timer shutdown still drains provider work")
+        await firstBroker.shutdown()
+
+        let gatedClock = GatedFocusClock(now: now.addingTimeInterval(30))
+        let gatedBroker = ActivityBroker()
+        let gatedRuntime = FocusTimerRuntimeService(
+            broker: gatedBroker,
+            clock: gatedClock,
+            persistenceStorage: storage
+        )
+        let gatedStart = Task { @MainActor in await gatedRuntime.start() }
+        check(
+            await waitUntil { await gatedClock.isNowPending },
+            "persistent restore reaches its suspended clock boundary"
+        )
+        check(
+            !gatedRuntime.requestStart(duration: 300),
+            "Focus Timer command admission stays closed while persisted restore is starting"
+        )
+        let gatedShutdownFinished = CompletionFlag()
+        let gatedShutdown = Task { @MainActor in
+            await gatedRuntime.shutdown()
+            gatedShutdownFinished.isComplete = true
+        }
+        for _ in 0..<20 { await Task.yield() }
+        check(!gatedShutdownFinished.isComplete, "shutdown joins a suspended persisted restore")
+        await gatedClock.releaseNow()
+        _ = await gatedStart.value
+        _ = await gatedShutdown.value
+        let gatedStatus = await gatedRuntime.provider.status()
+        let gatedBrokerWork = await gatedBroker.workState()
+        check(
+            gatedShutdownFinished.isComplete
+                && gatedStatus == .disabled
+                && gatedRuntime.workState().isIdle
+                && gatedBrokerWork.activeOwnershipCount == 0,
+            "shutdown during persisted restore leaves no provider, command, or ownership work"
+        )
+        check(
+            storage.currentData == originalRecord,
+            "shutdown during suspended restore preserves the valid persisted deadline"
+        )
+        check(
+            !gatedRuntime.requestStart(duration: 300),
+            "persistent Focus Timer rejects commands after restore-overlap shutdown"
+        )
+        await gatedBroker.shutdown()
+
+        let pendingStartStorage = RuntimeAtomicSettingsStorage()
+        let pendingStartClock = GatedFocusClock(now: now)
+        let pendingStartBroker = ActivityBroker()
+        let pendingStartRuntime = FocusTimerRuntimeService(
+            broker: pendingStartBroker,
+            clock: pendingStartClock,
+            persistenceStorage: pendingStartStorage
+        )
+        await pendingStartRuntime.start()
+        check(
+            pendingStartRuntime.requestStart(duration: 120),
+            "running Focus Timer admits the suspended-start fixture"
+        )
+        check(
+            await waitUntil { await pendingStartClock.isNowPending },
+            "Focus Timer start reaches its suspended clock boundary"
+        )
+        let pendingStartShutdown = Task { @MainActor in
+            await pendingStartRuntime.shutdown()
+        }
+        for _ in 0..<20 { await Task.yield() }
+        await pendingStartClock.releaseNow()
+        _ = await pendingStartShutdown.value
+        let pendingStartStatus = await pendingStartRuntime.provider.status()
+        let pendingStartBrokerWork = await pendingStartBroker.workState()
+        check(
+            pendingStartStorage.currentData == nil
+                && pendingStartStatus == .disabled
+                && pendingStartRuntime.workState().isIdle
+                && pendingStartBrokerWork.activeOwnershipCount == 0,
+            "shutdown admission prevents a suspended start from creating persisted or provider work"
+        )
+        await pendingStartBroker.shutdown()
+
+        let immediateCancelStorage = RuntimeAtomicSettingsStorage()
+        let immediateCancelClock = ManualFocusClock(now: now)
+        let immediateCancelBroker = ActivityBroker()
+        let immediateCancelRuntime = FocusTimerRuntimeService(
+            broker: immediateCancelBroker,
+            clock: immediateCancelClock,
+            persistenceStorage: immediateCancelStorage
+        )
+        await immediateCancelRuntime.start()
+        check(
+            immediateCancelRuntime.requestStart(duration: 120),
+            "immediate-cancel persistence fixture starts"
+        )
+        check(
+            await waitUntil { await immediateCancelRuntime.provider.countdown() != nil },
+            "immediate-cancel persistence fixture reaches provider state"
+        )
+        guard let immediateActiveRecord = immediateCancelStorage.currentData else {
+            check(false, "immediate-cancel persistence fixture exposes its active record")
+            await immediateCancelRuntime.shutdown()
+            await immediateCancelBroker.shutdown()
+            return
+        }
+        check(
+            immediateCancelRuntime.requestCancel(),
+            "immediate-cancel persistence fixture synchronously admits Cancel"
+        )
+        await immediateCancelRuntime.shutdown()
+        check(
+            immediateCancelStorage.currentData != nil
+                && immediateCancelStorage.currentData != immediateActiveRecord,
+            "Quit immediately after an accepted Cancel preserves the cancellation tombstone"
+        )
+        await immediateCancelBroker.shutdown()
+
+        let postCancelBroker = ActivityBroker()
+        let postCancelRuntime = FocusTimerRuntimeService(
+            broker: postCancelBroker,
+            clock: immediateCancelClock,
+            persistenceStorage: immediateCancelStorage
+        )
+        await postCancelRuntime.start()
+        let postCancelStatus = await postCancelRuntime.provider.status()
+        let postCancelBrokerWork = await postCancelBroker.workState()
+        check(
+            postCancelStatus == .disabled
+                && postCancelRuntime.workState().isIdle
+                && postCancelBrokerWork.activeOwnershipCount == 0,
+            "a Cancel accepted immediately before Quit cannot resurrect on relaunch"
+        )
+        await postCancelRuntime.shutdown()
+        await postCancelBroker.shutdown()
+
+        await clock.advance(to: now.addingTimeInterval(30))
+        let restoredBroker = ActivityBroker()
+        let restored = FocusTimerRuntimeService(
+            broker: restoredBroker,
+            clock: clock,
+            persistenceStorage: storage
+        )
+        await restored.start()
+        check(
+            await waitUntil {
+                let countdown = await restored.provider.countdown()
+                let brokerWork = await restoredBroker.workState()
+                return countdown == originalTimer && brokerWork.activeOwnershipCount == 1
+            },
+            "relaunch restores the exact original timestamps and one broker ownership"
+        )
+        check(
+            restored.menuContext(at: now.addingTimeInterval(30))
+                == .active(remainingText: "01:30"),
+            "restored timer derives remaining time from its absolute deadline"
+        )
+        check(
+            await waitUntil { await clock.pendingDeadlines == [originalTimer.endsAt] },
+            "restored timer owns one expiry boundary without tick polling"
+        )
+
+        storage.failNextReplacement()
+        check(restored.requestCancel(), "persistent timer admits an explicit cancellation request")
+        check(
+            await waitUntil {
+                let state = restored.workState()
+                return !state.hasWorkerTask && state.pendingOperationCount == 0
+            },
+            "failed persistent cancellation drains its bounded command work"
+        )
+        check(
+            await restored.provider.countdown() == originalTimer
+                && storage.currentData == originalRecord,
+            "failed cancellation tombstone leaves the persisted timer running instead of resurrectable"
+        )
+
+        check(restored.requestCancel(), "persistent timer cancellation can be retried")
+        check(
+            await waitUntil {
+                let countdown = await restored.provider.countdown()
+                let brokerWork = await restoredBroker.workState()
+                return countdown == nil
+                    && restored.workState().isIdle
+                    && brokerWork.activeOwnershipCount == 0
+            },
+            "successful cancellation tombstones and releases the restored timer"
+        )
+        let cancellationTombstone = storage.currentData
+        check(
+            cancellationTombstone != nil && cancellationTombstone != originalRecord,
+            "successful explicit cancellation replaces the active record with a tombstone"
+        )
+        await restored.shutdown()
+        await restoredBroker.shutdown()
+
+        let completionBroker = ActivityBroker()
+        let completionNotifications = Counter()
+        let completionRuntime = FocusTimerRuntimeService(
+            broker: completionBroker,
+            clock: clock,
+            persistenceStorage: storage,
+            completionNotifier: { completionNotifications.value += 1 }
+        )
+        await completionRuntime.start()
+        check(
+            await completionRuntime.provider.status() == .disabled,
+            "a cancellation tombstone restores no timer work"
+        )
+        check(completionRuntime.requestStart(duration: 5), "naturally completing persistent timer starts")
+        check(
+            await waitUntil { await completionRuntime.provider.countdown() != nil },
+            "naturally completing persistent timer reaches provider state"
+        )
+        guard let completionDeadline = await completionRuntime.provider.countdown()?.endsAt,
+              let completionRecord = storage.currentData else {
+            check(false, "naturally completing persistent timer exposes a deadline")
+            check(false, "naturally completing persistent timer exposes a record")
+            await completionRuntime.shutdown()
+            await completionBroker.shutdown()
+            return
+        }
+        await clock.advance(to: completionDeadline)
+        check(
+            await waitUntil {
+                let countdown = await completionRuntime.provider.countdown()
+                return countdown == nil
+                    && completionRuntime.workState().isIdle
+                    && completionNotifications.value == 1
+            },
+            "natural completion drains the timer and delivers its one notifier"
+        )
+        check(
+            storage.currentData != nil && storage.currentData != completionRecord,
+            "natural completion tombstones its matching persisted session"
+        )
+        await completionRuntime.shutdown()
+        await completionBroker.shutdown()
+
+        let expiredStorage = RuntimeAtomicSettingsStorage()
+        let expiredClock = ManualFocusClock(now: now)
+        let expiringBroker = ActivityBroker()
+        let expiring = FocusTimerRuntimeService(
+            broker: expiringBroker,
+            clock: expiredClock,
+            persistenceStorage: expiredStorage
+        )
+        await expiring.start()
+        check(expiring.requestStart(duration: 5), "offline-expiry fixture starts")
+        check(
+            await waitUntil { await expiring.provider.countdown() != nil },
+            "offline-expiry fixture reaches provider state"
+        )
+        guard let expiredDeadline = await expiring.provider.countdown()?.endsAt,
+              let expiringRecord = expiredStorage.currentData else {
+            check(false, "offline-expiry fixture exposes a deadline")
+            check(false, "offline-expiry fixture exposes a record")
+            await expiring.shutdown()
+            await expiringBroker.shutdown()
+            return
+        }
+        await expiring.shutdown()
+        await expiringBroker.shutdown()
+        await expiredClock.advance(to: expiredDeadline.addingTimeInterval(1))
+
+        let expiredBroker = ActivityBroker()
+        let expiredNotifications = Counter()
+        let expired = FocusTimerRuntimeService(
+            broker: expiredBroker,
+            clock: expiredClock,
+            persistenceStorage: expiredStorage,
+            completionNotifier: { expiredNotifications.value += 1 }
+        )
+        await expired.start()
+        let expiredStatus = await expired.provider.status()
+        let expiredCountdown = await expired.provider.countdown()
+        let expiredBrokerWork = await expiredBroker.workState()
+        check(
+            expiredStatus == .disabled
+                && expiredCountdown == nil
+                && expiredBrokerWork.activeOwnershipCount == 0,
+            "a deadline that passed while Erylo was closed restores no provider or ownership work"
+        )
+        check(expiredNotifications.value == 0, "offline expiry never emits a late completion alert")
+        check(
+            expiredStorage.currentData != nil && expiredStorage.currentData != expiringRecord,
+            "offline expiry is replaced by an inert tombstone"
+        )
+        await expired.shutdown()
+        await expiredBroker.shutdown()
+
+        do {
+            let futureData = try JSONEncoder().encode(
+                RuntimePersistedFocusTimerEnvelope(
+                    schemaVersion: 1,
+                    activeSession: RuntimePersistedFocusTimerSession(
+                        sessionID: UUID(uuidString: "D6AA996F-6D62-4D29-BA74-91B40678E2B7")!,
+                        startedAt: now.addingTimeInterval(60),
+                        endsAt: now.addingTimeInterval(120)
+                    )
+                )
+            )
+            let futureStorage = RuntimeAtomicSettingsStorage(initialData: futureData)
+            let futureBroker = ActivityBroker()
+            let futureRuntime = FocusTimerRuntimeService(
+                broker: futureBroker,
+                clock: ManualFocusClock(now: now),
+                persistenceStorage: futureStorage
+            )
+            await futureRuntime.start()
+            let futureStatus = await futureRuntime.provider.status()
+            let futureCountdown = await futureRuntime.provider.countdown()
+            let futureBrokerWork = await futureBroker.workState()
+            check(
+                futureStatus == .disabled
+                    && futureCountdown == nil
+                    && futureBrokerWork.activeOwnershipCount == 0,
+                "a future-start persisted session fails closed without scheduling work"
+            )
+            check(
+                futureStorage.currentData != futureData,
+                "a future-start persisted session is replaced by an inert tombstone"
+            )
+            await futureRuntime.shutdown()
+            await futureBroker.shutdown()
+        } catch {
+            recordUnexpected(error, context: "future-start Focus Timer persistence fixture")
+            check(false, "future-start persistence fixture remains encodable")
+            check(false, "future-start persistence fixture remains testable")
+        }
+
+        let unsupportedData = Data(
+            "{\"activeSession\":{\"futureShape\":true},\"schemaVersion\":2}".utf8
+        )
+        let unsupportedStorage = RuntimeAtomicSettingsStorage(initialData: unsupportedData)
+        let unsupportedBroker = ActivityBroker()
+        let unsupportedRuntime = FocusTimerRuntimeService(
+            broker: unsupportedBroker,
+            clock: ManualFocusClock(now: now),
+            persistenceStorage: unsupportedStorage
+        )
+        await unsupportedRuntime.start()
+        let unsupportedStatus = await unsupportedRuntime.provider.status()
+        check(
+            unsupportedStatus == .disabled
+                && unsupportedStorage.currentData == unsupportedData
+                && unsupportedStorage.replacementAttemptCount == 0,
+            "a future persistence schema fails closed without overwriting its bytes"
+        )
+        await unsupportedRuntime.shutdown()
+        await unsupportedBroker.shutdown()
+
+        let unreadableData = Data("preserve-on-read-failure".utf8)
+        let unreadableStorage = RuntimeAtomicSettingsStorage(initialData: unreadableData)
+        unreadableStorage.failNextRead()
+        let unreadableBroker = ActivityBroker()
+        let unreadableRuntime = FocusTimerRuntimeService(
+            broker: unreadableBroker,
+            clock: ManualFocusClock(now: now),
+            persistenceStorage: unreadableStorage
+        )
+        await unreadableRuntime.start()
+        let unreadableStatus = await unreadableRuntime.provider.status()
+        check(
+            unreadableStatus == .disabled
+                && unreadableStorage.currentData == unreadableData
+                && unreadableStorage.replacementAttemptCount == 0,
+            "a persistence read failure stays inert without overwriting unreadable data"
+        )
+        await unreadableRuntime.shutdown()
+        await unreadableBroker.shutdown()
+
+        for invalidData in [
+            Data("not-json".utf8),
+            Data(repeating: 0x41, count: 1_025),
+        ] {
+            let invalidStorage = RuntimeAtomicSettingsStorage(initialData: invalidData)
+            let invalidBroker = ActivityBroker()
+            let invalidNotifications = Counter()
+            let invalidRuntime = FocusTimerRuntimeService(
+                broker: invalidBroker,
+                clock: ManualFocusClock(now: now),
+                persistenceStorage: invalidStorage,
+                completionNotifier: { invalidNotifications.value += 1 }
+            )
+            await invalidRuntime.start()
+            let invalidStatus = await invalidRuntime.provider.status()
+            let invalidCountdown = await invalidRuntime.provider.countdown()
+            let invalidBrokerWork = await invalidBroker.workState()
+            check(
+                invalidStatus == .disabled
+                    && invalidCountdown == nil
+                    && invalidBrokerWork.activeOwnershipCount == 0,
+                "invalid or oversized timer persistence fails closed without runtime work"
+            )
+            check(invalidNotifications.value == 0, "invalid persistence emits no completion notification")
+            check(
+                invalidStorage.currentData != invalidData,
+                "invalid persistence is replaced by a bounded tombstone"
+            )
+            await invalidRuntime.shutdown()
+            await invalidBroker.shutdown()
+        }
+    }
+
     mutating func verifyNaturalCompletionPresentationAndShutdownBarrier() async {
         let now = Date(timeIntervalSinceReferenceDate: 95_000)
         let completionScheduler = ManualExpirationScheduler()
@@ -2447,9 +2901,13 @@ private struct AppRuntimeHarness {
             broker: barrierBroker,
             clock: barrierClock
         )
+        let barrierStorage = RuntimeAtomicSettingsStorage()
+        let barrierNotifications = Counter()
         let focusTimer = FocusTimerRuntimeService(
             provider: barrierProvider,
-            clock: barrierClock
+            clock: barrierClock,
+            persistenceStorage: barrierStorage,
+            completionNotifier: { barrierNotifications.value += 1 }
         )
         await focusTimer.start()
         await barrierBroker.gateNextRelease()
@@ -2488,6 +2946,11 @@ private struct AppRuntimeHarness {
             },
             "gated cleanup stores a semantically new operation with value-identical timer fields"
         )
+        let replacementPersistedRecord = barrierStorage.currentData
+        check(
+            replacementPersistedRecord != nil,
+            "value-identical replacement stores a distinct persisted session identity"
+        )
         check(
             focusTimer.menuContext(at: now) == .active(remainingText: "00:05"),
             "value-identical replacement immediately owns its menu deadline"
@@ -2522,6 +2985,14 @@ private struct AppRuntimeHarness {
             "value-identical replacement preserves its menu context after the old callback"
         )
         check(
+            barrierStorage.currentData == replacementPersistedRecord,
+            "retired natural completion cannot tombstone the persisted replacement session"
+        )
+        check(
+            barrierNotifications.value == 0,
+            "retired natural completion cannot notify after a replacement is active"
+        )
+        check(
             await waitUntil { await barrierClock.pendingDeadlines == [replacementEnd] },
             "settled replacement owns exactly one fresh expiry boundary"
         )
@@ -2538,6 +3009,10 @@ private struct AppRuntimeHarness {
                     && brokerWork.pendingOwnershipIntentCount == 0
             },
             "replacement cancel route drains revision, boundary, ownership, and capacity"
+        )
+        check(
+            barrierStorage.currentData != replacementPersistedRecord,
+            "replacement cancellation tombstones its exact persisted session"
         )
 
         await barrierBroker.gateNextRelease()
@@ -3068,22 +3543,66 @@ private actor GatedApplicationSettingsOwner: ApplicationSettingsOwning {
     }
 }
 
+private struct RuntimePersistedFocusTimerSession: Codable {
+    let sessionID: UUID
+    let startedAt: Date
+    let endsAt: Date
+}
+
+private struct RuntimePersistedFocusTimerEnvelope: Codable {
+    let schemaVersion: Int
+    let activeSession: RuntimePersistedFocusTimerSession?
+}
+
 private final class RuntimeAtomicSettingsStorage: AtomicSettingsStorage, @unchecked Sendable {
     private let lock = NSLock()
     private var data: Data?
+    private var reads = 0
+    private var replacementAttempts = 0
+    private var successfulReplacements = 0
+    private var shouldFailNextRead = false
+    private var shouldFailNextReplacement = false
 
-    init(initialData: Data?) {
+    init(initialData: Data? = nil) {
         data = initialData
+    }
+
+    var currentData: Data? { lock.withLock { data } }
+    var readCount: Int { lock.withLock { reads } }
+    var replacementAttemptCount: Int { lock.withLock { replacementAttempts } }
+    var successfulReplacementCount: Int { lock.withLock { successfulReplacements } }
+
+    func failNextReplacement() {
+        lock.withLock { shouldFailNextReplacement = true }
+    }
+
+    func failNextRead() {
+        lock.withLock { shouldFailNextRead = true }
     }
 
     func data(forKey key: String) throws -> Data? {
         _ = key
-        return lock.withLock { data }
+        return try lock.withLock {
+            reads += 1
+            if shouldFailNextRead {
+                shouldFailNextRead = false
+                throw RuntimeSystemSourceError.requestedFailure
+            }
+            return data
+        }
     }
 
     func replace(_ data: Data, forKey key: String) throws {
         _ = key
-        lock.withLock { self.data = data }
+        try lock.withLock {
+            replacementAttempts += 1
+            if shouldFailNextReplacement {
+                shouldFailNextReplacement = false
+                throw RuntimeSystemSourceError.requestedFailure
+            }
+            self.data = data
+            successfulReplacements += 1
+        }
     }
 }
 
@@ -3558,6 +4077,36 @@ private final class VisibilityReportingPanel: PanelPresenting, PanelActivityVisi
         guard force || visible != lastReportedVisibility else { return }
         lastReportedVisibility = visible
         visibilityHandler?(visible)
+    }
+}
+
+private actor GatedFocusClock: GlanceClock {
+    private let currentDate: Date
+    private var gatesNextNow = true
+    private var nowContinuation: CheckedContinuation<Date, Never>?
+
+    init(now: Date) {
+        currentDate = now
+    }
+
+    var isNowPending: Bool { nowContinuation != nil }
+
+    func now() async -> Date {
+        guard gatesNextNow else { return currentDate }
+        gatesNextNow = false
+        return await withCheckedContinuation { continuation in
+            nowContinuation = continuation
+        }
+    }
+
+    func releaseNow() {
+        nowContinuation?.resume(returning: currentDate)
+        nowContinuation = nil
+    }
+
+    func sleep(until deadline: Date) async throws {
+        guard deadline > currentDate else { return }
+        throw CancellationError()
     }
 }
 

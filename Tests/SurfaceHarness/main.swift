@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 47659)
-Total output lines: 4313
-
 import AppKit
 import CoreGraphics
 import Darwin
@@ -36,6 +33,7 @@ enum SurfaceHarnessMain {
         await harness.verifyFocusTimerProjectionAndLauncher()
         await harness.verifyProductInteractionSemantics()
         await harness.verifyTemporalProjectionPhysicalVisibility()
+        harness.verifyWindowTransitionStaging()
         harness.verifyReduceMotionAndRapidStateChanges()
         await harness.verifySharedBrokerVisibilityAndDisabledWork()
         if let outputDirectory = ProcessInfo.processInfo.environment["ERYLO_VISUAL_QA_DIRECTORY"] {
@@ -1710,7 +1708,623 @@ private struct SurfaceHarness {
         let broker = ActivityBroker()
         let handler = GatedCancellationActionHandler()
         let model = SurfaceActivityModel(broker: broker, actionHandler: handler)
-        let…7659 tokens truncated… reference is released by a detached task")
+        let displays = FakeDisplayProvider(displays: [makeDisplaySnapshot(identity: 10, isMain: true)])
+        let events = FakeLifecycleEventSource()
+        let registry = SharedModelPanelRegistry()
+        let coordinator = makeCoordinator(
+            displays: displays,
+            events: events,
+            registry: registry,
+            model: model
+        )
+        await coordinator.startAndWait()
+        guard await beginGatedAction(
+            broker: broker,
+            model: model,
+            handler: handler,
+            id: "coordinator-overlap"
+        ) else {
+            await coordinator.stopAndWait()
+            return
+        }
+
+        let stopTask = Task { @MainActor in
+            await coordinator.stopAndWait()
+        }
+        check(
+            await waitUntil {
+                let subscriberCount = await broker.workState().subscriberCount
+                return handler.isBlockedAfterCancellation
+                    && !events.isRunning
+                    && subscriberCount == 0
+            },
+            "coordinator stop is suspended in the gated model drain"
+        )
+
+        var startReturned = false
+        let startTask = Task { @MainActor in
+            await coordinator.startAndWait()
+            startReturned = true
+        }
+        for _ in 0..<50 { await Task.yield() }
+        check(!startReturned, "awaited restart remains behind the active physical stop drain")
+        check(coordinator.isRunning, "overlapping stop-start records running as the latest request")
+        check(events.isRunning && events.runningInstanceCount == 1, "latest start restores exactly one event source")
+        check(coordinator.activeDisplayIdentities.isEmpty, "latest start stays panel-free during the old drain")
+        check(await broker.workState().subscriberCount <= 1, "overlapping coordinator restart never exceeds one subscriber")
+
+        handler.release()
+        await stopTask.value
+        await startTask.value
+        check(startReturned, "awaited restart returns after the superseded stop drain settles")
+        check(
+            await waitUntil {
+                let subscriberCount = await broker.workState().subscriberCount
+                return model.isRunning && subscriberCount == 1
+            },
+            "latest coordinator start restarts the model after stale stop drain"
+        )
+        check(coordinator.isRunning && events.isRunning, "stop-start finishes running with events active")
+        check(
+            await waitUntil {
+                coordinator.activeDisplayIdentities.count == 1
+                    && registry.openPanelCount == 1
+            },
+            "stale stop cannot close the panel created by fresh successor content"
+        )
+        check(await broker.workState().subscriberCount == 1, "stop-start finishes with exactly one subscriber")
+
+        await coordinator.stopAndWait()
+        check(!coordinator.isRunning && !events.isRunning, "stop-start fixture performs a later normal stop")
+        check(registry.openPanelCount == 0, "later normal stop closes the restarted panel")
+        check(await broker.workState().subscriberCount == 0, "later normal stop removes the restarted subscriber")
+    }
+
+    private mutating func verifyCoordinatorShutdownIsTerminal() async {
+        let broker = ActivityBroker()
+        let handler = GatedCancellationActionHandler()
+        let model = SurfaceActivityModel(broker: broker, actionHandler: handler)
+        let displays = FakeDisplayProvider(displays: [makeDisplaySnapshot(identity: 10, isMain: true)])
+        let events = FakeLifecycleEventSource()
+        let registry = SharedModelPanelRegistry()
+        let coordinator = makeCoordinator(
+            displays: displays,
+            events: events,
+            registry: registry,
+            model: model
+        )
+        await coordinator.startAndWait()
+        guard await beginGatedAction(
+            broker: broker,
+            model: model,
+            handler: handler,
+            id: "terminal-overlap"
+        ) else {
+            await coordinator.shutdown()
+            return
+        }
+
+        let shutdownTask = Task { @MainActor in
+            await coordinator.shutdown()
+        }
+        check(
+            await waitUntil {
+                let subscriberCount = await broker.workState().subscriberCount
+                return handler.isBlockedAfterCancellation
+                    && !events.isRunning
+                    && subscriberCount == 0
+            },
+            "terminal shutdown is gated on physical action cleanup"
+        )
+        var rejectedRequestsReturned = [false, false, false]
+        let rejectedRequests = [
+            Task { @MainActor in
+                await coordinator.startAndWait()
+                rejectedRequestsReturned[0] = true
+            },
+            Task { @MainActor in
+                await coordinator.updateAndWait(policy: DisplayPolicy(isEnabled: false))
+                rejectedRequestsReturned[1] = true
+            },
+            Task { @MainActor in
+                await coordinator.updateAndWait(policy: .safeDefault)
+                rejectedRequestsReturned[2] = true
+            },
+        ]
+        for _ in 0..<50 { await Task.yield() }
+        check(rejectedRequestsReturned.allSatisfy { !$0 }, "awaited requests during shutdown join terminal cleanup")
+        check(!coordinator.isRunning && !events.isRunning, "terminal shutdown rejects overlapping restart requests")
+
+        handler.release()
+        await shutdownTask.value
+        for task in rejectedRequests { await task.value }
+        check(rejectedRequestsReturned.allSatisfy { $0 }, "terminal-overlap lifecycle waiters settle with shutdown")
+        check(model.workState == .stopped && !model.isRunning, "terminal shutdown returns with no model task ownership")
+        check(await broker.workState().subscriberCount == 0, "terminal shutdown returns with zero subscribers")
+        check(coordinator.activeDisplayIdentities.isEmpty && registry.openPanelCount == 0, "terminal shutdown closes every panel")
+        check(!events.isRunning && events.runningInstanceCount == 0, "terminal shutdown leaves zero event sources")
+
+        await coordinator.startAndWait()
+        model.start()
+        for _ in 0..<20 { await Task.yield() }
+        check(!coordinator.isRunning && !model.isRunning, "terminal coordinator and model cannot restart after shutdown returns")
+        check(await broker.workState().subscriberCount == 0, "post-shutdown start attempts perform zero subscriber work")
+    }
+
+    private mutating func beginGatedAction(
+        broker: ActivityBroker,
+        model: SurfaceActivityModel,
+        handler: GatedCancellationActionHandler,
+        id: String
+    ) async -> Bool {
+        do {
+            let submitted = try await broker.submit(
+                request(
+                    id: id,
+                    title: "Gated lifecycle action",
+                    actionIdentifier: "\(id).cancel",
+                    actionLabel: "Cancel",
+                    actionIntent: .cancel
+                )
+            )
+            check(
+                await waitUntil { model.snapshotVersion == submitted.version && model.currentAction != nil },
+                "\(id) action reaches the shared model"
+            )
+            guard let action = model.currentAction else {
+                check(false, "\(id) exposes a dispatchable action")
+                return false
+            }
+            check(model.dispatch(action), "\(id) begins cancellable action work")
+            check(
+                await waitUntil { handler.didStart && model.workState.hasActionTask },
+                "\(id) owns a physically active action task"
+            )
+            return true
+        } catch {
+            recordUnexpected(error, context: "\(id) gated lifecycle fixture")
+            return false
+        }
+    }
+
+    private func makeCoordinator(
+        displays: FakeDisplayProvider,
+        events: FakeLifecycleEventSource,
+        registry: SharedModelPanelRegistry,
+        model: SurfaceActivityModel,
+        policy: DisplayPolicy = .safeDefault
+    ) -> PanelCoordinator {
+        PanelCoordinator(
+            displayProvider: displays,
+            policy: policy,
+            lifecycleEventSource: events,
+            activityModel: model,
+            panelFactory: { snapshot, activityModel in
+                registry.makePanel(snapshot: snapshot, activityModel: activityModel)
+            }
+        )
+    }
+
+    mutating func verifyEventCallbackLeases() async {
+        let broker = ActivityBroker()
+        let model = SurfaceActivityModel(broker: broker)
+        let display = makeDisplaySnapshot(identity: 10, isMain: true)
+        let displays = FakeDisplayProvider(displays: [display])
+        let events = FakeLifecycleEventSource()
+        let registry = SharedModelPanelRegistry()
+        let coordinator = makeCoordinator(
+            displays: displays,
+            events: events,
+            registry: registry,
+            model: model
+        )
+        await coordinator.startAndWait()
+        check(events.registrationCount == 1, "initial coordinator run installs one leased event callback")
+        check(
+            await waitUntil { await broker.workState().subscriberCount == 1 },
+            "event-lease fixture starts one broker subscriber"
+        )
+
+        let enabledVariant = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [display.uuid],
+            preferredDisplayUUID: display.uuid
+        )
+        await coordinator.updateAndWait(policy: enabledVariant)
+        check(events.registrationCount == 1, "enabled policy update preserves its still-owned event registration")
+        let enabledUpdateActionBaseline = registry.totalPrimaryActionCount
+        events.replayRegistration(0, event: .primaryShortcut)
+        check(
+            registry.totalPrimaryActionCount == enabledUpdateActionBaseline + 1,
+            "preserved callback remains current and works exactly once after enabled policy update"
+        )
+
+        await coordinator.updateAndWait(policy: DisplayPolicy(isEnabled: false))
+        await coordinator.updateAndWait(policy: .safeDefault)
+        check(events.registrationCount == 2, "disable-enable installs a fresh immutable event lease")
+        let disableEnableBaseline = registry.mutationSnapshot
+        let disableEnableDisplayRequests = displays.requestCount
+        replayAllLifecycleEvents(events, registration: 0)
+        check(registry.mutationSnapshot == disableEnableBaseline, "retired disable-generation callbacks perform zero panel mutations")
+        check(displays.requestCount == disableEnableDisplayRequests, "retired disable-generation display callback performs zero discovery")
+        check(coordinator.isRunning && coordinator.policy.isEnabled, "retired disable-generation callbacks cannot change current lifecycle")
+        let currentAfterEnable = registry.totalPrimaryActionCount
+        events.replayRegistration(1, event: .primaryShortcut)
+        check(registry.totalPrimaryActionCount == currentAfterEnable + 1, "new enable callback works exactly once")
+
+        await coordinator.stopAndWait()
+        await coordinator.startAndWait()
+        check(events.registrationCount == 3, "stop-start installs a third event lease")
+        events.replayRegistration(2, event: .primaryShortcut)
+        guard let latestPanel = registry.latestOpenPanel else {
+            check(false, "stop-start replacement panel is available")
+            await coordinator.shutdown()
+            return
+        }
+        let latestHideCount = latestPanel.hideCount
+        events.replayRegistration(1, event: .workspaceWillSleep)
+        check(
+            latestPanel.hideCount == latestHideCount && coordinator.isRunning,
+            "retired generation-2 sleep callback cannot hide the latest panel while coordinator runs"
+        )
+        let stopStartBaseline = registry.mutationSnapshot
+        let stopStartDisplayRequests = displays.requestCount
+        replayAllLifecycleEvents(events, registration: 1)
+        check(registry.mutationSnapshot == stopStartBaseline, "all retired stop-generation callbacks perform zero panel mutations")
+        check(displays.requestCount == stopStartDisplayRequests, "retired stop-generation display callback performs zero discovery")
+        let currentAfterRestart = registry.totalPrimaryActionCount
+        events.replayRegistration(2, event: .primaryShortcut)
+        check(registry.totalPrimaryActionCount == currentAfterRestart + 1, "restart callback works exactly once")
+
+        await coordinator.shutdown()
+        let shutdownBaseline = registry.mutationSnapshot
+        let shutdownDisplayRequests = displays.requestCount
+        replayAllLifecycleEvents(events, registration: 2)
+        check(registry.mutationSnapshot == shutdownBaseline, "retired shutdown callbacks perform zero panel mutations")
+        check(displays.requestCount == shutdownDisplayRequests, "retired shutdown display callback performs zero discovery")
+        check(!coordinator.isRunning && !events.isRunning, "retired shutdown callbacks cannot revive terminal coordinator")
+        check(await broker.workState().subscriberCount == 0, "event-lease terminal fixture returns with zero subscribers")
+    }
+
+    private func replayAllLifecycleEvents(
+        _ events: FakeLifecycleEventSource,
+        registration: Int
+    ) {
+        events.replayRegistration(registration, event: .pointerMoved(CGPoint(x: 42, y: 42)))
+        events.replayRegistration(registration, event: .workspaceWillSleep)
+        events.replayRegistration(registration, event: .workspaceDidWake)
+        events.replayRegistration(registration, event: .displayConfigurationChanged)
+        events.replayRegistration(registration, event: .primaryShortcut)
+    }
+
+    mutating func verifyPointerEventDeliveryIsBounded() async {
+        let scheduler = ManualMainActorDeliveryScheduler()
+        let source = SystemPanelLifecycleEventSource(
+            pointerDeliveryScheduler: { operation in
+                scheduler.schedule(operation)
+            }
+        )
+        let probe = source.workProbe
+        var deliveredPositions: [CGPoint] = []
+        source.start { event in
+            guard case let .pointerMoved(point) = event else { return }
+            deliveredPositions.append(point)
+        }
+
+        let idleHotKeyResourceCount = probe.hotKeyResourceCount
+        check(probe.monitorCount == 0, "started lifecycle discovery owns zero idle pointer monitors")
+        source.setPointerMonitoringEnabled(true)
+        check(probe.monitorCount == 2, "visible demand installs one local and one global monitor")
+        for revision in 0..<20_000 {
+            source.submitPointerPositionForTesting(
+                CGPoint(x: CGFloat(revision), y: CGFloat(revision % 997))
+            )
+        }
+        let newestBurstPosition = CGPoint(x: 19_999, y: CGFloat(19_999 % 997))
+        check(scheduler.pendingOperationCount == 1, "high-rate pointer burst schedules exactly one MainActor delivery")
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 1
+                && probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "high-rate pointer burst owns one pending delivery and one newest-value buffer"
+        )
+        check(
+            probe.pointerDeliveryWorkState.maximumPendingDeliveryCount == 1,
+            "pointer delivery work-state never exceeds its one-task bound"
+        )
+
+        await scheduler.runNext()
+        check(deliveredPositions == [newestBurstPosition], "pointer burst delivers only its newest screen position")
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "newest pointer delivery drains all scheduled and buffered work"
+        )
+
+        source.submitPointerPositionForTesting(newestBurstPosition)
+        source.submitPointerPositionForTesting(newestBurstPosition)
+        check(scheduler.pendingOperationCount == 0, "equivalent delivered pointer positions schedule no work")
+
+        source.setPointerMonitoringEnabled(false)
+        check(probe.monitorCount == 0, "final hide removes both pointer monitors")
+        check(
+            probe.observerCount == 4
+                && probe.hotKeyResourceCount == idleHotKeyResourceCount
+                && probe.handlerCount == 1 && probe.callbackLeaseCount == 1,
+            "final hide preserves display, Space, sleep/wake, and shortcut discovery"
+        )
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "final hide leaves no pending pointer delivery"
+        )
+        source.setPointerMonitoringEnabled(true)
+
+        source.submitPointerPositionForTesting(CGPoint(x: 21_000, y: 210))
+        check(scheduler.pendingOperationCount == 1, "a fresh pointer position schedules one delivery")
+        source.stop()
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "shutdown synchronously revokes pending pointer ownership"
+        )
+        source.start { event in
+            guard case let .pointerMoved(point) = event else { return }
+            deliveredPositions.append(point)
+        }
+        source.setPointerMonitoringEnabled(true)
+        let restartedPosition = CGPoint(x: 22_000, y: 220)
+        source.submitPointerPositionForTesting(restartedPosition)
+        check(scheduler.pendingOperationCount == 2, "restart owns one new delivery alongside one stale scheduled callback")
+        await scheduler.runNext()
+        check(deliveredPositions == [newestBurstPosition], "stop revokes a queued pointer callback before delivery")
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 1
+                && probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "stale callback cannot consume successor delivery ownership"
+        )
+        await scheduler.runNext()
+        check(
+            deliveredPositions == [newestBurstPosition, restartedPosition],
+            "restart delivers only its fresh leased pointer position"
+        )
+        source.stop()
+        check(
+            probe.pointerDeliveryWorkState.pendingDeliveryCount == 0
+                && !probe.pointerDeliveryWorkState.hasBufferedPosition,
+            "stopped pointer delivery settles with zero owned work"
+        )
+        check(probe.monitorCount == 0, "stop removes both pointer monitors")
+
+        let releaseScheduler = ManualMainActorDeliveryScheduler()
+        var releasedDeliveryCount = 0
+        var releasableSource: SystemPanelLifecycleEventSource? = SystemPanelLifecycleEventSource(
+            pointerDeliveryScheduler: { operation in
+                releaseScheduler.schedule(operation)
+            }
+        )
+        let releaseProbe = releasableSource?.workProbe
+        weak var releasedSource: SystemPanelLifecycleEventSource?
+        releasedSource = releasableSource
+        releasableSource?.start { event in
+            if case .pointerMoved = event {
+                releasedDeliveryCount += 1
+            }
+        }
+        releasableSource?.setPointerMonitoringEnabled(true)
+        for revision in 0..<20_000 {
+            releasableSource?.submitPointerPositionForTesting(
+                CGPoint(x: CGFloat(revision), y: CGFloat(-revision))
+            )
+        }
+        check(releaseScheduler.pendingOperationCount == 1, "release stress retains one queued delivery at peak load")
+        releasableSource = nil
+        check(releasedSource == nil, "high-rate event source releases synchronously without task retention")
+        check(
+            await waitUntil { releaseProbe?.isRunning == false },
+            "high-rate event source release retires platform registrations on MainActor"
+        )
+        await releaseScheduler.runNext()
+        check(releasedDeliveryCount == 0, "released high-rate event source emits no stale pointer callback")
+        check(releaseProbe?.hasWork == false, "released high-rate event source settles every owned resource")
+    }
+
+    mutating func verifyCoordinatorDeinitDoesNotPoisonSharedModel() async {
+        let broker = ActivityBroker()
+        let model = SurfaceActivityModel(broker: broker)
+        let displays = FakeDisplayProvider(displays: [makeDisplaySnapshot(identity: 10, isMain: true)])
+        let firstEvents = FakeLifecycleEventSource()
+        let firstRegistry = SharedModelPanelRegistry()
+        var firstCoordinator: PanelCoordinator? = makeCoordinator(
+            displays: displays,
+            events: firstEvents,
+            registry: firstRegistry,
+            model: model
+        )
+        weak var releasedFirstCoordinator: PanelCoordinator?
+        releasedFirstCoordinator = firstCoordinator
+        await firstCoordinator?.startAndWait()
+        check(
+            await waitUntil { await broker.workState().subscriberCount == 1 },
+            "first coordinator starts the shared model subscriber"
+        )
+        firstCoordinator = nil
+        check(releasedFirstCoordinator == nil, "first coordinator deinitializes synchronously")
+        check(
+            await waitUntil { !firstEvents.isRunning && firstRegistry.openPanelCount == 0 },
+            "coordinator deinit retires only its own events and panels"
+        )
+        let subscriberCountAfterFirstDeinit = await broker.workState().subscriberCount
+        check(model.isRunning && subscriberCountAfterFirstDeinit == 1, "old coordinator deinit does not terminally stop shared model")
+
+        let secondEvents = FakeLifecycleEventSource()
+        let secondRegistry = SharedModelPanelRegistry()
+        let secondCoordinator = makeCoordinator(
+            displays: displays,
+            events: secondEvents,
+            registry: secondRegistry,
+            model: model
+        )
+        await secondCoordinator.startAndWait()
+        check(secondCoordinator.isRunning && secondRegistry.openPanelCount == 0, "replacement coordinator starts panel-free with the same idle model")
+        check(await broker.workState().subscriberCount == 1, "replacement owner retains exactly one shared broker subscriber")
+        do {
+            let submitted = try await broker.submit(request(id: "replacement-owner", title: "Replacement owner update"))
+            check(
+                await waitUntil { model.snapshotVersion == submitted.version },
+                "replacement coordinator model receives fresh broker updates"
+            )
+            check(
+                await waitUntil { secondRegistry.openPanelCount == 1 },
+                "replacement coordinator constructs its panel on fresh broker activity"
+            )
+        } catch {
+            recordUnexpected(error, context: "replacement coordinator broker update")
+        }
+        await secondCoordinator.stopAndWait()
+        model.start()
+        check(
+            await waitUntil {
+                let subscriberCount = await broker.workState().subscriberCount
+                return model.isRunning && subscriberCount == 1
+            },
+            "shared model remains directly restartable after replacement coordinator stop"
+        )
+        await model.stop()
+
+        let drainBroker = ActivityBroker()
+        let drainHandler = TrackingGatedActionHandler()
+        let drainModel = SurfaceActivityModel(broker: drainBroker, actionHandler: drainHandler)
+        let drainDisplays = FakeDisplayProvider(displays: [makeDisplaySnapshot(identity: 20, isMain: true)])
+        let drainEvents = FakeLifecycleEventSource()
+        let drainRegistry = SharedModelPanelRegistry()
+        var drainingCoordinator: PanelCoordinator? = makeCoordinator(
+            displays: drainDisplays,
+            events: drainEvents,
+            registry: drainRegistry,
+            model: drainModel
+        )
+        await drainingCoordinator?.startAndWait()
+        guard await submitAndDispatchTrackedAction(
+            broker: drainBroker,
+            model: drainModel,
+            handler: drainHandler,
+            id: "deinit-pending-drain"
+        ) else {
+            await drainModel.shutdown()
+            return
+        }
+
+        drainingCoordinator?.stop()
+        check(
+            await waitUntil {
+                let subscriberCount = await drainBroker.workState().subscriberCount
+                return drainHandler.blockedInvocations.contains(0)
+                    && drainModel.workState.unsettledActionTaskCount == 1
+                    && drainModel.lifecycleRequestTaskCount == 1
+                    && subscriberCount == 0
+            },
+            "replacement-owner fixture reaches a model-owned physical drain from synchronous coordinator stop"
+        )
+        drainingCoordinator = nil
+        check(
+            await waitUntil { !drainEvents.isRunning && drainRegistry.openPanelCount == 0 },
+            "deinit during pending drain cleans only coordinator-owned state"
+        )
+        check(
+            drainModel.workState.unsettledActionTaskCount == 1
+                && drainModel.lifecycleRequestTaskCount == 1,
+            "deinit during pending drain preserves all model-owned work"
+        )
+
+        let replacementEvents = FakeLifecycleEventSource()
+        let replacementRegistry = SharedModelPanelRegistry()
+        let replacementCoordinator = makeCoordinator(
+            displays: drainDisplays,
+            events: replacementEvents,
+            registry: replacementRegistry,
+            model: drainModel
+        )
+        var replacementStartReturned = false
+        let replacementStartTask = Task { @MainActor in
+            await replacementCoordinator.startAndWait()
+            replacementStartReturned = true
+        }
+        for _ in 0..<50 { await Task.yield() }
+        check(!replacementStartReturned, "successor awaited start joins the inherited model drain")
+        check(replacementCoordinator.isRunning && replacementRegistry.openPanelCount == 0, "successor coordinator stays panel-free while the prior model drain is pending")
+        drainHandler.release(invocation: 0)
+        await replacementStartTask.value
+        check(replacementStartReturned, "successor awaited start returns after inherited model work settles")
+        check(
+            await waitUntil {
+                let subscriberCount = await drainBroker.workState().subscriberCount
+                return drainModel.isRunning && subscriberCount == 1
+            },
+            "successor start is replayed after pending drain without old deinit poisoning"
+        )
+        check(drainHandler.activeHandlerCount == 0, "pending drain completes without orphaned action work")
+        check(replacementCoordinator.isRunning && replacementEvents.isRunning, "successor coordinator remains current after drain completion")
+        check(
+            await waitUntil { replacementRegistry.openPanelCount == 1 },
+            "successor coordinator constructs one panel after fresh activity replay"
+        )
+        await replacementCoordinator.shutdown()
+        let finalDrainSubscriberCount = await drainBroker.workState().subscriberCount
+        check(drainModel.workState == .stopped && finalDrainSubscriberCount == 0, "explicit final owner shutdown remains terminal and complete")
+    }
+
+    mutating func verifyDetachedReleaseTeardown() async {
+        var lifecycleSource: SystemPanelLifecycleEventSource? = SystemPanelLifecycleEventSource()
+        let lifecycleProbe = lifecycleSource?.workProbe
+        lifecycleSource?.start { _ in }
+        weak var releasedLifecycleSource: SystemPanelLifecycleEventSource?
+        releasedLifecycleSource = lifecycleSource
+        check(lifecycleProbe?.isRunning == true, "detached-release system event source starts explicitly")
+        check(lifecycleProbe?.observerCount == 4, "detached-release system event source owns all notification observers")
+        check(lifecycleProbe?.handlerCount == 1, "detached-release system event source owns one event handler")
+        check(lifecycleProbe?.hasWork == true, "detached-release system event source exposes active platform work")
+
+        let lifecycleGate = DetachedReleaseGate()
+        let lifecycleRelease = Task.detached { [lifecycleSource] in
+            await lifecycleGate.wait()
+            withExtendedLifetime(lifecycleSource) {}
+        }
+        lifecycleSource = nil
+        await lifecycleGate.open()
+        await lifecycleRelease.value
+        check(releasedLifecycleSource == nil, "system event source last strong reference is released by a detached task")
+        check(
+            await waitUntil { lifecycleProbe?.hasWork == false },
+            "detached system event source deinit settles every observer, monitor, hot-key, and handler resource"
+        )
+        check(lifecycleProbe?.observerCount == 0, "detached system event source removes notification observers exactly")
+        check(lifecycleProbe?.monitorCount == 0, "detached system event source removes pointer monitors exactly")
+        check(lifecycleProbe?.hotKeyResourceCount == 0, "detached system event source removes hot-key resources exactly")
+        check(lifecycleProbe?.handlerCount == 0, "detached system event source clears its callback exactly")
+        check(lifecycleProbe?.callbackLeaseCount == 0, "detached system event source retires its callback lease exactly")
+
+        let observerModel = makeEmptyPreviewModel()
+        let surfaceScheduler = ManualOneShotScheduler()
+        var surfaceModel: PanelSurfaceModel? = PanelSurfaceModel(
+            displayGeometry: makeDisplaySnapshot(identity: 10, isMain: true).geometry,
+            scheduler: surfaceScheduler,
+            activityModel: observerModel
+        )
+        surfaceModel?.send(.primaryAction)
+        weak var releasedSurfaceModel: PanelSurfaceModel?
+        releasedSurfaceModel = surfaceModel
+        check(observerModel.observerCount == 1, "detached-release surface fixture owns one activity observer")
+        check(surfaceScheduler.activeOperationCount == 1, "detached-release surface fixture owns one scheduled operation")
+
+        let surfaceGate = DetachedReleaseGate()
+        let surfaceRelease = Task.detached { [surfaceModel] in
+            await surfaceGate.wait()
+            withExtendedLifetime(surfaceModel) {}
+        }
+        surfaceModel = nil
+        await surfaceGate.open()
+        await surfaceRelease.value
+        check(releasedSurfaceModel == nil, "surface last strong reference is released by a detached task")
         check(
             await waitUntil {
                 releasedSurfaceModel == nil
@@ -1959,6 +2573,95 @@ private struct SurfaceHarness {
                 completionModel.content.action?.label == "Done"
                     && completionLayout.hitRegion != .empty,
                 "completion render contract keeps its real Done target visible and interactive"
+            )
+
+            let tallNotchedDisplay = DisplayGeometry(
+                frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
+                visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 826),
+                backingScaleFactor: 2,
+                topEdgeOcclusion: TopEdgeOcclusion(
+                    frame: CGRect(x: 610, y: 826, width: 220, height: 74)
+                )
+            )
+            let filePeekModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.file,
+                displayGeometry: tallNotchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                filePeekModel.layout.surfaceFrame.height
+                    - filePeekModel.layout.surfaceContentTopInset == 36,
+                "standard notched Peek reserves a thirty-six-point body below the camera housing"
+            )
+
+            let timerModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.timer,
+                displayGeometry: tallNotchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                timerModel.layout.surfaceFrame.height
+                    - timerModel.layout.surfaceContentTopInset == 112,
+                "expanded notched timer reserves its full countdown composition below the housing"
+            )
+
+            let genericExpanded = ActivitySurfacePreviewScenario(
+                name: "Generic expanded body geometry",
+                state: .expanded,
+                current: ActivitySurfacePreviewCatalog.generic.current
+            )
+            let genericExpandedModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: genericExpanded,
+                displayGeometry: tallNotchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                genericExpandedModel.layout.surfaceFrame.height
+                    - genericExpandedModel.layout.surfaceContentTopInset == 104,
+                "standard expanded detail reserves its base body below the housing"
+            )
+
+            let meetingModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.meeting,
+                displayGeometry: tallNotchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                meetingModel.layout.surfaceFrame.height
+                    - meetingModel.layout.surfaceContentTopInset == 132,
+                "standard expanded action reserves its larger body below the housing"
+            )
+
+            let queuedActionModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.media,
+                displayGeometry: notchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            let queuedActionLayout = queuedActionModel.layout
+            let queuedActionBodyHeight = queuedActionLayout.surfaceFrame.height
+                - queuedActionLayout.surfaceContentTopInset
+            check(
+                queuedActionBodyHeight == 176,
+                "standard expanded queue and action reserve a one-hundred-seventy-six-point body"
+            )
+            check(
+                queuedActionLayout.surfaceFrame.height
+                    <= PanelMetrics.feasibility.maximumSize.height,
+                "worst-case standard queue and action remain inside the fixed maximum envelope"
+            )
+
+            let clampedQueuedActionModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.media,
+                displayGeometry: tallNotchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            let clampedQueuedActionLayout = clampedQueuedActionModel.layout
+            check(
+                clampedQueuedActionLayout.surfaceFrame.height
+                    == PanelMetrics.feasibility.maximumSize.height
+                    && clampedQueuedActionLayout.surfaceFrame.height
+                        - clampedQueuedActionLayout.surfaceContentTopInset == 166,
+                "queued action body uses every available point when a tall occlusion forces clamping"
             )
         } catch {
             recordUnexpected(error, context: "semantic Volume surface previews")
@@ -2355,6 +3058,10 @@ private struct SurfaceHarness {
             compactGeometryKey != launcherGeometryKey,
             "same-state launcher geometry produces a distinct animation key"
         )
+        check(
+            launcher.acceptsPointerInteraction && !launcher.acceptsBackgroundTap,
+            "launcher accepts only its explicit preset buttons, not an ancestor tap"
+        )
 
         let passiveScenarios = [
             ActivitySurfacePreviewCatalog.volume,
@@ -2370,6 +3077,16 @@ private struct SurfaceHarness {
                     scenario: scenario,
                     displayGeometry: display,
                     scheduler: scheduler
+                )
+                let disposition = model.pointerDisposition(
+                    at: model.layout.surfaceFrame.center
+                )
+                check(
+                    !model.acceptsPointerInteraction
+                        && !model.acceptsBackgroundTap
+                        && !disposition.acceptsMouseEvents
+                        && !disposition.isInsideTargetSurface,
+                    "\(scenario.name) remains click-through across its visible surface"
                 )
                 model.setPointerInside(true)
                 scheduler.runAll()
@@ -2408,10 +3125,18 @@ private struct SurfaceHarness {
                 model.state == .compact,
                 "Focus Timer suppresses Peek when it would repeat the compact countdown"
             )
+            check(
+                model.acceptsBackgroundTap && model.acceptsPointerInteraction,
+                "compact Focus Timer owns one deliberate expansion tap"
+            )
             model.send(.primaryAction)
             check(
                 model.state == .expanded,
                 "Focus Timer expands only for its useful Cancel action"
+            )
+            check(
+                !model.acceptsBackgroundTap && model.acceptsPointerInteraction,
+                "expanded Focus Timer delegates input to Cancel without an ancestor tap"
             )
             check(
                 !model.isHitRegionSettled
@@ -2474,6 +3199,14 @@ private struct SurfaceHarness {
             check(
                 titleOnlyModel.state == .compact,
                 "standard title-only activity opens neither redundant Peek nor empty Expanded"
+            )
+            let titleWingWidth = display.topEdgeOcclusion.map {
+                (titleOnlyModel.layout.surfaceFrame.width - $0.frame.width) / 2
+            }
+            check(
+                titleWingWidth.map { $0 >= 76 } == true
+                    && !titleOnlyModel.acceptsPointerInteraction,
+                "title-only automation reserves a readable notch wing without becoming a dead control"
             )
 
             let detailedScheduler = ManualOneShotScheduler()
@@ -2703,6 +3436,159 @@ private struct SurfaceHarness {
         await broker.shutdown()
     }
 
+    mutating func verifyWindowTransitionStaging() {
+        let display = makeDisplaySnapshot(identity: 9).geometry
+        let scheduler = ManualOneShotScheduler()
+        let model = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: scheduler,
+            activityModel: makeEmptyPreviewModel()
+        )
+        model.setWindowPresented(false)
+
+        let gate = PanelWindowTransitionGate(scheduler: scheduler)
+        let trace = WindowTransitionTrace()
+        gate.orderIn(
+            stageHidden: {
+                trace.append("hidden")
+                return model.stageForWindowOrderIn()
+            },
+            orderFront: {
+                trace.append("front")
+                model.setWindowPresented(true)
+            },
+            commitCompact: {
+                trace.append("compact")
+                model.commitStagedWindowOrderIn()
+            }
+        )
+        check(
+            trace.events == ["hidden", "front"]
+                && model.state == .compact
+                && model.renderedState == .hidden
+                && model.content.state == .hidden
+                && model.interactionHitRegion == .empty,
+            "window order-in presents an inert Hidden render without withdrawing Compact demand"
+        )
+        check(
+            scheduler.lastScheduledDelay == PanelWindowTransitionGate.orderInStagingDelay
+                && scheduler.activeOperationCount == 1
+                && gate.pendingKind == .orderInCommit,
+            "Compact commit waits one display frame so Hidden cannot be coalesced away"
+        )
+
+        scheduler.runNext()
+        check(
+            trace.events == ["hidden", "front", "compact"]
+                && model.state == .compact
+                && model.renderedState == .compact
+                && !model.isHitRegionSettled
+                && scheduler.lastScheduledDelay == .milliseconds(220),
+            "staged Compact commit enters the existing conservative morph interval"
+        )
+        scheduler.runAll()
+        check(
+            model.interactionHitRegion == model.layout.hitRegion
+                && model.isHitRegionSettled
+                && scheduler.activeOperationCount == 0,
+            "ordered-in Compact controls become interactive only after the morph settles"
+        )
+
+        let exitScheduler = ManualOneShotScheduler()
+        let exitGate = PanelWindowTransitionGate(scheduler: exitScheduler)
+        let exitCounter = CallbackCounter()
+        exitGate.orderOut(after: .milliseconds(220)) {
+            exitCounter.increment()
+        }
+        check(
+            exitCounter.count == 0
+                && exitScheduler.lastScheduledDelay == .milliseconds(220)
+                && exitGate.hasPendingOrderOut,
+            "standard demand loss keeps the physical panel ordered in for the outgoing morph"
+        )
+        exitScheduler.runAll()
+        check(exitCounter.count == 1, "standard order-out fires once after 220 milliseconds")
+
+        let interruptedScheduler = ManualOneShotScheduler()
+        let interruptedGate = PanelWindowTransitionGate(scheduler: interruptedScheduler)
+        let staleExitCounter = CallbackCounter()
+        let replacementTrace = WindowTransitionTrace()
+        interruptedGate.orderOut(after: .milliseconds(220)) {
+            staleExitCounter.increment()
+        }
+        interruptedGate.orderIn(
+            stageHidden: {
+                replacementTrace.append("hidden")
+                return true
+            },
+            orderFront: {
+                replacementTrace.append("front")
+            },
+            commitCompact: {
+                replacementTrace.append("compact")
+            }
+        )
+        interruptedScheduler.runAll()
+        check(
+            staleExitCounter.count == 0
+                && replacementTrace.events == ["hidden", "front", "compact"]
+                && interruptedScheduler.activeOperationCount == 0,
+            "a newer order-in cancels the stale physical exit generation"
+        )
+
+        let reverseScheduler = ManualOneShotScheduler()
+        let reverseGate = PanelWindowTransitionGate(scheduler: reverseScheduler)
+        let staleCommitCounter = CallbackCounter()
+        let replacementExitCounter = CallbackCounter()
+        reverseGate.orderIn(
+            stageHidden: { true },
+            orderFront: {},
+            commitCompact: {
+                staleCommitCounter.increment()
+            }
+        )
+        reverseGate.orderOut(after: nil) {
+            replacementExitCounter.increment()
+        }
+        reverseScheduler.runAll()
+        check(
+            staleCommitCounter.count == 0
+                && replacementExitCounter.count == 1
+                && reverseScheduler.activeOperationCount == 0,
+            "a newer immediate retirement cancels the stale Compact commit"
+        )
+
+        let immediateGate = PanelWindowTransitionGate(
+            scheduler: ManualOneShotScheduler()
+        )
+        let immediateCounter = CallbackCounter()
+        immediateGate.orderOut(after: nil) {
+            immediateCounter.increment()
+        }
+        check(
+            immediateCounter.count == 1 && immediateGate.pendingKind == nil,
+            "Reduce Motion performs physical order-out synchronously"
+        )
+
+        let reducedScheduler = ManualOneShotScheduler()
+        let reducedModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: reducedScheduler,
+            activityModel: makeEmptyPreviewModel()
+        )
+        reducedModel.setWindowPresented(false)
+        reducedModel.updateReduceMotion(true)
+        check(
+            !reducedModel.stageForWindowOrderIn()
+                && reducedModel.renderedState == .compact
+                && reducedModel.windowOrderOutDelay == nil
+                && reducedScheduler.activeOperationCount == 0,
+            "Reduce Motion skips the staged entrance and exposes no delayed exit"
+        )
+    }
+
     mutating func verifyReduceMotionAndRapidStateChanges() {
         let scheduler = ManualOneShotScheduler()
         let model = PanelSurfaceModel(
@@ -2731,6 +3617,11 @@ private struct SurfaceHarness {
         )
 
         model.updateReduceMotion(false)
+        check(
+            model.motionStyle == .standard
+                && model.motionStyle.allowsHoverOpacityAnimation,
+            "disabling system Reduce Motion restores standard presentation immediately"
+        )
         model.send(.primaryAction)
         check(scheduler.lastScheduledDelay == .milliseconds(220), "standard morph remains inside the 180–240 ms brief range")
         for _ in 0..<500 {
@@ -3226,6 +4117,15 @@ private final class CallbackCounter {
 }
 
 @MainActor
+private final class WindowTransitionTrace {
+    private(set) var events: [String] = []
+
+    func append(_ event: String) {
+        events.append(event)
+    }
+}
+
+@MainActor
 private final class ManualOneShotScheduler: OneShotScheduling {
     private struct Entry {
         let delay: Duration
@@ -3252,14 +4152,19 @@ private final class ManualOneShotScheduler: OneShotScheduling {
         return token
     }
 
+    func runNext() {
+        guard !entries.isEmpty else { return }
+        let entry = entries.removeFirst()
+        if !entry.token.isCancelled {
+            entry.operation()
+        }
+    }
+
     func runAll() {
         var safetyBudget = 10_000
         while !entries.isEmpty, safetyBudget > 0 {
             safetyBudget -= 1
-            let entry = entries.removeFirst()
-            if !entry.token.isCancelled {
-                entry.operation()
-            }
+            runNext()
         }
     }
 }
@@ -3609,6 +4514,30 @@ private func writeNativeVisualQA(to directory: URL) throws {
             scenario: { compactOutput },
             geometry: notchlessGeometry,
             desktop: .light
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-battery-notched.png",
+            scenario: { ActivitySurfacePreviewCatalog.battery },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-charging-notchless.png",
+            scenario: { ActivitySurfacePreviewCatalog.charging },
+            geometry: notchlessGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-generic-peek-notched.png",
+            scenario: { ActivitySurfacePreviewCatalog.generic },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-queued-action-expanded-notched.png",
+            scenario: { ActivitySurfacePreviewCatalog.media },
+            geometry: notchedGeometry,
+            desktop: .dark
         ),
     ]
     guard Set(scenarios.map(\.desktop)) == Set(NativeVisualQADesktop.allCases) else {

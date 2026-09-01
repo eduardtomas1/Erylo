@@ -30,8 +30,9 @@ Run:
 Scripts/ci.sh
 ```
 
-To regenerate the native Focus Timer and Volume visual-QA set on representative
-notched and notchless geometry while running the deterministic surface harness,
+To regenerate the 14-frame native Focus Timer, Battery, Volume, generic Peek,
+and queued-action visual-QA set on representative notched and notchless geometry
+while running the deterministic surface harness,
 set the output directory below. Timer fixtures use a timestamp projection
 anchored immediately before each render, so the production countdown path—not
 static fallback copy—produces the visible value. The renderer hosts the

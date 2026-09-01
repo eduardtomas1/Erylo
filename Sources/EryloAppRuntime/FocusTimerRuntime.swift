@@ -1,7 +1,111 @@
 import EryloActivity
 import EryloGlance
 import EryloSurface
+import EryloTrust
 import Foundation
+
+private enum FocusTimerPersistenceLoadResult {
+    case missing
+    case active(PersistedFocusTimerSession)
+    case corrupt
+    case unreadable
+    case unsupportedSchema
+}
+
+private struct PersistedFocusTimerSession: Codable, Equatable, Sendable {
+    let sessionID: UUID
+    let startedAt: Date
+    let endsAt: Date
+}
+
+private struct PersistedFocusTimerEnvelope: Codable, Sendable {
+    static let currentSchemaVersion = 1
+
+    let schemaVersion: Int
+    let activeSession: PersistedFocusTimerSession?
+
+    init(activeSession: PersistedFocusTimerSession?) {
+        schemaVersion = Self.currentSchemaVersion
+        self.activeSession = activeSession
+    }
+}
+
+private struct PersistedFocusTimerVersionEnvelope: Decodable {
+    let schemaVersion: Int
+}
+
+/// One atomically replaced deadline record. It deliberately stores no ticks and performs
+/// no work until the owning runtime calls `load()` from its explicit startup lifecycle.
+private struct FocusTimerPersistence: Sendable {
+    static let maximumEncodedBytes = 1_024
+
+    let storage: (any AtomicSettingsStorage)?
+    let storageKey: String
+
+    func load() -> FocusTimerPersistenceLoadResult {
+        guard let storage else { return .missing }
+        let data: Data
+        do {
+            guard let stored = try storage.data(forKey: storageKey) else {
+                return .missing
+            }
+            data = stored
+        } catch {
+            return .unreadable
+        }
+        guard data.count <= Self.maximumEncodedBytes,
+              let version = try? JSONDecoder().decode(
+                PersistedFocusTimerVersionEnvelope.self,
+                from: data
+              ) else {
+            return .corrupt
+        }
+        guard version.schemaVersion == PersistedFocusTimerEnvelope.currentSchemaVersion else {
+            return .unsupportedSchema
+        }
+        guard let envelope = try? JSONDecoder().decode(
+            PersistedFocusTimerEnvelope.self,
+            from: data
+        ) else { return .corrupt }
+        guard let activeSession = envelope.activeSession else { return .missing }
+        return .active(activeSession)
+    }
+
+    @discardableResult
+    func replace(with session: PersistedFocusTimerSession?) -> Bool {
+        guard let storage else { return true }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(
+            PersistedFocusTimerEnvelope(activeSession: session)
+        ), data.count <= Self.maximumEncodedBytes else {
+            return false
+        }
+        do {
+            try storage.replace(data, forKey: storageKey)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func clear(ifMatching sessionID: UUID) -> Bool {
+        // Erylo is the sole writer for this dedicated key. The identity check prevents stale
+        // in-process callbacks from clearing a replacement; it is not a cross-process CAS.
+        guard storage != nil else { return true }
+        switch load() {
+        case .missing:
+            return true
+        case .corrupt:
+            return replace(with: nil)
+        case .unreadable, .unsupportedSchema:
+            return false
+        case let .active(session):
+            guard session.sessionID == sessionID else { return false }
+            return replace(with: nil)
+        }
+    }
+}
 
 package enum FocusTimerPreset: Int, CaseIterable, Equatable, Sendable {
     case fifteenMinutes = 15
@@ -33,6 +137,7 @@ package struct FocusTimerRuntimeWorkState: Equatable, Sendable {
 package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     private enum Phase {
         case initialized
+        case starting
         case running
         case shuttingDown
         case stopped
@@ -56,17 +161,20 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     private struct ActiveTimer {
         let countdown: CountdownTimer
         let operationIdentity: CountdownOperationIdentity
+        let sessionID: UUID
     }
 
     package let provider: CountdownGlanceProvider
 
     private let clock: any GlanceClock
     private let completionNotifier: @MainActor @Sendable () -> Void
+    private let persistence: FocusTimerPersistence
     private var phase = Phase.initialized
     private var nextSequence: UInt64 = 0
     private var pendingUserOperation: SequencedOperation?
     private var pendingDemandOperation: SequencedOperation?
     private var pendingRoutedOperation: SequencedOperation?
+    private var startupTask: Task<Void, Never>?
     private var workerTask: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
     private var isProviderEnabled = false
@@ -77,31 +185,54 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     package init(
         provider: CountdownGlanceProvider,
         clock: any GlanceClock = SystemGlanceClock(),
+        persistenceStorage: (any AtomicSettingsStorage)? = nil,
+        persistenceKey: String = "erylo.focus-timer.active-session",
         completionNotifier: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.provider = provider
         self.clock = clock
+        persistence = FocusTimerPersistence(
+            storage: persistenceStorage,
+            storageKey: persistenceKey
+        )
         self.completionNotifier = completionNotifier
     }
 
     package convenience init(
         broker: ActivityBroker,
         clock: any GlanceClock = SystemGlanceClock(),
+        persistenceStorage: (any AtomicSettingsStorage)? = nil,
+        persistenceKey: String = "erylo.focus-timer.active-session",
         completionNotifier: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.init(
             provider: CountdownGlanceProvider(broker: broker, clock: clock),
             clock: clock,
+            persistenceStorage: persistenceStorage,
+            persistenceKey: persistenceKey,
             completionNotifier: completionNotifier
         )
     }
 
     package func start() async {
-        guard phase == .initialized else { return }
-        await provider.setNaturalCompletionHandler { [weak self] completedTimer in
-            await self?.naturalCompletionDidFinish(completedTimer)
+        if let startupTask {
+            _ = await startupTask.value
+            return
         }
-        phase = .running
+        guard phase == .initialized else { return }
+        phase = .starting
+        let task = Task { @MainActor [self] in
+            await provider.setNaturalCompletionHandler { [weak self] completedTimer in
+                await self?.naturalCompletionDidFinish(completedTimer)
+            }
+            guard phase == .starting else { return }
+            await restorePersistedTimerIfNeeded()
+            guard phase == .starting else { return }
+            phase = .running
+        }
+        startupTask = task
+        _ = await task.value
+        startupTask = nil
     }
 
     @discardableResult
@@ -158,7 +289,7 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
 
     package func workState() -> FocusTimerRuntimeWorkState {
         FocusTimerRuntimeWorkState(
-            hasWorkerTask: workerTask != nil,
+            hasWorkerTask: startupTask != nil || workerTask != nil,
             pendingOperationCount: [
                 pendingUserOperation,
                 pendingDemandOperation,
@@ -183,14 +314,23 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         guard phase != .stopped else { return }
 
         phase = .shuttingDown
+        if let pendingUserOperation,
+           case .cancel = pendingUserOperation.operation,
+           let activeTimer = activeTimer {
+            // A synchronously accepted Cancel is already the latest user intent even if its
+            // worker has not started. Preserve that linearization across an immediate Quit.
+            _ = persistence.clear(ifMatching: activeTimer.sessionID)
+        }
         pendingUserOperation = nil
         pendingDemandOperation = nil
         if case let .routedCancel(_, continuation)? = pendingRoutedOperation?.operation {
             continuation.resume(returning: .unavailable)
         }
         pendingRoutedOperation = nil
+        let startupTask = startupTask
         let workerTask = workerTask
         let task = Task { @MainActor [self] in
+            _ = await startupTask?.value
             _ = await workerTask?.value
             await provider.setPresentationDemand(.hidden)
             await provider.cancelCountdown()
@@ -198,6 +338,7 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
             await provider.setNaturalCompletionHandler(nil)
             isProviderEnabled = false
             activeTimer = nil
+            self.startupTask = nil
             self.workerTask = nil
             phase = .stopped
             shutdownTask = nil
@@ -271,7 +412,8 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     private func startTimer(duration: TimeInterval) async {
         let now = await clock.now()
         let end = now.addingTimeInterval(duration)
-        guard now.timeIntervalSinceReferenceDate.isFinite,
+        guard phase == .running,
+              now.timeIntervalSinceReferenceDate.isFinite,
               end.timeIntervalSinceReferenceDate.isFinite,
               let timer = try? CountdownTimer(
                 title: "Focus Timer",
@@ -281,11 +423,54 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
             return
         }
 
+        let sessionID = UUID()
+        let persisted = PersistedFocusTimerSession(
+            sessionID: sessionID,
+            startedAt: timer.startedAt,
+            endsAt: timer.endsAt
+        )
+        // Replacement is ordered after the deadline-record write. A failed atomic write leaves
+        // the previous live and persisted timer coherent instead of resurrecting stale state.
+        guard persistence.replace(with: persisted) else { return }
+        await activateTimer(timer, sessionID: sessionID)
+    }
+
+    private func restorePersistedTimerIfNeeded() async {
+        switch persistence.load() {
+        case .missing:
+            return
+        case .corrupt:
+            _ = persistence.replace(with: nil)
+            return
+        case .unreadable, .unsupportedSchema:
+            return
+        case let .active(session):
+            let now = await clock.now()
+            // Teardown may be admitted while the clock is suspended. That lifecycle race must
+            // leave a valid persisted session untouched for the next launch.
+            guard phase == .starting else { return }
+            guard now.timeIntervalSinceReferenceDate.isFinite,
+                  session.startedAt <= now,
+                  session.endsAt > now,
+                  let timer = try? CountdownTimer(
+                    title: "Focus Timer",
+                    startedAt: session.startedAt,
+                    endsAt: session.endsAt
+                  ) else {
+                _ = persistence.replace(with: nil)
+                return
+            }
+            await activateTimer(timer, sessionID: session.sessionID)
+        }
+    }
+
+    private func activateTimer(_ timer: CountdownTimer, sessionID: UUID) async {
         let demand: CountdownPresentationDemand = isSurfaceVisible ? .visible : .hidden
         let operationIdentity = CountdownOperationIdentity()
         activeTimer = ActiveTimer(
             countdown: timer,
-            operationIdentity: operationIdentity
+            operationIdentity: operationIdentity,
+            sessionID: sessionID
         )
         if await provider.status().isEnabled {
             await provider.setPresentationDemand(demand)
@@ -301,12 +486,33 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         if isProviderEnabled {
             await provider.setPresentationDemand(demand)
         }
+        // The absolute deadline can pass between restore validation and provider activation.
+        // Reconcile after the provider's own clock check so no persisted 00:00 ghost survives.
+        await reconcileMissingProviderCountdown(sessionID: sessionID)
+    }
+
+    private func reconcileMissingProviderCountdown(sessionID: UUID) async {
+        guard await provider.countdown() == nil,
+              activeTimer?.sessionID == sessionID else { return }
+        _ = persistence.clear(ifMatching: sessionID)
+        activeTimer = nil
+        if isProviderEnabled {
+            await provider.disable()
+            isProviderEnabled = false
+        }
     }
 
     private func naturalCompletionDidFinish(
         _ completion: CountdownNaturalCompletion
     ) async {
-        guard phase == .running,
+        switch phase {
+        case .starting, .running:
+            break
+        case .initialized, .shuttingDown, .stopped:
+            return
+        }
+        guard let activeTimer,
+              activeTimer.operationIdentity == completion.operationIdentity,
               lastNotifiedCompletionOperationIdentity != completion.operationIdentity else {
             return
         }
@@ -314,24 +520,29 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         completionNotifier()
         isProviderEnabled = await provider.status().isEnabled
         if !isProviderEnabled,
-           activeTimer?.operationIdentity == completion.operationIdentity {
-            activeTimer = nil
+           self.activeTimer?.operationIdentity == completion.operationIdentity {
+            _ = persistence.clear(ifMatching: activeTimer.sessionID)
+            self.activeTimer = nil
         }
     }
 
     private func cancelTimer() async {
+        guard let activeTimer else { return }
+        // If the tombstone cannot be persisted, leave the live timer alone. Cancelling only
+        // in memory would make a stale deadline reappear on the next launch.
+        guard persistence.clear(ifMatching: activeTimer.sessionID) else { return }
         guard isProviderEnabled else {
-            activeTimer = nil
+            self.activeTimer = nil
             return
         }
         await provider.cancelCountdown()
         await provider.disable()
         isProviderEnabled = false
-        activeTimer = nil
+        self.activeTimer = nil
     }
 
     private func cancelTimer(ifPublishedRevision revision: UInt64) async -> FocusTimerRouteResult {
-        guard isProviderEnabled else { return .unavailable }
+        guard isProviderEnabled, let activeTimer else { return .unavailable }
         let status = await provider.status()
         guard status.isEnabled, status.capability == .available else {
             return .unavailable
@@ -339,9 +550,19 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
         guard await provider.cancelCountdown(ifPublishedRevision: revision) else {
             return .stale
         }
+        guard persistence.clear(ifMatching: activeTimer.sessionID) else {
+            // The revision was current, but persisted cancellation failed. Restore the exact
+            // deadline in-process so memory and the persisted session cannot diverge.
+            await provider.setCountdown(
+                activeTimer.countdown,
+                operationIdentity: activeTimer.operationIdentity
+            )
+            await reconcileMissingProviderCountdown(sessionID: activeTimer.sessionID)
+            return .unavailable
+        }
         await provider.disable()
         isProviderEnabled = false
-        activeTimer = nil
+        self.activeTimer = nil
         return .cancelled
     }
 

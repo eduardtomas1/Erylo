@@ -187,15 +187,24 @@ public struct PanelLayout: Equatable, Sendable {
         minimumNotchBodyHeight: CGFloat = 0
     ) {
         let maximumSize = metrics.maximumSize
+        let resolvedAttachment: PanelAttachment = display.topEdgeOcclusion == nil
+            ? .notchlessPill
+            : .notchIntegrated
+        attachment = resolvedAttachment
+        let fixedFrameTopEdge = resolvedAttachment == .notchlessPill
+            ? display.visibleFrame.maxY
+            : display.frame.maxY
         fixedFrame = CGRect(
             x: display.frame.midX - maximumSize.width / 2,
-            y: display.frame.maxY - maximumSize.height,
+            y: fixedFrameTopEdge - maximumSize.height,
             width: maximumSize.width,
             height: maximumSize.height
         )
 
-        attachment = display.topEdgeOcclusion == nil ? .notchlessPill : .notchIntegrated
-        surfaceTopInset = attachment == .notchlessPill ? metrics.notchlessTopInset : 0
+        let resolvedSurfaceTopInset = resolvedAttachment == .notchlessPill
+            ? metrics.notchlessTopInset
+            : 0
+        surfaceTopInset = resolvedSurfaceTopInset
 
         let requestedSize = Self.requestedSurfaceSize(
             state: state,
@@ -205,14 +214,14 @@ public struct PanelLayout: Equatable, Sendable {
             minimumNotchWingWidth: minimumNotchWingWidth,
             minimumNotchBodyHeight: minimumNotchBodyHeight
         )
-        let availableHeight = max(maximumSize.height - surfaceTopInset, 0)
+        let availableHeight = max(maximumSize.height - resolvedSurfaceTopInset, 0)
         let size = CGSize(
             width: min(max(requestedSize.width, 0), maximumSize.width),
             height: min(max(requestedSize.height, 0), availableHeight)
         )
         surfaceFrame = CGRect(
             x: (maximumSize.width - size.width) / 2,
-            y: maximumSize.height - surfaceTopInset - size.height,
+            y: maximumSize.height - resolvedSurfaceTopInset - size.height,
             width: size.width,
             height: size.height
         )
@@ -261,7 +270,7 @@ public struct PanelLayout: Equatable, Sendable {
             hoverAnchorRegion = .empty
         }
 
-        cornerRadius = switch (attachment, state, showsFocusTimerLauncher) {
+        cornerRadius = switch (resolvedAttachment, state, showsFocusTimerLauncher) {
         case (_, .hidden, _):
             0
         case (.notchlessPill, .compact, true):
@@ -282,7 +291,7 @@ public struct PanelLayout: Equatable, Sendable {
             // File Hold is not mounted. The compatibility state must stay inert
             // and can never become an invisible AppKit click blocker.
             hitRegion = .empty
-        } else if attachment == .notchIntegrated {
+        } else if resolvedAttachment == .notchIntegrated {
             // The concave top corners are transparent. Accept clicks only in an
             // inscribed visible shelf; the global pointer monitor owns the wider
             // noninteractive hover envelope.

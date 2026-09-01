@@ -28,6 +28,7 @@ private final class TrustHarness {
         await verifyAtomicPersistence()
         await verifyNoWorkWhileBrowsingOrDisabled()
         await verifyOnboardingCommandAdmission()
+        await verifyOnboardingCompletionPersistence()
         await verifyRowLocalModuleFeedback()
         await verifyPromptFreePersistedRestore()
         await verifyConcurrentToggleSerialization()
@@ -355,6 +356,82 @@ private final class TrustHarness {
             await fixture.repository.current().onboardingCompleted,
             "accepted first-run timer persists onboarding completion exactly after admission"
         )
+    }
+
+    private func verifyOnboardingCompletionPersistence() async {
+        do {
+            let storage = TestAtomicSettingsStorage()
+            let fixture = makeFixture(
+                storage: storage,
+                provider: TestLifecycleProvider()
+            )
+            let model = TrustSettingsViewModel(
+                coordinator: fixture.coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events)
+            )
+            storage.failNextReplacement()
+
+            await model.completeOnboarding()
+
+            let failedPersistedSettings = await fixture.repository.current()
+            check(
+                !model.settings.onboardingCompleted
+                    && !failedPersistedSettings.onboardingCompleted,
+                "failed Continue keeps both visible and persisted onboarding incomplete"
+            )
+            check(
+                model.onboardingActionFailure
+                    == "Setup couldn’t be saved. Try again.",
+                "failed Continue exposes setup-specific inline recovery copy"
+            )
+            check(!model.isWorking, "failed Continue releases the disabled working state")
+
+            await model.completeOnboarding()
+
+            let retriedPersistedSettings = await fixture.repository.current()
+            check(
+                model.settings.onboardingCompleted
+                    && retriedPersistedSettings.onboardingCompleted,
+                "retry reveals Settings only after onboarding persistence succeeds"
+            )
+            check(
+                model.onboardingActionFailure == nil && !model.isWorking,
+                "successful retry clears setup failure and pending work"
+            )
+        }
+
+        do {
+            let coordinator = GatedOnboardingSettingsCoordinator()
+            let model = TrustSettingsViewModel(
+                coordinator: coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: InMemoryDiagnosticEventBuffer())
+            )
+            let completion = Task { await model.completeOnboarding() }
+
+            check(
+                await waitUntil { await coordinator.onboardingRequestIsWaiting },
+                "Continue reaches the gated persistence boundary"
+            )
+            check(
+                !model.settings.onboardingCompleted && model.isWorking,
+                "pending Continue keeps onboarding visible and disables repeated submission"
+            )
+            await model.completeOnboarding()
+            check(
+                await coordinator.onboardingRequestCount == 1,
+                "disabled Continue admits only one persistence request"
+            )
+
+            await coordinator.releaseOnboardingRequest()
+            await completion.value
+
+            check(
+                model.settings.onboardingCompleted
+                    && !model.isWorking
+                    && model.onboardingActionFailure == nil,
+                "settled Continue reveals Settings only after persistence succeeds"
+            )
+        }
     }
 
     private func verifyPromptFreePersistedRestore() async {
@@ -1627,6 +1704,56 @@ private actor OutOfOrderSettingsCoordinator: TrustSettingsCoordinating {
         motionContinuation?.resume()
         motionContinuation = nil
         motionRequestIsWaiting = false
+    }
+}
+
+private actor GatedOnboardingSettingsCoordinator: TrustSettingsCoordinating {
+    private(set) var onboardingRequestIsWaiting = false
+    private(set) var onboardingRequestCount = 0
+    private var onboardingContinuation: CheckedContinuation<Void, Never>?
+    private var settings = EryloSettings.safeDefaults
+
+    func currentSettings() async -> EryloSettings { settings }
+
+    func launchAtLoginSnapshot() async -> LaunchAtLoginSnapshot { .unavailable }
+
+    func setModuleEnabled(
+        _ module: EryloModule,
+        enabled: Bool,
+        permissionPolicy: PermissionRequestPolicy
+    ) async -> TrustSettingsUpdateResult {
+        TrustSettingsUpdateResult(settings: settings, outcome: .noChange)
+    }
+
+    func apply(_ change: TrustSettingsChange) async -> TrustSettingsUpdateResult {
+        guard case let .onboardingCompleted(completed) = change else {
+            return TrustSettingsUpdateResult(settings: settings, outcome: .noChange)
+        }
+        onboardingRequestCount += 1
+        onboardingRequestIsWaiting = true
+        await withCheckedContinuation { onboardingContinuation = $0 }
+        onboardingRequestIsWaiting = false
+        settings.onboardingCompleted = completed
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) async -> TrustSettingsUpdateResult {
+        TrustSettingsUpdateResult(settings: settings, outcome: .noChange)
+    }
+
+    func resetToSafeDefaults() async -> TrustSettingsUpdateResult {
+        settings = .safeDefaults
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func diagnosticsContext() async -> DiagnosticsContext {
+        DiagnosticsContext(settings: settings, providerHealth: [])
+    }
+
+    func releaseOnboardingRequest() {
+        let continuation = onboardingContinuation
+        onboardingContinuation = nil
+        continuation?.resume()
     }
 }
 

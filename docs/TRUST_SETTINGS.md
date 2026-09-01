@@ -1,6 +1,6 @@
 # Trust, settings, onboarding, and diagnostics foundation
 
-The trust-domain and SwiftUI settings targets are mounted by `EryloAppRuntime` in one contained native settings window. First launch presents a focused welcome surface that explains the three shipping utility categories, makes no permission request, and performs no utility work. Its single Continue action completes setup and reveals the grouped Settings form. The window activates the accessory app only when it is intentionally presented; the passive panel remains nonactivating.
+The trust-domain and SwiftUI settings targets are mounted by `EryloAppRuntime` in one contained native settings window. First launch presents a focused welcome surface with a truthful compact-signal preview, explains the three shipping utility categories, makes no permission request, and performs no utility work. Its single Get Started action completes setup and reveals the grouped Settings form only after persistence succeeds. The window activates the accessory app only when it is intentionally presented; the passive panel remains nonactivating.
 
 ## Safe defaults and persistence
 

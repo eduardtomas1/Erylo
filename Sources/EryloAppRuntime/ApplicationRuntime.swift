@@ -2,6 +2,7 @@ import AppKit
 import EryloActivity
 import EryloGlance
 import EryloSurface
+import EryloTrust
 import EryloUpdates
 import EryloWindowing
 import Foundation
@@ -100,6 +101,7 @@ package final class ApplicationRuntime {
         )
         let focusTimer = FocusTimerRuntimeService(
             broker: activityBroker,
+            persistenceStorage: UserDefaultsSettingsStorage(),
             completionNotifier: {
                 NSSound.beep()
             }

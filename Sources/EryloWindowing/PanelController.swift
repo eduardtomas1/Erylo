@@ -19,8 +19,93 @@ package enum PanelCollectionBehaviorPolicy {
 }
 
 @MainActor
+package final class PanelWindowTransitionGate {
+    /// One 60 Hz frame gives SwiftUI a real Hidden commit before Compact begins.
+    /// A zero-delay main-actor hop can be coalesced into the final state.
+    package static let orderInStagingDelay = Duration.milliseconds(16)
+
+    package enum PendingKind: Equatable, Sendable {
+        case orderInCommit
+        case orderOut
+    }
+
+    private let scheduler: any OneShotScheduling
+    private var pendingOperation: (any ScheduledOperation)?
+    private var generation: UInt64 = 0
+
+    package private(set) var pendingKind: PendingKind?
+
+    package var hasPendingOrderOut: Bool {
+        pendingKind == .orderOut
+    }
+
+    package init(scheduler: any OneShotScheduling) {
+        self.scheduler = scheduler
+    }
+
+    /// Orders the transparent window first while its rendered model is Hidden,
+    /// then commits Compact after one display frame so SwiftUI owns the morph.
+    package func orderIn(
+        stageHidden: @MainActor () -> Bool,
+        orderFront: @MainActor () -> Void,
+        commitCompact: @escaping @MainActor @Sendable () -> Void
+    ) {
+        cancel()
+        let isStaged = stageHidden()
+        orderFront()
+        guard isStaged else { return }
+        schedule(
+            kind: .orderInCommit,
+            after: Self.orderInStagingDelay,
+            operation: commitCompact
+        )
+    }
+
+    /// A nil delay is the Reduce Motion path and performs synchronously.
+    package func orderOut(
+        after delay: Duration?,
+        perform: @escaping @MainActor @Sendable () -> Void
+    ) {
+        cancel()
+        guard let delay else {
+            perform()
+            return
+        }
+        schedule(kind: .orderOut, after: delay, operation: perform)
+    }
+
+    package func cancel() {
+        generation &+= 1
+        pendingOperation?.cancel()
+        pendingOperation = nil
+        pendingKind = nil
+    }
+
+    private func schedule(
+        kind: PendingKind,
+        after delay: Duration,
+        operation: @escaping @MainActor @Sendable () -> Void
+    ) {
+        generation &+= 1
+        let lease = generation
+        pendingKind = kind
+        pendingOperation = scheduler.schedule(after: delay) { [weak self] in
+            guard let self,
+                  self.generation == lease,
+                  self.pendingKind == kind else {
+                return
+            }
+            self.pendingOperation = nil
+            self.pendingKind = nil
+            operation()
+        }
+    }
+}
+
+@MainActor
 final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
-    PanelPresentationDemandReporting, PanelFocusTimerLaunching {
+    PanelPresentationDemandReporting, PanelFocusTimerLaunching,
+    PanelImmediateEnvironmentalHiding {
     let directDisplayID: CGDirectDisplayID
 
     var displayIdentity: DisplayIdentity {
@@ -30,6 +115,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     private let panel: NonActivatingPanel
     private let rootView: PanelHitTestView
     private let model: PanelSurfaceModel
+    private let windowTransitionGate: PanelWindowTransitionGate
     private let expandedMouseDownMonitor = ExpandedMouseDownMonitor()
     private var isVisible = false
     private var lastReportedActivityVisibility = false
@@ -39,7 +125,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     private var isFullscreenAuxiliaryEnabled = false
 
     var isActivitySurfaceVisible: Bool {
-        isVisible && model.state != .hidden
+        isVisible && model.renderedState != .hidden
     }
 
     var wantsSurfacePresentation: Bool {
@@ -49,9 +135,13 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     init(
         snapshot: DisplaySnapshot,
         activityModel: SurfaceActivityModel,
-        initialState: PanelPresentationState = .hidden
+        initialState: PanelPresentationState = .hidden,
+        transitionScheduler: any OneShotScheduling = TaskOneShotScheduler()
     ) {
         directDisplayID = CGDirectDisplayID(snapshot.identity.rawValue)
+        windowTransitionGate = PanelWindowTransitionGate(
+            scheduler: transitionScheduler
+        )
         model = PanelSurfaceModel(
             displayGeometry: snapshot.geometry,
             initialState: initialState,
@@ -98,32 +188,53 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
 
     func show() {
         isVisible = true
-        panel.orderFrontRegardless()
-        model.setWindowPresented(true)
+        windowTransitionGate.orderIn(
+            stageHidden: { [weak self] in
+                self?.model.stageForWindowOrderIn() ?? false
+            },
+            orderFront: { [weak self] in
+                guard let self, self.isVisible else { return }
+                self.panel.orderFrontRegardless()
+                self.model.setWindowPresented(true)
+            },
+            commitCompact: { [weak self] in
+                guard let self, self.isVisible else { return }
+                self.model.commitStagedWindowOrderIn()
+            }
+        )
         synchronizeExpandedInteraction()
         updatePointer(screenPoint: NSEvent.mouseLocation)
         reportActivityVisibilityIfNeeded()
     }
 
     func close() {
-        isVisible = false
-        retireExpandedInteraction()
+        windowTransitionGate.cancel()
+        beginLogicalHide()
         panel.escapeDismissalHandler = nil
         model.setWindowPresented(false)
         model.prepareForWindowOrderOut()
-        panel.ignoresMouseEvents = true
         panel.close()
-        reportActivityVisibilityIfNeeded()
     }
 
     func hide() {
-        isVisible = false
-        retireExpandedInteraction()
-        model.setWindowPresented(false)
-        model.prepareForWindowOrderOut()
-        panel.ignoresMouseEvents = true
-        panel.orderOut(nil)
-        reportActivityVisibilityIfNeeded()
+        beginLogicalHide()
+        let delay = model.state == .hidden
+            ? model.windowOrderOutDelay
+            : nil
+        windowTransitionGate.orderOut(after: delay) { [weak self] in
+            guard let self,
+                  !self.isVisible,
+                  self.model.state == .hidden else {
+                return
+            }
+            self.performPhysicalOrderOut()
+        }
+    }
+
+    func hideImmediatelyForEnvironmentalTransition() {
+        windowTransitionGate.cancel()
+        beginLogicalHide()
+        performPhysicalOrderOut()
     }
 
     func update(snapshot: DisplaySnapshot) {
@@ -142,7 +253,17 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     }
 
     func performPrimaryAction() {
+        // Shortcut and menu actions enter through the native owner. Pointer
+        // taps mutate the model inside PanelSurfaceView and remain nonactivating.
+        let oldState = model.state
         model.send(.primaryAction)
+        if DeliberatePanelFocusPolicy.shouldRequestKey(
+            from: oldState,
+            to: model.state,
+            isWindowPresented: isVisible
+        ) {
+            panel.makeKeyAndOrderFront(nil)
+        }
     }
 
     func performVisibilityToggle() {
@@ -199,6 +320,14 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     }
 
     private func refreshLayout() {
+        if !isVisible,
+           windowTransitionGate.hasPendingOrderOut,
+           model.motionStyle == .reduced {
+            windowTransitionGate.cancel()
+            performPhysicalOrderOut()
+            return
+        }
+
         let layout = model.layout
         panel.setFrame(layout.fixedFrame, display: true, animate: false)
         rootView.frame = CGRect(origin: .zero, size: layout.fixedFrame.size)
@@ -210,6 +339,21 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
             updatePointer(screenPoint: NSEvent.mouseLocation)
         }
         reportActivityVisibilityIfNeeded()
+    }
+
+    private func beginLogicalHide() {
+        isVisible = false
+        retireExpandedInteraction()
+        panel.ignoresMouseEvents = true
+        reportActivityVisibilityIfNeeded()
+    }
+
+    private func performPhysicalOrderOut() {
+        guard !isVisible else { return }
+        model.setWindowPresented(false)
+        model.prepareForWindowOrderOut()
+        panel.ignoresMouseEvents = true
+        panel.orderOut(nil)
     }
 
     private var expandedInteractionPolicy: ExpandedInteractionPolicy {

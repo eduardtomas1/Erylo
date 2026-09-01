@@ -54,9 +54,12 @@ public struct PanelSurfaceView: View {
             layout.surfaceFrame.height - layout.surfaceContentTopInset,
             0
         )
+        let acceptsBackgroundTap = model.acceptsBackgroundTap
+        let handoffRevision = model.activityModel.handoff?.snapshotVersion
+        let activityIdentity = model.activityModel.current?.activity.identity
 
         return ZStack(alignment: .top) {
-            if model.isWindowPresented, model.state != .dropTarget {
+            if model.isWindowPresented, model.renderedState != .dropTarget {
                 surfaceBackground(
                     silhouette,
                     attachment: layout.attachment
@@ -64,7 +67,7 @@ public struct PanelSurfaceView: View {
                     .accessibilityHidden(true)
 
                 if layout.attachment == .notchIntegrated,
-                   model.state == .compact,
+                   model.renderedState == .compact,
                    !content.showsFocusTimerLauncher {
                     notchCompactContent(
                         content,
@@ -73,7 +76,14 @@ public struct PanelSurfaceView: View {
                         surfaceHeight: layout.surfaceFrame.height,
                         occlusionWidth: model.displayGeometry.topEdgeOcclusion?.frame.width ?? 0
                     )
-                    .opacity(model.isPointerInside ? 1 : 0.9)
+                    .id(activityIdentity)
+                    .transition(.opacity)
+                    .animation(handoffAnimation, value: handoffRevision)
+                    .opacity(
+                        model.acceptsPointerInteraction
+                            ? (model.isPointerInside ? 1 : 0.9)
+                            : 1
+                    )
                     .animation(
                         model.motionStyle.allowsHoverOpacityAnimation
                             ? .easeOut(duration: 0.12)
@@ -86,6 +96,9 @@ public struct PanelSurfaceView: View {
                             .frame(height: layout.surfaceContentTopInset)
                             .accessibilityHidden(true)
                         surfaceContent(content, temporalSnapshot: temporalSnapshot)
+                            .id(activityIdentity)
+                            .transition(.opacity)
+                            .animation(handoffAnimation, value: handoffRevision)
                             .frame(
                                 width: layout.surfaceFrame.width,
                                 height: contentHeight
@@ -108,12 +121,11 @@ public struct PanelSurfaceView: View {
         .clipShape(silhouette)
         .contentShape(silhouette)
         .onTapGesture {
-            if !model.showsFocusTimerLauncher {
-                model.send(.primaryAction)
-            }
+            guard acceptsBackgroundTap else { return }
+            model.send(.primaryAction)
         }
         .overlay {
-            if model.state != .dropTarget,
+            if model.renderedState != .dropTarget,
                layout.attachment == .notchlessPill {
                 silhouette
                     .stroke(EryloPalette.cloud.opacity(0.1), lineWidth: 0.5)
@@ -245,6 +257,13 @@ public struct PanelSurfaceView: View {
                     weight: .medium,
                     countsDown: true,
                     numeric: true
+                )
+            } else if item.composition == .standard {
+                principalValue(
+                    item.title,
+                    item: item,
+                    size: 10,
+                    weight: .medium
                 )
             } else {
                 principalValue(
@@ -792,7 +811,8 @@ public struct PanelSurfaceView: View {
         .monospacedDigit()
         .foregroundStyle(color)
         .lineLimit(1)
-        .minimumScaleFactor(0.6)
+        .minimumScaleFactor(0.9)
+        .truncationMode(.tail)
         .accessibilityHidden(true)
         .matchedGeometryEffect(
             id: SignalContinuityID(identity: item.identity, element: .value),
@@ -889,7 +909,9 @@ public struct PanelSurfaceView: View {
                 .font(.system(size: fontSize, weight: .medium))
                 .monospacedDigit()
                 .foregroundStyle(EryloPalette.mist)
-                .lineLimit(2)
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
+                .truncationMode(.tail)
         }
     }
 
@@ -915,21 +937,23 @@ public struct PanelSurfaceView: View {
     }
 
     private func queueView(_ queue: ActivityQueueContext) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
+        let visibleItems = Array(queue.items.prefix(1))
+        let remainingCount = queue.remainingCount + max(queue.items.count - visibleItems.count, 0)
+        return VStack(alignment: .leading, spacing: 5) {
             HStack {
                 Text(SurfaceStrings.queueTitle)
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(EryloPalette.mist)
                 Spacer()
-                if queue.remainingCount > 0 {
-                    Text(SurfaceStrings.queueRemaining(queue.remainingCount))
+                if remainingCount > 0 {
+                    Text(SurfaceStrings.queueRemaining(remainingCount))
                         .font(.system(size: 9, weight: .medium))
                         .monospacedDigit()
                         .foregroundStyle(EryloPalette.mist)
                 }
             }
 
-            ForEach(queue.items, id: \.revision) { item in
+            ForEach(visibleItems, id: \.revision) { item in
                 HStack(spacing: 7) {
                     Image(systemName: item.symbolName)
                         .font(.system(size: 9, weight: .semibold))
@@ -1102,7 +1126,13 @@ public struct PanelSurfaceView: View {
     private var surfaceAnimation: Animation? {
         model.motionStyle == .reduced
             ? nil
-            : .spring(response: 0.22, dampingFraction: 0.9)
+            : .smooth(duration: 0.22, extraBounce: 0)
+    }
+
+    private var handoffAnimation: Animation? {
+        model.motionStyle == .reduced
+            ? nil
+            : .easeInOut(duration: 0.14)
     }
 
 }

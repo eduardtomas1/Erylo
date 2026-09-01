@@ -81,7 +81,10 @@ private struct FoundationHarness {
         }
         let fixedFrame = layouts[0].fixedFrame
         check(layouts.allSatisfy { $0.fixedFrame == fixedFrame }, "maximum frame is fixed across states")
-        check(fixedFrame.maxY == display.frame.maxY, "fixed frame is top-edge anchored")
+        check(
+            fixedFrame.maxY == display.visibleFrame.maxY,
+            "notchless fixed frame starts below the usable menu-bar edge"
+        )
 
         let hidden = PanelLayout(display: display, state: .hidden)
         check(!hidden.hitRegion.contains(hidden.surfaceFrame.center), "hidden state has no hit region")
@@ -93,6 +96,11 @@ private struct FoundationHarness {
         check(
             compact.surfaceFrame.maxY == compact.fixedFrame.height - compact.surfaceTopInset,
             "notchless pill inset is represented in AppKit-local geometry"
+        )
+        check(
+            compact.fixedFrame.minY + compact.surfaceFrame.maxY
+                == display.visibleFrame.maxY - compact.surfaceTopInset,
+            "notchless pill renders wholly below the visible-frame top edge"
         )
         check(
             compact.cornerRadius == compact.surfaceFrame.height / 2,
@@ -138,11 +146,38 @@ private struct FoundationHarness {
         let notched = PanelLayout(display: notchedDisplay, state: .compact)
         check(notched.attachment == .notchIntegrated, "top-edge occlusion selects notch integration")
         check(notched.surfaceTopInset == 0, "notch-integrated surface remains top-edge anchored")
-        check(notched.fixedFrame == compact.fixedFrame, "notch does not change the maximum frame")
+        check(
+            notched.fixedFrame.maxY == notchedDisplay.frame.maxY
+                && notched.fixedFrame.size == compact.fixedFrame.size
+                && notched.fixedFrame.midX == compact.fixedFrame.midX,
+            "notch integration keeps the fixed envelope attached to the physical display edge"
+        )
         check(notched.surfaceFrame.width == 280, "notch width and padding expand compact surface")
         check(notched.surfaceFrame.height == 74, "notch height expands compact surface")
         check(notched.topCornerRadius == 6, "compact notch shoulders use the smallest top curl")
         check(notched.surfaceContentTopInset == 0, "compact content remains in the notch wings")
+
+        let bodyReservedPeek = PanelLayout(
+            display: notchedDisplay,
+            state: .peek,
+            minimumNotchBodyHeight: 36
+        )
+        check(
+            bodyReservedPeek.surfaceFrame.height - bodyReservedPeek.surfaceContentTopInset == 36,
+            "notched Peek reserves its requested body height below the occlusion"
+        )
+
+        let maximumBodyRequest = PanelLayout(
+            display: notchedDisplay,
+            state: .expanded,
+            minimumNotchBodyHeight: 176
+        )
+        check(
+            maximumBodyRequest.surfaceFrame.height <= PanelMetrics.feasibility.maximumSize.height
+                && maximumBodyRequest.surfaceFrame.height
+                    - maximumBodyRequest.surfaceContentTopInset == 166,
+            "an oversized notched body request clamps to the maximum envelope without hiding the body calculation"
+        )
 
         let realisticNotchedDisplay = DisplayGeometry(
             frame: CGRect(x: 0, y: 0, width: 1_512, height: 982),
@@ -384,6 +419,27 @@ private struct FoundationHarness {
         check(
             !expanded.shouldHandleEscape(panelIsKey: false),
             "Escape does not act when another window owns key interaction"
+        )
+        check(
+            DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: .compact,
+                to: .expanded,
+                isWindowPresented: true
+            ),
+            "shortcut expansion deliberately transfers keyboard focus"
+        )
+        check(
+            !DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: .compact,
+                to: .expanded,
+                isWindowPresented: false
+            )
+                && !DeliberatePanelFocusPolicy.shouldRequestKey(
+                    from: .expanded,
+                    to: .compact,
+                    isWindowPresented: true
+                ),
+            "ordered-out or contracting surfaces never request key focus"
         )
 
         let orderedOut = ExpandedInteractionPolicy(
@@ -811,7 +867,11 @@ private struct FoundationHarness {
         check(registry.creationCount == 3, "active-Space reconciliation reuses existing panels")
 
         eventSource.emit(.workspaceWillSleep)
-        check(registry.latestPanel(for: main.identity)?.hideCount == 1, "sleep hides existing panels")
+        check(
+            registry.latestPanel(for: main.identity)?.hideCount == 1
+                && registry.latestPanel(for: main.identity)?.immediateEnvironmentalHideCount == 1,
+            "sleep uses the immediate environmental hide route"
+        )
         check(!eventSource.isPointerMonitoringEnabled, "sleep retires pointer monitoring while panels are hidden")
         let shortcutCountBeforeSleep = registry.totalPrimaryActionCount
         eventSource.emit(.primaryShortcut)
@@ -1231,7 +1291,7 @@ private final class FakePanelRegistry {
 }
 
 @MainActor
-private final class FakePanel: PanelPresenting {
+private final class FakePanel: PanelPresenting, PanelImmediateEnvironmentalHiding {
     let displayIdentity: DisplayIdentity
     private(set) var showCount = 0
     private(set) var hideCount = 0
@@ -1241,6 +1301,7 @@ private final class FakePanel: PanelPresenting {
     private(set) var lastPointerPosition: CGPoint?
     private(set) var primaryActionCount = 0
     private(set) var cancellationCount = 0
+    private(set) var immediateEnvironmentalHideCount = 0
     private(set) var fullscreenAuxiliaryUpdates: [Bool] = []
 
     init(displayIdentity: DisplayIdentity) {
@@ -1253,6 +1314,11 @@ private final class FakePanel: PanelPresenting {
 
     func hide() {
         hideCount += 1
+    }
+
+    func hideImmediatelyForEnvironmentalTransition() {
+        immediateEnvironmentalHideCount += 1
+        hide()
     }
 
     func close() {

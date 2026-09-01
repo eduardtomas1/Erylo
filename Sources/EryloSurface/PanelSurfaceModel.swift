@@ -34,6 +34,10 @@ private final class PanelSurfaceOwnedResources {
 /// MainActor cleanup without capturing `self`.
 public final class PanelSurfaceModel {
     public private(set) var stateMachine: PanelStateMachine
+    /// The state currently drawn by SwiftUI. Window ordering may briefly stage
+    /// this at Hidden while the logical reducer remains Compact and continues
+    /// to demand presentation from the native coordinator.
+    package private(set) var renderedState: PanelPresentationState
     public private(set) var displayGeometry: DisplayGeometry
     public private(set) var interactionHitRegion: HitRegion
     /// Newly revealed controls stay visually reserved but inert until AppKit's
@@ -79,7 +83,6 @@ public final class PanelSurfaceModel {
     @ObservationIgnored
     private var lastObservedActivity: ObservedActivityKey?
 
-    @ObservationIgnored
     private var reduceMotion = false
 
     @ObservationIgnored
@@ -92,7 +95,7 @@ public final class PanelSurfaceModel {
     public var layout: PanelLayout {
         PanelLayout(
             display: displayGeometry,
-            state: state,
+            state: renderedState,
             metrics: metrics,
             showsFocusTimerLauncher: showsFocusTimerLauncher,
             minimumNotchWingWidth: minimumNotchWingWidth,
@@ -105,7 +108,9 @@ public final class PanelSurfaceModel {
     }
 
     public var showsFocusTimerLauncher: Bool {
-        state == .compact && activityModel.current == nil && focusTimerStartHandler != nil
+        renderedState == .compact
+            && activityModel.current == nil
+            && focusTimerStartHandler != nil
     }
 
     private var showsTemporalTimer: Bool {
@@ -119,25 +124,93 @@ public final class PanelSurfaceModel {
             42
         case .volumeOutputChanged:
             82
-        case .standard, .completionAcknowledgement, .volumeLevelChanged, .none:
+        case .standard:
+            currentSurfaceItem?.composition == .standard ? 76 : 0
+        case .completionAcknowledgement, .volumeLevelChanged, .none:
             0
         }
     }
 
-    /// Completion is deliberately promoted to Peek. On a notched display its
-    /// acknowledgement row must remain fully below the camera housing so the
-    /// Done control is never clipped by the physical occlusion.
+    /// Notch-native states compose their body below the camera housing. Reserve
+    /// enough vertical space for the active composition, bounded by the fixed
+    /// panel envelope when unusually tall hardware leaves less room.
     private var minimumNotchBodyHeight: CGFloat {
-        state == .peek && isCompletionAcknowledgement ? 40 : 0
+        guard let occlusion = displayGeometry.topEdgeOcclusion else { return 0 }
+        let availableBodyHeight = max(
+            metrics.maximumSize.height - max(occlusion.frame.height, 0),
+            0
+        )
+        return min(desiredMinimumNotchBodyHeight, availableBodyHeight)
+    }
+
+    private var desiredMinimumNotchBodyHeight: CGFloat {
+        switch renderedState {
+        case .peek:
+            return switch currentSurfaceItem?.composition {
+            case .timerCompletion:
+                40
+            case .standard:
+                36
+            case .timerCountdown,
+                 .volumeLevel,
+                 .volumeMuted,
+                 .volumeUnmuted,
+                 .volumeOutput,
+                 .battery,
+                 .charging,
+                 .none:
+                0
+            }
+        case .expanded:
+            switch currentSurfaceItem?.composition {
+            case .timerCountdown:
+                return 112
+            case .standard:
+                if !activityModel.queueContext.items.isEmpty { return 176 }
+                if activityModel.currentAction != nil { return 132 }
+                return 104
+            case .timerCompletion,
+                 .volumeLevel,
+                 .volumeMuted,
+                 .volumeUnmuted,
+                 .volumeOutput,
+                 .battery,
+                 .charging,
+                 .none:
+                return 0
+            }
+        case .hidden, .compact, .dropTarget:
+            return 0
+        }
     }
 
     package var isTemporalProjectionActive: Bool {
-        isWindowPresented && state != .hidden && showsTemporalTimer
+        isWindowPresented && renderedState != .hidden && showsTemporalTimer
+    }
+
+    /// The silhouette itself is a control only when tapping its background has
+    /// a deterministic action. Child buttons own their own events so preset,
+    /// Done, and provider actions cannot also trigger the ancestor surface.
+    package var acceptsBackgroundTap: Bool {
+        switch content.interactionRole {
+        case .expand:
+            true
+        case .collapse:
+            content.action == nil
+        case .dismiss, .none:
+            false
+        }
+    }
+
+    /// Passive acknowledgements are visual HUDs, not dead controls. They must
+    /// remain click-through so a Volume or Battery cue cannot block menu extras.
+    package var acceptsPointerInteraction: Bool {
+        showsFocusTimerLauncher || content.action != nil || acceptsBackgroundTap
     }
 
     public var content: ActivitySurfaceContent {
         ActivitySurfaceContent(
-            state: state,
+            state: renderedState,
             phase: activityModel.phase,
             current: activityModel.current,
             queueContext: activityModel.queueContext,
@@ -211,6 +284,7 @@ public final class PanelSurfaceModel {
             initialStateMachine.updateActivityAvailability(true)
         }
         stateMachine = initialStateMachine
+        renderedState = initialStateMachine.state
         interactionHitRegion = .empty
         targetHitRegion = .empty
         lastObservedActivity = Self.observedActivityKey(activityModel.current)
@@ -297,13 +371,17 @@ public final class PanelSurfaceModel {
     public func updateReduceMotion(_ reduceMotion: Bool) {
         guard self.reduceMotion != reduceMotion else { return }
         self.reduceMotion = reduceMotion
-        guard reduceMotion, pendingMotionOperation != nil else { return }
+        guard reduceMotion else { return }
+
         pendingMotionOperation?.cancel()
         pendingMotionOperation = nil
+        renderedState = state
         let exactRegion = layout.hitRegion
         targetHitRegion = exactRegion
         interactionHitRegion = exactRegion
         isHitRegionSettled = true
+        // This notification also lets the native window owner finish a pending
+        // delayed order-out immediately when Reduce Motion becomes enabled.
         didChange?()
     }
 
@@ -325,6 +403,47 @@ public final class PanelSurfaceModel {
         isWindowPresented = isPresented
     }
 
+    /// Stages a physically ordered-in Compact panel at zero rendered geometry.
+    /// Logical state is deliberately untouched so the presentation demand that
+    /// caused the order-in cannot recursively withdraw itself.
+    @discardableResult
+    package func stageForWindowOrderIn() -> Bool {
+        guard !reduceMotion,
+              !isWindowPresented,
+              state == .compact,
+              renderedState == state else {
+            return false
+        }
+
+        pendingMotionOperation?.cancel()
+        pendingMotionOperation = nil
+        renderedState = .hidden
+        let hiddenRegion = layout.hitRegion
+        targetHitRegion = hiddenRegion
+        interactionHitRegion = hiddenRegion
+        isHitRegionSettled = true
+        didChange?()
+        return true
+    }
+
+    /// Commits the staged render after the window gate's one-frame delay. Every guard is a
+    /// stale-callback barrier for activity loss, environmental retirement, or a
+    /// newer visibility request.
+    package func commitStagedWindowOrderIn() {
+        guard isWindowPresented,
+              state == .compact,
+              renderedState == .hidden else {
+            return
+        }
+        renderedState = .compact
+        publishRenderedLayoutChange()
+    }
+
+    /// A nil delay is the Reduce Motion contract: no physical exit staging.
+    package var windowOrderOutDelay: Duration? {
+        reduceMotion ? nil : timing.motionDuration
+    }
+
     /// Physical retirement is a presentation boundary. Preserve valid activity
     /// content, but discard transient or deliberate expansion so wake, a Space
     /// change, or a later policy reconciliation can only restore Compact.
@@ -336,6 +455,7 @@ public final class PanelSurfaceModel {
         hoverRequiresExit = false
 
         let oldState = state
+        let oldRenderedState = renderedState
         let oldInteractionHitRegion = interactionHitRegion
         let wasHitRegionSettled = isHitRegionSettled
         if activityModel.current == nil {
@@ -351,11 +471,13 @@ public final class PanelSurfaceModel {
             }
         }
 
+        renderedState = state
         let contractedRegion = layout.hitRegion
         targetHitRegion = contractedRegion
         interactionHitRegion = contractedRegion
         isHitRegionSettled = true
         if state != oldState
+            || renderedState != oldRenderedState
             || interactionHitRegion != oldInteractionHitRegion
             || !wasHitRegionSettled {
             didChange?()
@@ -384,6 +506,12 @@ public final class PanelSurfaceModel {
     }
 
     public func pointerDisposition(at localPoint: CGPoint) -> PanelPointerDisposition {
+        guard acceptsPointerInteraction else {
+            return PanelPointerDisposition(
+                acceptsMouseEvents: false,
+                isInsideTargetSurface: false
+            )
+        }
         let currentLayout = layout
         let isInsideHoverTarget = currentLayout.hoverAnchorRegion.contains(localPoint)
             || currentLayout.hitRegion.contains(localPoint)
@@ -457,6 +585,11 @@ public final class PanelSurfaceModel {
     }
 
     private func publishStateLayoutChange() {
+        renderedState = state
+        publishRenderedLayoutChange()
+    }
+
+    private func publishRenderedLayoutChange() {
         let currentLayout = layout
         beginHitRegionTransition(to: currentLayout.hitRegion)
         didChange?()

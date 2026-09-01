@@ -326,8 +326,7 @@ public final class TrustSettingsViewModel {
     }
 
     public func completeOnboarding() async {
-        onboardingActionFailure = nil
-        await applySettingChange(.onboardingCompleted(true))
+        _ = await persistOnboardingCompletion()
     }
 
     /// Optional admission-safe setup action retained for alternate clients.
@@ -337,13 +336,12 @@ public final class TrustSettingsViewModel {
     public func startFocusTimerAndCompleteOnboarding(
         using startFocusTimer: @MainActor () -> Bool
     ) async -> Bool {
+        guard !isWorking else { return false }
         guard startFocusTimer() else {
             onboardingActionFailure = "Focus Timer could not start. Erylo is still setting up."
             return false
         }
-        onboardingActionFailure = nil
-        await applySettingChange(.onboardingCompleted(true))
-        return true
+        return await persistOnboardingCompletion()
     }
 
     public func resetToSafeDefaults() async {
@@ -415,6 +413,43 @@ public final class TrustSettingsViewModel {
     private var automaticDisplayChoice: DisplayChoice? {
         displayChoices.first(where: \.isMain)
             ?? displayChoices.min { $0.identity < $1.identity }
+    }
+
+    private func persistOnboardingCompletion() async -> Bool {
+        guard !isWorking else { return false }
+        onboardingActionFailure = nil
+        let sequence = beginOperation()
+        defer { endOperation() }
+
+        let result = await coordinator.apply(.onboardingCompleted(true))
+        let didApply = apply(
+            result,
+            sequence: sequence,
+            successfulChangeKind: .persistedSettings
+        )
+        guard didApply else { return false }
+
+        let completed = result.failure == nil && result.settings.onboardingCompleted
+        if !completed {
+            onboardingActionFailure = Self.onboardingFailureMessage(for: result.failure)
+        }
+        return completed
+    }
+
+    private static func onboardingFailureMessage(for failure: TrustUpdateFailure?) -> String {
+        switch failure {
+        case .persistenceFailed:
+            "Setup couldn’t be saved. Try again."
+        case .operationCancelled, .operationSuperseded:
+            "Setup wasn’t completed. Try again."
+        case .queueCapacityExceeded:
+            "Setup is busy with another change. Try again."
+        case .coordinatorShutDown:
+            "Setup can’t finish while Erylo is shutting down."
+        case .permissionDenied, .providerFactoryFailed, .providerStartFailed,
+             .rollbackFailed, .launchAtLoginFailed, .none:
+            "Setup couldn’t be completed. Try again."
+        }
     }
 
     private func applySettingChange(_ change: TrustSettingsChange) async {

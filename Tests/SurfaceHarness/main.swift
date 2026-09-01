@@ -3117,8 +3117,9 @@ private struct SurfaceHarness {
                     displayGeometry: display,
                     scheduler: scheduler
                 )
+                let surfaceFrame = model.layout.surfaceFrame
                 let disposition = model.pointerDisposition(
-                    at: model.layout.surfaceFrame.center
+                    at: CGPoint(x: surfaceFrame.midX, y: surfaceFrame.midY)
                 )
                 check(
                     !model.acceptsPointerInteraction

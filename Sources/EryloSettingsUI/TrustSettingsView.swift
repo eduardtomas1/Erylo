@@ -13,7 +13,7 @@ public struct TrustSettingsView: View {
     private let model: TrustSettingsViewModel
     private let destinationChooser: any DiagnosticsDestinationChoosing
     private let onStartFocusTimer: (@MainActor () -> Bool)?
-    private let startsAtBottomForVisualQA: Bool
+    private let showsLowerSectionsForVisualQA: Bool
 
     @State private var isResetConfirmationPresented = false
     @State private var focusTimerStartFailed = false
@@ -27,22 +27,22 @@ public struct TrustSettingsView: View {
         self.model = model
         self.destinationChooser = destinationChooser
         self.onStartFocusTimer = onStartFocusTimer
-        startsAtBottomForVisualQA = false
+        showsLowerSectionsForVisualQA = false
     }
 
-    /// Package-only visual-proof seam. Production Settings always starts at
-    /// the top; the deterministic harness can also prove the lower native
+    /// Package-only visual-proof seam. Production Settings always renders the
+    /// complete form; the deterministic harness can isolate the lower native
     /// controls without exposing a test preference to users.
     @MainActor
     package init(
         model: TrustSettingsViewModel,
         onStartFocusTimer: (@MainActor () -> Bool)?,
-        startsAtBottomForVisualQA: Bool
+        showsLowerSectionsForVisualQA: Bool
     ) {
         self.model = model
         destinationChooser = SystemDiagnosticsDestinationChooser()
         self.onStartFocusTimer = onStartFocusTimer
-        self.startsAtBottomForVisualQA = startsAtBottomForVisualQA
+        self.showsLowerSectionsForVisualQA = showsLowerSectionsForVisualQA
     }
 
     public var body: some View {
@@ -54,17 +54,21 @@ public struct TrustSettingsView: View {
                 settingsRecoveryView
             } else if model.settings.onboardingCompleted {
                 Form {
-                    activitySection
-                    displaySection
-                    if model.supportsMotionPreference || model.supportsFullscreenPreference {
-                        behaviorSection
+                    if showsLowerSectionsForVisualQA {
+                        generalSection
+                        supportSection
+                    } else {
+                        activitySection
+                        displaySection
+                        if model.supportsMotionPreference || model.supportsFullscreenPreference {
+                            behaviorSection
+                        }
+                        generalSection
+                        supportSection
                     }
-                    generalSection
-                    supportSection
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)
-                .defaultScrollAnchor(startsAtBottomForVisualQA ? .bottom : .top)
                 .frame(maxWidth: 720)
             } else {
                 onboardingView

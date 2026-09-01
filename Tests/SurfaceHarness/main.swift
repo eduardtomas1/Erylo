@@ -4973,6 +4973,34 @@ private func validateNativeSurfacePixels(
             minimum: minimumVisibleContentCount
         )
     }
+
+    if filename.hasPrefix("erylo-timer-launcher") {
+        let glyphXRange = filename == "erylo-timer-launcher.png"
+            ? 270..<310
+            : 285..<325
+        var amberPixelCount = 0
+        for y in 0..<representation.pixelsHigh {
+            for x in glyphXRange where x < representation.pixelsWide {
+                guard let sample = deviceRGBSample(representation, x: x, y: y) else {
+                    continue
+                }
+                if sample.red >= 0.55,
+                   sample.green >= 0.32,
+                   sample.blue <= 0.45,
+                   sample.red - sample.green >= 0.12,
+                   sample.green - sample.blue >= 0.08 {
+                    amberPixelCount += 1
+                }
+            }
+        }
+        guard amberPixelCount >= 12 else {
+            throw VisualQARenderingError.missingSemanticAccent(
+                filename,
+                observed: amberPixelCount,
+                minimum: 12
+            )
+        }
+    }
 }
 
 @MainActor
@@ -5044,4 +5072,5 @@ private enum VisualQARenderingError: Error {
     case implausibleSurfaceBounds(String, width: Int, height: Int)
     case missingSurfaceInterior(String)
     case missingVisibleContent(String, observed: Int, minimum: Int)
+    case missingSemanticAccent(String, observed: Int, minimum: Int)
 }

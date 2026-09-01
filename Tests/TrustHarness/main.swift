@@ -1479,11 +1479,11 @@ private final class TrustHarness {
             ("erylo-settings-dark.png", settingsModel, .dark, false),
             ("erylo-settings-lower-light.png", settingsModel, .light, true),
         ]
-        for (filename, model, colorScheme, startsAtBottom) in fixtures {
+        for (filename, model, colorScheme, showsLowerSections) in fixtures {
             let view = TrustSettingsView(
                 model: model,
                 onStartFocusTimer: { true },
-                startsAtBottomForVisualQA: startsAtBottom
+                showsLowerSectionsForVisualQA: showsLowerSections
             )
             .frame(width: 680, height: 620)
             .environment(\.colorScheme, colorScheme)
@@ -1495,6 +1495,19 @@ private final class TrustHarness {
                 view,
                 colorScheme: colorScheme,
                 to: directory.appendingPathComponent(filename)
+            )
+        }
+
+        let upperSettings = try Data(
+            contentsOf: directory.appendingPathComponent("erylo-settings-light.png")
+        )
+        let lowerSettings = try Data(
+            contentsOf: directory.appendingPathComponent("erylo-settings-lower-light.png")
+        )
+        guard upperSettings != lowerSettings else {
+            throw NativeSettingsVisualQAError.duplicateFixture(
+                "erylo-settings-light.png",
+                "erylo-settings-lower-light.png"
             )
         }
     }
@@ -1706,6 +1719,7 @@ private func validateNativeSettingsPixels(
 
 private enum NativeSettingsVisualQAError: Error {
     case encodingFailed(String)
+    case duplicateFixture(String, String)
     case missingContrast(String)
     case missingSemanticContent(String, observed: Int)
     case implausiblyClippedContent(String, width: Int, height: Int)

@@ -14,6 +14,8 @@ public protocol PanelPresenting: AnyObject {
     func performPrimaryAction()
     func performVisibilityToggle()
     func cancelPendingInteractions()
+    func contractForEnvironmentalTransition()
+    func setFullscreenAuxiliaryEnabled(_ enabled: Bool)
 }
 
 /// Package-only feedback from native panels to the process coordinator. The
@@ -52,6 +54,17 @@ public extension PanelPresenting {
     /// The native presenter overrides this with a strict hidden/visible surface toggle.
     func performVisibilityToggle() {
         performPrimaryAction()
+    }
+
+    /// Compatibility fallback for injected presenters without an internal
+    /// surface reducer. Native panels override this to retire Peek/Expanded.
+    func contractForEnvironmentalTransition() {
+        cancelPendingInteractions()
+    }
+
+    /// Compatibility fallback for injected presenters without native AppKit policy.
+    func setFullscreenAuxiliaryEnabled(_ enabled: Bool) {
+        _ = enabled
     }
 }
 

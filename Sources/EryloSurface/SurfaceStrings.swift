@@ -35,6 +35,10 @@ public enum SurfaceStrings {
         localized: "surface.focus-timer.launcher.hint",
         defaultValue: "Choose a 15, 25, or 50 minute focus timer."
     )
+    package static let focusTimerCompletionDetail = String(
+        localized: "surface.focus-timer.completion.detail",
+        defaultValue: "Time to take a breath."
+    )
     public static let compactPaused = String(
         localized: "surface.degraded.compact",
         defaultValue: "Paused"
@@ -79,6 +83,26 @@ public enum SurfaceStrings {
     public static let collapseHint = String(
         localized: "surface.accessibility.collapse-hint",
         defaultValue: "Activate Erylo or press Control-Option-Command-E to return to compact view."
+    )
+    public static let expandAction = String(
+        localized: "surface.accessibility.expand-action",
+        defaultValue: "Expand activity details"
+    )
+    public static let collapseAction = String(
+        localized: "surface.accessibility.collapse-action",
+        defaultValue: "Collapse activity details"
+    )
+    public static let dismissCompletionAction = String(
+        localized: "surface.accessibility.dismiss-completion-action",
+        defaultValue: "Dismiss completion"
+    )
+    public static let dismissCompletionHint = String(
+        localized: "surface.accessibility.dismiss-completion-hint",
+        defaultValue: "Dismisses this completed Focus Timer acknowledgement."
+    )
+    public static let passiveStatusHint = String(
+        localized: "surface.accessibility.passive-status-hint",
+        defaultValue: "This status disappears automatically."
     )
     public static let hideHint = String(
         localized: "surface.accessibility.hide-hint",
@@ -142,6 +166,13 @@ public enum SurfaceStrings {
         String.localizedStringWithFormat(
             String(localized: "activity.progress.short-percent", defaultValue: "%lld%%"),
             percent
+        )
+    }
+
+    package static func remainingTime(_ value: String) -> String {
+        String.localizedStringWithFormat(
+            String(localized: "activity.timer.remaining", defaultValue: "%@ remaining"),
+            value
         )
     }
 

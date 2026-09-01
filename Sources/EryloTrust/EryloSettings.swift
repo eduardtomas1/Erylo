@@ -3,7 +3,7 @@ import Foundation
 
 public enum SettingsLimits {
     public static let maximumEncodedBytes = 65_536
-    public static let maximumEnabledDisplayIDs = 32
+    public static let maximumEnabledDisplayUUIDs = 32
 }
 
 public enum EryloModule: String, CaseIterable, Codable, Sendable {
@@ -108,40 +108,46 @@ public struct ModulePreferences: Codable, Equatable, Sendable {
 
 public struct DisplayPreferences: Codable, Equatable, Sendable {
     public var isEnabled: Bool
-    /// `nil` means all currently available non-mirrored displays.
-    public var enabledDisplayIDs: [UInt32]?
-    /// A preference only. `DisplayPolicy` still performs availability fallback.
-    public var selectedDisplayID: UInt32?
+    /// Automatic (the safe default) uses one display. All Displays is an explicit
+    /// opt-in. Custom uses `enabledDisplayUUIDs`.
+    public var surfaceScope: DisplaySurfaceScope
+    /// Used only by custom scope. UUIDs that are not currently available are
+    /// retained but never remapped to a different physical display.
+    public var enabledDisplayUUIDs: [DisplayUUID]?
+    /// The menu and shortcut target. An unavailable UUID intentionally resolves to
+    /// no target until that display returns or the user chooses another.
+    public var preferredDisplayUUID: DisplayUUID?
 
     public init(
         isEnabled: Bool = true,
-        enabledDisplayIDs: [UInt32]? = nil,
-        selectedDisplayID: UInt32? = nil
+        surfaceScope: DisplaySurfaceScope = .automatic,
+        enabledDisplayUUIDs: [DisplayUUID]? = nil,
+        preferredDisplayUUID: DisplayUUID? = nil
     ) {
         self.isEnabled = isEnabled
-        self.enabledDisplayIDs = enabledDisplayIDs.map(Self.boundedUniqueIDs)
-        self.selectedDisplayID = selectedDisplayID
+        self.surfaceScope = surfaceScope
+        self.enabledDisplayUUIDs = enabledDisplayUUIDs.map(Self.boundedUniqueUUIDs)
+        self.preferredDisplayUUID = preferredDisplayUUID
     }
 
     public var displayPolicy: DisplayPolicy {
         DisplayPolicy(
             isEnabled: isEnabled,
-            enabledDisplayIdentities: enabledDisplayIDs.map {
-                Set($0.map(DisplayIdentity.init(rawValue:)))
-            },
-            selectedDisplayIdentity: selectedDisplayID.map(DisplayIdentity.init(rawValue:))
+            surfaceScope: surfaceScope,
+            enabledDisplayUUIDs: enabledDisplayUUIDs.map(Set.init),
+            preferredDisplayUUID: preferredDisplayUUID
         )
     }
 
     public static let safeDefaults = DisplayPreferences()
 
-    static func boundedUniqueIDs(_ values: [UInt32]) -> [UInt32] {
-        var seen: Set<UInt32> = []
-        var result: [UInt32] = []
-        result.reserveCapacity(min(values.count, SettingsLimits.maximumEnabledDisplayIDs))
+    static func boundedUniqueUUIDs(_ values: [DisplayUUID]) -> [DisplayUUID] {
+        var seen: Set<DisplayUUID> = []
+        var result: [DisplayUUID] = []
+        result.reserveCapacity(min(values.count, SettingsLimits.maximumEnabledDisplayUUIDs))
         for value in values where seen.insert(value).inserted {
             result.append(value)
-            if result.count == SettingsLimits.maximumEnabledDisplayIDs { break }
+            if result.count == SettingsLimits.maximumEnabledDisplayUUIDs { break }
         }
         return result.sorted()
     }
@@ -165,7 +171,7 @@ public enum FullscreenBehavior: String, Codable, CaseIterable, Sendable {
 }
 
 public struct EryloSettings: Codable, Equatable, Sendable {
-    public static let currentSchemaVersion = 2
+    public static let currentSchemaVersion = 3
 
     public private(set) var schemaVersion: Int
     public var modules: ModulePreferences
@@ -198,11 +204,21 @@ public struct EryloSettings: Codable, Equatable, Sendable {
 
     public static let safeDefaults = EryloSettings()
 
+    /// Complete window/display policy derived from the one persisted settings value.
+    public var displayPolicy: DisplayPolicy {
+        var policy = displays.displayPolicy
+        policy.allowsFullscreenAuxiliary = fullscreenBehavior == .remainAvailable
+        return policy
+    }
+
     func normalized() -> EryloSettings {
         var result = self
         result.schemaVersion = Self.currentSchemaVersion
-        result.displays.enabledDisplayIDs = displays.enabledDisplayIDs.map {
-            DisplayPreferences.boundedUniqueIDs($0)
+        result.displays.enabledDisplayUUIDs = displays.enabledDisplayUUIDs.map {
+            DisplayPreferences.boundedUniqueUUIDs($0)
+        }
+        if result.displays.surfaceScope != .custom {
+            result.displays.enabledDisplayUUIDs = nil
         }
         return result
     }
@@ -296,6 +312,17 @@ public struct SettingsCodec: Sendable {
                     storedSchemaVersion: envelope.schemaVersion
                 )
             )
+        case 2:
+            guard let legacy = try? decoder.decode(LegacySettingsV2.self, from: data) else {
+                return safeFallback(.corrupt, version: envelope.schemaVersion)
+            }
+            return SettingsDecodeResult(
+                settings: legacy.migrated(),
+                report: SettingsLoadReport(
+                    disposition: .migrated,
+                    storedSchemaVersion: envelope.schemaVersion
+                )
+            )
         default:
             return safeFallback(.unsupportedVersion, version: envelope.schemaVersion)
         }
@@ -337,16 +364,63 @@ private struct LegacySettingsV1: Decodable {
     func migrated() -> EryloSettings {
         EryloSettings(
             modules: modules,
-            displays: DisplayPreferences(
+            displays: Self.safeDisplayMigration(
                 isEnabled: displayEnabled,
-                enabledDisplayIDs: enabledDisplayIDs,
-                selectedDisplayID: selectedDisplayID
+                enabledDisplayIDs: enabledDisplayIDs
             ),
             motion: reduceMotion ? .reduce : .systemDefault,
             fullscreenBehavior: fullscreenBehavior,
             launchAtLogin: launchAtLogin,
             crashAndDiagnosticSharingConsent: diagnosticSharingConsent,
             onboardingCompleted: false
+        )
+    }
+
+    private static func safeDisplayMigration(
+        isEnabled: Bool,
+        enabledDisplayIDs: [UInt32]?
+    ) -> DisplayPreferences {
+        // Session-scoped IDs cannot be mapped safely after a restart. Preserve only
+        // an intentional empty scope; otherwise reset to one automatic display.
+        DisplayPreferences(
+            isEnabled: isEnabled,
+            surfaceScope: enabledDisplayIDs?.isEmpty == true ? .custom : .automatic,
+            enabledDisplayUUIDs: enabledDisplayIDs?.isEmpty == true ? [] : nil,
+            preferredDisplayUUID: nil
+        )
+    }
+}
+
+private struct LegacySettingsV2: Decodable {
+    private struct LegacyDisplayPreferences: Decodable {
+        let isEnabled: Bool
+        let enabledDisplayIDs: [UInt32]?
+        let selectedDisplayID: UInt32?
+    }
+
+    let schemaVersion: Int
+    let modules: ModulePreferences
+    let displays: LegacyDisplayPreferences
+    let motion: MotionPreference
+    let fullscreenBehavior: FullscreenBehavior
+    let launchAtLogin: Bool
+    let crashAndDiagnosticSharingConsent: Bool
+    let onboardingCompleted: Bool
+
+    func migrated() -> EryloSettings {
+        EryloSettings(
+            modules: modules,
+            displays: DisplayPreferences(
+                isEnabled: displays.isEnabled,
+                surfaceScope: displays.enabledDisplayIDs?.isEmpty == true ? .custom : .automatic,
+                enabledDisplayUUIDs: displays.enabledDisplayIDs?.isEmpty == true ? [] : nil,
+                preferredDisplayUUID: nil
+            ),
+            motion: motion,
+            fullscreenBehavior: fullscreenBehavior,
+            launchAtLogin: launchAtLogin,
+            crashAndDiagnosticSharingConsent: crashAndDiagnosticSharingConsent,
+            onboardingCompleted: onboardingCompleted
         )
     }
 }

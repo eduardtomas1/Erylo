@@ -792,7 +792,10 @@ public enum GlanceRequestFactory {
             kind: ActivityKind.timer.rawValue,
             priority: 60,
             title: "Focus complete",
-            ttlMilliseconds: 2_500,
+            actionIdentifier: CountdownActivityContract.dismissActionIdentifier,
+            actionLabel: "Done",
+            actionIntent: ActivityActionIntent.dismiss.rawValue,
+            ttlMilliseconds: 8_000,
             temporalProgress: nil,
             presentationRole: .completionAcknowledgement
         )
@@ -807,6 +810,7 @@ public enum CountdownActivityContract {
     public static let source = ActivitySource.timer
     public static let kind = ActivityKind.timer
     public static let cancelActionIdentifier = "timer.cancel"
+    public static let dismissActionIdentifier = "timer.dismiss-completion"
 
     public static let identity = ActivityIdentity(
         source: source,

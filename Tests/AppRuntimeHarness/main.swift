@@ -276,7 +276,7 @@ private struct AppRuntimeHarness {
         check(coreGatePresenter.statusItemCount == 1, "status item is discoverable while core startup is gated")
         let startingMenu = coreGatePresenter.menu
         check(
-            startingMenu?.items.filter {
+            startingMenu?.allItems.filter {
                 if case .command = $0.kind { return $0.kind != .command(.quit) }
                 return false
             }.allSatisfy { !$0.isEnabled && $0.keyEquivalent.isEmpty } == true,
@@ -377,7 +377,7 @@ private struct AppRuntimeHarness {
             "surface control is admitted before optional restoration completes"
         )
         check(
-            restoringMenu?.items.first(where: { $0.kind == .command(.startFocusTimer25) })?.isEnabled == true,
+            restoringMenu?.allItems.first(where: { $0.kind == .command(.startFocusTimer25) })?.isEnabled == true,
             "Focus control is admitted before optional restoration completes"
         )
         check(
@@ -537,7 +537,7 @@ private struct AppRuntimeHarness {
             ),
             presenter: presenter,
             makeDisplayChoices: {
-                [DisplayChoice(identity: DisplayIdentity(rawValue: 1), name: "Main display")]
+                [DisplayChoice(identity: makeDisplayUUID(1), name: "Built-in Display", isMain: true)]
             }
         )
 
@@ -546,17 +546,24 @@ private struct AppRuntimeHarness {
         check(presenter.statusItemCount == 0 && presenter.settingsWindowCount == 0, "control-plane preparation creates no menu or window resource")
 
         var routedCommands: [ApplicationControlCommand] = []
+        var commandAdmission = false
         var appliedPolicies: [DisplayPolicy] = []
         let menuContextProbe = FocusTimerMenuContextProbe()
         let runtimeSnapshot = RuntimeControlSnapshotProbe(focusTimer: menuContextProbe)
         check(plane.installEarlyControls(
             runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
-            commandHandler: { routedCommands.append($0) },
+            commandHandler: {
+                routedCommands.append($0)
+                return commandAdmission
+            },
             displayPolicyHandler: { appliedPolicies.append($0) }
         ), "early control installation succeeds after inert preparation")
         check(!plane.installEarlyControls(
             runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
-            commandHandler: { routedCommands.append($0) },
+            commandHandler: {
+                routedCommands.append($0)
+                return commandAdmission
+            },
             displayPolicyHandler: { appliedPolicies.append($0) }
         ), "repeated early control installation is rejected")
 
@@ -571,7 +578,7 @@ private struct AppRuntimeHarness {
             "early menu exposes truthful non-actionable startup copy"
         )
         check(
-            presenter.menu?.items.filter {
+            presenter.menu?.allItems.filter {
                 if case .command = $0.kind { return $0.kind != .command(.quit) }
                 return false
             }.allSatisfy { !$0.isEnabled && $0.keyEquivalent.isEmpty } == true,
@@ -604,8 +611,9 @@ private struct AppRuntimeHarness {
         check(presenter.presentationCount == 1, "first-launch presentation occurs once after persistence settles")
         check(plane.readinessSnapshot.state == .setupRequired, "missing first-launch settings become setup-required, not attention")
         check(
-            presenter.menu?.items.contains(where: { $0.title == ApplicationControlCopy.shortcutReminder }) == true,
-            "admitted visible-surface controls include the keyboard shortcut reminder"
+            presenter.menu?.items.first(where: { $0.kind == .command(.showSettings) })?.title
+                == ApplicationControlCopy.finishSetup,
+            "setup-required readiness becomes one actionable native Settings command"
         )
         check(menuContextProbe.evaluationCount == 2, "status menu performs no background context polling")
         menuContextProbe.context = .active(remainingText: "18:07")
@@ -618,9 +626,9 @@ private struct AppRuntimeHarness {
         check(
             menuContextProbe.evaluationCount == 3
                 && presenter.menu?.items.contains(where: {
-                    $0.title.contains("18:07") && $0.kind == .information && !$0.isEnabled
+                    $0.title.contains("18:07") && $0.kind == .submenu && $0.isEnabled
                 }) == true,
-            "menu-open refresh computes one contextual remaining-time snapshot"
+            "menu-open refresh computes one contextual timer-submenu title"
         )
 
         check(plane.presentSettings(), "ready Settings request succeeds")
@@ -631,11 +639,27 @@ private struct AppRuntimeHarness {
         let modelReference = WeakReference<TrustSettingsViewModel>()
         modelReference.value = presenter.presentedModel
         if let model = presenter.presentedModel {
-            await model.completeOnboarding()
+            let rejectedStart = await model.startFocusTimerAndCompleteOnboarding {
+                presenter.commandHandler?(.startFocusTimer25) == true
+            }
             check(
-                plane.readinessSnapshot.state == .ready
+                !rejectedStart
+                    && !model.settings.onboardingCompleted
+                    && plane.readinessSnapshot.state == .setupRequired
+                    && model.onboardingActionFailure?.contains("could not start") == true,
+                "rejected first-run command keeps setup visible with inline failure"
+            )
+            commandAdmission = true
+            let acceptedStart = await model.startFocusTimerAndCompleteOnboarding {
+                presenter.commandHandler?(.startFocusTimer25) == true
+            }
+            check(
+                acceptedStart
+                    && model.settings.onboardingCompleted
+                    && model.onboardingActionFailure == nil
+                    && plane.readinessSnapshot.state == .ready
                     && plane.readinessSnapshot.notices.isEmpty,
-                "successful onboarding immediately clears setup-required readiness"
+                "accepted first-run command persists onboarding and clears setup-required readiness"
             )
             await model.setModuleEnabled(.timer, enabled: true)
             check(await settingsOwner.moduleMutationCount == 0, "unavailable timer control cannot reach provider mutation")
@@ -647,31 +671,49 @@ private struct AppRuntimeHarness {
             await model.setMotion(.reduce)
             check(model.settings.motion == .systemDefault, "unwired motion preference cannot be persisted")
             await model.setFullscreen(.remainAvailable)
-            check(model.settings.fullscreenBehavior == .hide, "unwired fullscreen preference cannot be persisted")
+            check(
+                model.settings.fullscreenBehavior == .remainAvailable
+                    && appliedPolicies.last?.allowsFullscreenAuxiliary == true,
+                "wired fullscreen preference persists and applies the auxiliary policy"
+            )
 
             await model.setDisplaySurfaceEnabled(false)
-            check(appliedPolicies.last == DisplayPolicy(isEnabled: false), "display preference applies the proven panel policy")
+            check(
+                appliedPolicies.last?.isEnabled == false
+                    && appliedPolicies.last?.allowsFullscreenAuxiliary == true,
+                "display preference preserves the independently persisted fullscreen policy"
+            )
         } else {
             check(false, "first-launch presenter receives a settings model")
+            check(false, "rejected first-run timer fixture has a model")
+            check(false, "accepted first-run timer fixture has a model")
             check(false, "unavailable utility fixture has a model")
             check(false, "unavailable utility status fixture has a model")
             check(false, "motion availability fixture has a model")
-            check(false, "fullscreen availability fixture has a model")
+            check(false, "fullscreen policy fixture has a model")
             check(false, "display-policy fixture has a model")
         }
 
-        presenter.commandHandler?(.showSettings)
-        check(routedCommands == [.showSettings], "native presenter routes menu selections through the injected handler")
+        check(
+            presenter.commandHandler?(.showSettings) == true
+                && routedCommands == [
+                    .startFocusTimer25,
+                    .startFocusTimer25,
+                    .showSettings,
+                ],
+            "presenter preserves the injected command admission result"
+        )
 
         check(
             ApplicationControlCopy.statusItemLabel == "Erylo controls"
-                && ApplicationControlCopy.statusItemHint.contains("surface")
+                && ApplicationControlCopy.statusItemHint.contains("Focus Timer")
                 && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("top edge")
-                && TrustAccessibilityCopy.onboardingInteractionExplanation.contains("Control–Option–Command–E")
-                && TrustAccessibilityCopy.onboardingSafetyExplanation.contains("Browsing Settings")
+                && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("visible only")
+                && !TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("hover")
                 && TrustAccessibilityCopy.onboardingControlExplanation.contains("Focus Timer")
-                && TrustAccessibilityCopy.onboardingControlExplanation.contains("quit"),
-            "control and onboarding accessibility copy explains the complete daily-use path"
+                && TrustAccessibilityCopy.onboardingControlExplanation.contains("Battery and Volume")
+                && TrustAccessibilityCopy.onboardingControlExplanation.contains("Settings"),
+            "concise onboarding copy explains the shipping utilities without false hover claims"
         )
 
         await plane.shutdown()
@@ -710,7 +752,7 @@ private struct AppRuntimeHarness {
                     surface: .hidden
                 )
             },
-            commandHandler: { _ in },
+            commandHandler: { _ in true },
             displayPolicyHandler: { _ in }
         )
         _ = await returningPlane.restorePersistedModules()
@@ -768,7 +810,7 @@ private struct AppRuntimeHarness {
                     surface: .hidden
                 )
             },
-            commandHandler: { _ in },
+            commandHandler: { _ in true },
             displayPolicyHandler: { _ in }
         )
         _ = await recoveryPlane.restorePersistedModules()
@@ -785,10 +827,13 @@ private struct AppRuntimeHarness {
         let recoveryCopy = recoveryPresenter.menu?.items.map(\.title).joined(separator: " ") ?? ""
         check(
             recoveryCopy.contains("Safe defaults were used.")
-                && recoveryCopy.contains("Battery could not start and was left off.")
+                && !recoveryCopy.contains("Battery could not start and was left off.")
+                && recoveryPresenter.menu?.items.first(where: {
+                    $0.kind == .command(.showSettings)
+                })?.title == ApplicationControlCopy.reviewSettings
                 && !recoveryCopy.contains("provider-start-failed")
                 && !recoveryCopy.contains("provider-factory-failed"),
-            "recovery surfaces safe outcomes without raw errors"
+            "recovery keeps the menu to one safe summary and one Review Settings action"
         )
         _ = recoveryPlane.presentSettings()
         check(
@@ -941,7 +986,7 @@ private struct AppRuntimeHarness {
 
             _ = plane.installEarlyControls(
                 runtimeSnapshotProvider: { .starting },
-                commandHandler: { _ in },
+                commandHandler: { _ in true },
                 displayPolicyHandler: { _ in }
             )
             check(presenter.statusItemCount == 1, "status item is installed before persisted Glance restoration")
@@ -1755,7 +1800,12 @@ private struct AppRuntimeHarness {
         let now = Date(timeIntervalSinceReferenceDate: 90_000.25)
         let clock = ManualFocusClock(now: now)
         let broker = ActivityBroker()
-        let focusTimer = FocusTimerRuntimeService(broker: broker, clock: clock)
+        let completionNotifications = Counter()
+        let focusTimer = FocusTimerRuntimeService(
+            broker: broker,
+            clock: clock,
+            completionNotifier: { completionNotifications.value += 1 }
+        )
         let router = FocusTimerActionRouter(broker: broker, focusTimer: focusTimer)
         let model = SurfaceActivityModel(broker: broker, actionHandler: router)
         let events = EventLog()
@@ -1814,9 +1864,13 @@ private struct AppRuntimeHarness {
             await broker.workState().activeOwnershipCount == 0,
             "Settings browsing creates no timer broker ownership"
         )
+        check(
+            !controlPlane.route(.cancelFocusTimer),
+            "installed control callback preserves a rejected runtime command result"
+        )
 
         let menu = ApplicationMenuDescriptor(canCheckForUpdates: true)
-        let commandItems = menu.items.filter {
+        let commandItems = menu.allItems.filter {
             if case .command = $0.kind { return true }
             return false
         }
@@ -1834,7 +1888,7 @@ private struct AppRuntimeHarness {
                 && Set(commandIdentifiers).count == commandIdentifiers.count,
             "menu command accessibility identifiers are unique"
         )
-        let timerItems = menu.items.filter {
+        let timerItems = menu.allItems.filter {
             switch $0.kind {
             case .command(.startFocusTimer15), .command(.startFocusTimer25),
                  .command(.startFocusTimer50), .command(.cancelFocusTimer):
@@ -1843,10 +1897,10 @@ private struct AppRuntimeHarness {
                 false
             }
         }
-        check(timerItems.count == 4, "status menu exposes three Focus Timer presets and Cancel")
+        check(timerItems.count == 3, "idle status menu exposes only three Focus Timer presets")
         check(
-            timerItems.map(\.keyEquivalent) == ["1", "2", "5", ""],
-            "only actionable Focus Timer commands provide keyboard equivalents"
+            timerItems.map(\.keyEquivalent) == ["1", "2", "5"],
+            "Focus Timer presets retain compact keyboard equivalents inside their submenu"
         )
         check(
             timerItems.allSatisfy {
@@ -1856,17 +1910,21 @@ private struct AppRuntimeHarness {
             "Focus Timer menu commands provide accurate accessibility metadata"
         )
         check(
-            !menu.items.map(\.title).joined(separator: " ").lowercased().contains("pause")
-                && !menu.items.map(\.title).joined(separator: " ").lowercased().contains("resume"),
+            !menu.allItems.map(\.title).joined(separator: " ").lowercased().contains("pause")
+                && !menu.allItems.map(\.title).joined(separator: " ").lowercased().contains("resume"),
             "Focus Timer menu makes no unsupported pause or resume claim"
         )
         check(
-            menu.items.first(where: { $0.kind == .command(.cancelFocusTimer) })?.isEnabled == false,
-            "status menu disables timer cancellation while idle"
+            menu.allItems.first(where: { $0.kind == .command(.cancelFocusTimer) }) == nil,
+            "idle status menu omits an inapplicable Cancel command"
         )
         check(
-            menu.items.first(where: { $0.kind == .information })?.isEnabled == false,
-            "status menu reminder is truly informational"
+            menu.items.contains(where: {
+                $0.kind == .submenu
+                    && $0.title == ApplicationControlCopy.focusTimer
+                    && $0.children.count == 3
+            }),
+            "idle presets live under one native Focus Timer submenu"
         )
         let activeMenu = ApplicationMenuDescriptor(
             canCheckForUpdates: false,
@@ -1874,12 +1932,12 @@ private struct AppRuntimeHarness {
         )
         check(
             activeMenu.items.contains(where: {
-                $0.kind == .information && $0.title.contains("24:59") && !$0.isEnabled
+                $0.kind == .submenu && $0.title.contains("24:59") && $0.isEnabled
             }),
-            "active status menu exposes remaining time as inert context"
+            "active status menu exposes remaining time in the actionable submenu title"
         )
         check(
-            activeMenu.items.filter {
+            activeMenu.allItems.filter {
                 switch $0.kind {
                 case .command(.startFocusTimer15), .command(.startFocusTimer25),
                      .command(.startFocusTimer50):
@@ -1887,17 +1945,24 @@ private struct AppRuntimeHarness {
                 default:
                     false
                 }
-            }.allSatisfy { $0.title.hasPrefix("Replace with") },
-            "active status menu makes preset replacement semantics explicit"
+            }.allSatisfy {
+                $0.accessibilityHint == ApplicationControlCopy.replaceFocusHint
+            },
+            "active preset accessibility copy makes replacement semantics explicit"
         )
         check(
-            activeMenu.items.first(where: { $0.kind == .command(.cancelFocusTimer) })?.isEnabled == true,
-            "active status menu enables timer cancellation"
+            activeMenu.allItems.first(where: { $0.kind == .command(.cancelFocusTimer) }).map {
+                $0.isEnabled && $0.keyEquivalent == "."
+            } == true,
+            "active status menu reveals one enabled timer-cancellation command"
         )
 
         check(runtime.handle(.toggleSurface), "deliberate surface toggle constructs the demand-driven idle launcher")
         check(panel.isActivitySurfaceVisible, "idle launcher is physically and logically visible before selection")
-        check(panel.startFocusTimer(minutes: 25), "idle native launcher routes the 25-minute Focus Timer preset")
+        check(
+            controlPlane.route(.startFocusTimer25),
+            "installed control callback preserves an accepted Focus Timer result"
+        )
         check(
             await waitUntil {
                 let countdown = await focusTimer.provider.countdown()
@@ -2195,6 +2260,10 @@ private struct AppRuntimeHarness {
             },
             "repeated start/cancel converges with no orphan command or timer work"
         )
+        check(
+            completionNotifications.value == 0,
+            "explicit cancellation and replacement never invoke the completion notifier"
+        )
 
         panel.setContentVisible(false)
         check(runtime.handle(.startFocusTimer15), "natural-completion Focus Timer starts")
@@ -2219,11 +2288,18 @@ private struct AppRuntimeHarness {
                 let providerWork = await focusTimer.provider.workState()
                 return countdown == nil
                     && snapshot.current?.activity.presentation.title == "Focus complete"
-                    && snapshot.current?.activity.action == nil
+                    && snapshot.current?.activity.action?.identifier
+                        == CountdownActivityContract.dismissActionIdentifier
+                    && snapshot.current?.activity.action?.label == "Done"
+                    && snapshot.current?.activity.action?.intent == .dismiss
                     && providerWork.isIdle
                     && focusTimer.workState().isIdle
             },
-            "natural completion publishes only the bounded acknowledgement and drains runtime work"
+            "natural completion publishes a bounded dismissible acknowledgement and drains runtime work"
+        )
+        check(
+            completionNotifications.value == 1,
+            "natural completion invokes the injected one-shot notifier exactly once"
         )
         check(await focusTimer.provider.status() == .disabled, "natural completion disables timer provider")
         check(focusTimer.menuContext(at: completionDeadline) == .idle, "natural completion retires menu timer context")
@@ -2231,6 +2307,35 @@ private struct AppRuntimeHarness {
             await broker.workState().activeOwnershipCount == 0,
             "natural completion releases timer broker ownership"
         )
+        check(
+            await waitUntil { model.currentAction?.intent == .dismiss },
+            "completion Done reaches the shared surface model"
+        )
+        if let completionAction = model.currentAction {
+            check(
+                completionAction.intent == .dismiss
+                    && completionAction.label == "Done",
+                "surface model exposes the completion Done route"
+            )
+            check(model.dispatch(completionAction), "completion Done dispatches through the app router")
+            check(
+                await waitUntil {
+                    await broker.snapshot().current == nil
+                        && model.current == nil
+                        && !model.workState.hasActionTask
+                },
+                "completion Done removes the exact acknowledgement revision"
+            )
+            check(
+                completionNotifications.value == 1,
+                "manual completion dismissal never duplicates the natural notifier"
+            )
+        } else {
+            check(false, "surface model exposes the completion Done route")
+            check(false, "completion Done remains dispatchable")
+            check(false, "completion Done can settle")
+            check(false, "completion dismissal leaves notifier count stable")
+        }
 
         check(runtime.handle(.startFocusTimer50), "shutdown-overlap Focus Timer starts")
         check(
@@ -2309,6 +2414,12 @@ private struct AppRuntimeHarness {
             check(
                 panelModel.accessibility.value.contains("Focus complete"),
                 "completion peek announces its acknowledgement to VoiceOver"
+            )
+            check(
+                panelModel.content.action?.intent == .dismiss
+                    && panelModel.content.action?.label == "Done"
+                    && panelModel.accessibilitySurfaceAction == .dismiss,
+                "completion peek exposes Done and a VoiceOver dismiss action, never Expand"
             )
             check(
                 await waitUntil { await completionScheduler.pendingCount == 1 },
@@ -2674,6 +2785,7 @@ private final class RecordingControlPlane: ApplicationControlPlaneOwning {
     private(set) var restoreCount = 0
     private var isShutDown = false
     private var runtimeSnapshotProvider: (@MainActor () -> ApplicationRuntimeControlSnapshot)?
+    private var commandHandler: (@MainActor (ApplicationControlCommand) -> Bool)?
     private(set) var readinessSnapshot = ApplicationReadinessSnapshot.starting
 
     var lastCanCheckForUpdates: Bool? {
@@ -2686,15 +2798,19 @@ private final class RecordingControlPlane: ApplicationControlPlaneOwning {
 
     func installEarlyControls(
         runtimeSnapshotProvider: @escaping @MainActor () -> ApplicationRuntimeControlSnapshot,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
     ) -> Bool {
         guard installCount == 0, !isShutDown else { return false }
-        _ = commandHandler
         _ = displayPolicyHandler
         self.runtimeSnapshotProvider = runtimeSnapshotProvider
+        self.commandHandler = commandHandler
         installCount += 1
         return true
+    }
+
+    func route(_ command: ApplicationControlCommand) -> Bool {
+        commandHandler?(command) == true
     }
 
     func restorePersistedModules() async -> Bool {
@@ -2713,6 +2829,7 @@ private final class RecordingControlPlane: ApplicationControlPlaneOwning {
     func shutdown() async {
         guard !isShutDown else { return }
         isShutDown = true
+        commandHandler = nil
         shutdownCount += 1
     }
 }
@@ -2724,13 +2841,13 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
     private(set) var presentationCount = 0
     private(set) var shutdownCount = 0
     private(set) var menu: ApplicationMenuDescriptor?
-    private(set) var commandHandler: (@MainActor (ApplicationControlCommand) -> Void)?
+    private(set) var commandHandler: (@MainActor (ApplicationControlCommand) -> Bool)?
     private(set) var presentedModel: TrustSettingsViewModel?
     private var descriptorProvider: (@MainActor () -> ApplicationMenuDescriptor)?
 
     func installStatusMenu(
         descriptorProvider: @escaping @MainActor () -> ApplicationMenuDescriptor,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool
     ) {
         statusItemCount = 1
         self.descriptorProvider = descriptorProvider
@@ -3266,6 +3383,8 @@ private final class FixedDisplayProvider: EnabledDisplayProviding {
         [
             DisplaySnapshot(
                 identity: DisplayIdentity(rawValue: 1),
+                uuid: makeDisplayUUID(1),
+                localizedName: "Built-in Display",
                 geometry: DisplayGeometry(
                     frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
                     visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
@@ -3276,6 +3395,11 @@ private final class FixedDisplayProvider: EnabledDisplayProviding {
             ),
         ]
     }
+}
+
+private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
+    let uuid = String(format: "00000000-0000-0000-0000-%012llx", UInt64(value))
+    return DisplayUUID(rawValue: uuid)!
 }
 
 @MainActor

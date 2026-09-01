@@ -91,4 +91,39 @@ jobs:
           persist-credentials: false
 
       - name: Run ${{ matrix.target }}
+        if: matrix.target != 'EryloSurfaceTests' && matrix.target != 'EryloTrustTests'
         run: .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
+
+      - name: Run EryloTrustTests and render native settings QA
+        if: matrix.target == 'EryloTrustTests'
+        env:
+          ERYLO_SETTINGS_VISUAL_QA_DIRECTORY: ${{ runner.temp }}/erylo-native-settings-visual-qa
+        run: .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
+
+      - name: Run EryloSurfaceTests and render native visual QA
+        if: matrix.target == 'EryloSurfaceTests'
+        env:
+          ERYLO_VISUAL_QA_DIRECTORY: ${{ runner.temp }}/erylo-native-visual-qa
+        run: .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
+
+      - name: Upload native visual QA
+        if: ${{ !cancelled() && matrix.target == 'EryloSurfaceTests' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: erylo-native-visual-qa-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/erylo-native-visual-qa/*.png
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+          overwrite: false
+
+      - name: Upload native settings visual QA
+        if: ${{ !cancelled() && matrix.target == 'EryloTrustTests' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: erylo-native-settings-visual-qa-${{ github.sha }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/erylo-native-settings-visual-qa/*.png
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
+          overwrite: false

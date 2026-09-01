@@ -1,5 +1,5 @@
 # shard	expected_checks	command_timeout_seconds
-source-boundaries	114	900
+source-boundaries	115	900
 build-validation	34	900
 build-artifact	7	900
 symbol-validation	3	900

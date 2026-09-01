@@ -61,6 +61,7 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     package let provider: CountdownGlanceProvider
 
     private let clock: any GlanceClock
+    private let completionNotifier: @MainActor @Sendable () -> Void
     private var phase = Phase.initialized
     private var nextSequence: UInt64 = 0
     private var pendingUserOperation: SequencedOperation?
@@ -71,22 +72,27 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     private var isProviderEnabled = false
     private var isSurfaceVisible = false
     private var activeTimer: ActiveTimer?
+    private var lastNotifiedCompletionOperationIdentity: CountdownOperationIdentity?
 
     package init(
         provider: CountdownGlanceProvider,
-        clock: any GlanceClock = SystemGlanceClock()
+        clock: any GlanceClock = SystemGlanceClock(),
+        completionNotifier: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.provider = provider
         self.clock = clock
+        self.completionNotifier = completionNotifier
     }
 
     package convenience init(
         broker: ActivityBroker,
-        clock: any GlanceClock = SystemGlanceClock()
+        clock: any GlanceClock = SystemGlanceClock(),
+        completionNotifier: @escaping @MainActor @Sendable () -> Void = {}
     ) {
         self.init(
             provider: CountdownGlanceProvider(broker: broker, clock: clock),
-            clock: clock
+            clock: clock,
+            completionNotifier: completionNotifier
         )
     }
 
@@ -300,7 +306,12 @@ package final class FocusTimerRuntimeService: ApplicationRuntimeService {
     private func naturalCompletionDidFinish(
         _ completion: CountdownNaturalCompletion
     ) async {
-        guard phase == .running else { return }
+        guard phase == .running,
+              lastNotifiedCompletionOperationIdentity != completion.operationIdentity else {
+            return
+        }
+        lastNotifiedCompletionOperationIdentity = completion.operationIdentity
+        completionNotifier()
         isProviderEnabled = await provider.status().isEnabled
         if !isProviderEnabled,
            activeTimer?.operationIdentity == completion.operationIdentity {
@@ -360,9 +371,7 @@ package final class FocusTimerActionRouter: ActivityActionHandling {
         _ intent: ActivityActionIntent,
         identity: SurfaceActionIdentity
     ) async -> ActivityActionOutcome {
-        guard intent == .cancel,
-              identity.activityIdentity == CountdownActivityContract.identity,
-              identity.actionIdentifier == CountdownActivityContract.cancelActionIdentifier else {
+        guard identity.activityIdentity == CountdownActivityContract.identity else {
             return .unhandled
         }
 
@@ -373,22 +382,48 @@ package final class FocusTimerActionRouter: ActivityActionHandling {
             return .stale
         }
         guard current.activity.identity.source == CountdownActivityContract.source,
-              current.activity.kind == CountdownActivityContract.kind,
-              current.activity.action?.identifier
-                == CountdownActivityContract.cancelActionIdentifier,
-              current.activity.action?.intent == .cancel else {
+              current.activity.kind == CountdownActivityContract.kind else {
             return .unhandled
         }
 
-        return switch await focusTimer.routeCancel(
-            activityRevision: identity.activityRevision
-        ) {
-        case .cancelled:
-            .handled
-        case .stale:
-            .stale
-        case .unavailable:
-            .unhandled
+        switch intent {
+        case .cancel:
+            guard identity.actionIdentifier
+                    == CountdownActivityContract.cancelActionIdentifier,
+                  current.activity.action?.identifier
+                    == CountdownActivityContract.cancelActionIdentifier,
+                  current.activity.action?.intent == .cancel else {
+                return .unhandled
+            }
+            return switch await focusTimer.routeCancel(
+                activityRevision: identity.activityRevision
+            ) {
+            case .cancelled:
+                .handled
+            case .stale:
+                .stale
+            case .unavailable:
+                .unhandled
+            }
+        case .dismiss:
+            guard identity.actionIdentifier
+                    == CountdownActivityContract.dismissActionIdentifier,
+                  current.activity.presentation.presentationRole
+                    == .completionAcknowledgement,
+                  current.activity.action?.identifier
+                    == CountdownActivityContract.dismissActionIdentifier,
+                  current.activity.action?.intent == .dismiss else {
+                return .unhandled
+            }
+            let dismissed = await broker.cancelCurrentAction(
+                identity: identity.activityIdentity,
+                revision: identity.activityRevision,
+                actionIdentifier: identity.actionIdentifier,
+                intent: intent
+            )
+            return dismissed ? .handled : .stale
+        case .pause, .resume, .openSource, .togglePlayback:
+            return .unhandled
         }
     }
 }

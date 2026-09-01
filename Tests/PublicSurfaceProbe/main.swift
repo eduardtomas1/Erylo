@@ -361,7 +361,9 @@ private struct PublicSurfaceProbe {
             check(
                 CountdownActivityContract.identity.source == .timer
                     && CountdownActivityContract.kind == .timer
-                    && CountdownActivityContract.cancelActionIdentifier == "timer.cancel",
+                    && CountdownActivityContract.cancelActionIdentifier == "timer.cancel"
+                    && CountdownActivityContract.dismissActionIdentifier
+                        == "timer.dismiss-completion",
                 "public countdown contract exposes closed typed metadata"
             )
             check(
@@ -455,6 +457,8 @@ private final class Fixture {
         model = SurfaceActivityModel(broker: broker, actionHandler: handler)
         let display = DisplaySnapshot(
             identity: DisplayIdentity(rawValue: identity),
+            uuid: makeDisplayUUID(identity),
+            localizedName: "Built-in Display",
             geometry: DisplayGeometry(
                 frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
                 visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
@@ -489,6 +493,8 @@ private final class GatedFixture {
         model = SurfaceActivityModel(broker: broker, actionHandler: handler)
         let display = DisplaySnapshot(
             identity: DisplayIdentity(rawValue: identity),
+            uuid: makeDisplayUUID(identity),
+            localizedName: "Built-in Display",
             geometry: DisplayGeometry(
                 frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
                 visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
@@ -507,6 +513,11 @@ private final class GatedFixture {
             }
         )
     }
+}
+
+private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
+    let uuid = String(format: "00000000-0000-0000-0000-%012llx", UInt64(value))
+    return DisplayUUID(rawValue: uuid)!
 }
 
 @MainActor

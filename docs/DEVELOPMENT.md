@@ -31,12 +31,18 @@ Scripts/ci.sh
 ```
 
 To regenerate the native Focus Timer and Volume visual-QA set on representative
-notched and notchless geometry while running the deterministic surface harness. The renderer hosts
-the production SwiftUI view on a fixed dark desktop backdrop so the notch's
-transparent outer curls are composited as product geometry, not an alpha matte:
+notched and notchless geometry while running the deterministic surface harness,
+set the output directory below. Timer fixtures use a timestamp projection
+anchored immediately before each render, so the production countdown path—not
+static fallback copy—produces the visible value. The renderer hosts the
+production SwiftUI view on explicit light and dark desktop backdrops so the
+notch's transparent outer curls are composited as product geometry, not an alpha
+matte. Existing README images use the dark context; the CI artifact also includes
+light-desktop notched and light-mode notchless review frames.
 
 ```sh
 ERYLO_VISUAL_QA_DIRECTORY="$PWD/docs/images" swift run EryloSurfaceTests
+ERYLO_SETTINGS_VISUAL_QA_DIRECTORY="$PWD/docs/settings-images" swift run EryloTrustTests
 ```
 
 The script fails for tracked files hidden by `.gitignore`, common private signing/credential filenames, private-key markers, high-confidence GitHub/AWS token patterns, invalid tracked shell syntax, or invalid GitHub YAML syntax. A false positive should receive a narrow reviewed exception; do not weaken the repository-wide rule or add a broad ignore pattern.

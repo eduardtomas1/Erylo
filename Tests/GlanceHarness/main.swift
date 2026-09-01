@@ -2095,9 +2095,12 @@ private struct GlanceHarness {
                 await broker.snapshot().current?.activity.presentation.title == "Focus complete",
                 "countdown expiry publishes one bounded completion acknowledgement"
             )
+            let completionAction = await broker.snapshot().current?.activity.action
             check(
-                await broker.snapshot().current?.activity.action == nil,
-                "completion acknowledgement exposes no stale timer action"
+                completionAction?.identifier == CountdownActivityContract.dismissActionIdentifier
+                    && completionAction?.label == "Done"
+                    && completionAction?.intent == .dismiss,
+                "completion acknowledgement replaces Cancel with one bounded Done action"
             )
             check(await provider.status() == .disabled, "natural completion disables the provider")
             check(

@@ -295,7 +295,15 @@ public final class PanelCoordinator {
     /// when disabling must also be a physical activity-model drain barrier.
     public func update(policy: DisplayPolicy) {
         guard !isShutdown, self.policy != policy else { return }
+        let optedOutOfFullscreen = self.policy.allowsFullscreenAuxiliary
+            && !policy.allowsFullscreenAuxiliary
         self.policy = policy
+        if optedOutOfFullscreen {
+            panels.values.forEach { $0.contractForEnvironmentalTransition() }
+        }
+        panels.values.forEach {
+            $0.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
+        }
         guard isRunning else { return }
         if policy.isEnabled {
             activityModel.start()
@@ -434,8 +442,12 @@ public final class PanelCoordinator {
         }
 
         switch event {
-        case .displayConfigurationChanged, .activeSpaceChanged:
+        case .displayConfigurationChanged:
             guard !isWorkspaceSleeping else { return }
+            reconcileDisplays()
+        case .activeSpaceChanged:
+            guard !isWorkspaceSleeping else { return }
+            panels.values.forEach { $0.contractForEnvironmentalTransition() }
             reconcileDisplays()
         case .workspaceWillSleep:
             guard !isWorkspaceSleeping else { return }
@@ -483,6 +495,7 @@ public final class PanelCoordinator {
     ) -> (any PanelPresenting)? {
         let displayID = CGDirectDisplayID(identity.rawValue)
         if let panel = panels[displayID] {
+            panel.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
             return panel
         }
         guard let snapshot = displaySnapshots[displayID] else { return nil }
@@ -495,11 +508,13 @@ public final class PanelCoordinator {
     ) -> any PanelPresenting {
         let displayID = CGDirectDisplayID(snapshot.identity.rawValue)
         if let panel = panels[displayID] {
+            panel.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
             panel.update(snapshot: snapshot)
             return panel
         }
 
         let panel = panelFactory(snapshot, activityModel)
+        panel.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
         let lease = UUID()
         panels[displayID] = panel
         panelLeases[displayID] = lease

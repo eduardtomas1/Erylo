@@ -183,7 +183,8 @@ public struct PanelLayout: Equatable, Sendable {
         state: PanelPresentationState,
         metrics: PanelMetrics = .feasibility,
         showsFocusTimerLauncher: Bool = false,
-        minimumNotchWingWidth: CGFloat = 0
+        minimumNotchWingWidth: CGFloat = 0,
+        minimumNotchBodyHeight: CGFloat = 0
     ) {
         let maximumSize = metrics.maximumSize
         fixedFrame = CGRect(
@@ -201,7 +202,8 @@ public struct PanelLayout: Equatable, Sendable {
             display: display,
             metrics: metrics,
             showsFocusTimerLauncher: showsFocusTimerLauncher,
-            minimumNotchWingWidth: minimumNotchWingWidth
+            minimumNotchWingWidth: minimumNotchWingWidth,
+            minimumNotchBodyHeight: minimumNotchBodyHeight
         )
         let availableHeight = max(maximumSize.height - surfaceTopInset, 0)
         let size = CGSize(
@@ -276,7 +278,9 @@ public struct PanelLayout: Equatable, Sendable {
             min(23, size.height / 2)
         }
 
-        if state == .hidden {
+        if state == .hidden || state == .dropTarget {
+            // File Hold is not mounted. The compatibility state must stay inert
+            // and can never become an invisible AppKit click blocker.
             hitRegion = .empty
         } else if attachment == .notchIntegrated {
             // The concave top corners are transparent. Accept clicks only in an
@@ -308,7 +312,8 @@ public struct PanelLayout: Equatable, Sendable {
         display: DisplayGeometry,
         metrics: PanelMetrics,
         showsFocusTimerLauncher: Bool,
-        minimumNotchWingWidth: CGFloat
+        minimumNotchWingWidth: CGFloat,
+        minimumNotchBodyHeight: CGFloat
     ) -> CGSize {
         var size = if state == .compact && showsFocusTimerLauncher {
             metrics.timerLauncherSize
@@ -333,7 +338,10 @@ public struct PanelLayout: Equatable, Sendable {
                 state == .compact ? minimumNotchWingWidth : 0
             )
             size.width = max(size.width, occlusion.frame.width + horizontalPadding * 2)
-            size.height = max(size.height, occlusion.frame.height)
+            size.height = max(
+                size.height,
+                occlusion.frame.height + max(minimumNotchBodyHeight, 0)
+            )
         }
         return size
     }

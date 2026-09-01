@@ -43,6 +43,7 @@ Sources/EryloTrust/ModuleLifecycle.swift
 Sources/EryloTrust/SettingsPersistence.swift
 Sources/EryloUpdates/UpdateConfiguration.swift
 Sources/EryloUpdates/UpdateRuntime.swift
+Sources/EryloWindowing/ExpandedInteractionPolicy.swift
 Sources/EryloWindowing/NonActivatingPanel.swift
 Sources/EryloWindowing/PanelController.swift
 Sources/EryloWindowing/PanelCoordinator.swift

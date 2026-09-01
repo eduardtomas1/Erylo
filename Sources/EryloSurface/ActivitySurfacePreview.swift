@@ -1,5 +1,6 @@
 import EryloActivity
 import EryloCore
+import Foundation
 
 public struct ActivitySurfacePreviewScenario: Equatable, Sendable {
     public let name: String
@@ -66,8 +67,8 @@ public enum ActivitySurfacePreviewCatalog {
     )
 
     public static let battery = ActivitySurfacePreviewScenario(
-        name: "Battery peek",
-        state: .peek,
+        name: "Battery compact",
+        state: .compact,
         current: request(
             identifier: "preview.battery",
             source: .battery,
@@ -79,8 +80,8 @@ public enum ActivitySurfacePreviewCatalog {
     )
 
     public static let charging = ActivitySurfacePreviewScenario(
-        name: "Charging peek",
-        state: .peek,
+        name: "Charging compact",
+        state: .compact,
         current: request(
             identifier: "preview.charging",
             source: .battery,
@@ -99,7 +100,7 @@ public enum ActivitySurfacePreviewCatalog {
             source: .timer,
             kind: .timer,
             title: "Focus timer",
-            detail: "12:40 remaining",
+            detail: "12:40",
             progress: 0.36,
             actionIdentifier: "preview.timer.cancel",
             actionLabel: "Cancel timer",
@@ -119,6 +120,38 @@ public enum ActivitySurfacePreviewCatalog {
         )
     )
 
+    /// Timestamp-backed timer fixture for native visual QA. The caller anchors
+    /// it immediately before rendering so `TimelineView` exercises production
+    /// temporal projection while the visible value remains 12:40 for the
+    /// bounded render transaction.
+    package static func timerVisualQA(
+        at renderingDate: Date,
+        state: PanelPresentationState
+    ) -> ActivitySurfacePreviewScenario {
+        ActivitySurfacePreviewScenario(
+            name: state == .compact
+                ? "Timer compact temporal visual QA"
+                : "Timer expanded temporal visual QA",
+            state: state,
+            current: request(
+                identifier: state == .compact
+                    ? "preview.timer.compact.temporal"
+                    : "preview.timer.expanded.temporal",
+                source: .timer,
+                kind: .timer,
+                title: "Focus Timer",
+                detail: "12:40",
+                actionIdentifier: "preview.timer.cancel",
+                actionLabel: "Cancel timer",
+                actionIntent: .cancel,
+                temporalProgress: ActivityTemporalProgress(
+                    startedAt: renderingDate.addingTimeInterval(-740),
+                    endsAt: renderingDate.addingTimeInterval(760)
+                )
+            )
+        )
+    }
+
     public static let timerCompletion = ActivitySurfacePreviewScenario(
         name: "Timer completion",
         state: .peek,
@@ -126,7 +159,11 @@ public enum ActivitySurfacePreviewCatalog {
             identifier: "preview.timer.complete",
             source: .timer,
             kind: .timer,
-            title: "Focus complete"
+            title: "Focus complete",
+            actionIdentifier: "timer.dismiss-completion",
+            actionLabel: "Done",
+            actionIntent: .dismiss,
+            presentationRole: .completionAcknowledgement
         )
     )
 
@@ -172,7 +209,7 @@ public enum ActivitySurfacePreviewCatalog {
 
     public static let volumeOutput = ActivitySurfacePreviewScenario(
         name: "Volume output changed",
-        state: .expanded,
+        state: .compact,
         current: request(
             identifier: "preview.volume.output",
             source: .volume,
@@ -273,6 +310,7 @@ public enum ActivitySurfacePreviewCatalog {
         actionIdentifier: String? = nil,
         actionLabel: String? = nil,
         actionIntent: ActivityActionIntent? = nil,
+        temporalProgress: ActivityTemporalProgress? = nil,
         presentationRole: ActivityPresentationRole = .standard
     ) -> ActivityRequest {
         ActivityRequest(
@@ -286,7 +324,7 @@ public enum ActivitySurfacePreviewCatalog {
             actionIdentifier: actionIdentifier,
             actionLabel: actionLabel,
             actionIntent: actionIntent?.rawValue,
-            temporalProgress: nil,
+            temporalProgress: temporalProgress,
             presentationRole: presentationRole
         )
     }

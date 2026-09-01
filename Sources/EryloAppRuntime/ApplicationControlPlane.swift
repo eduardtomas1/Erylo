@@ -21,6 +21,7 @@ package enum ApplicationMenuItemKind: Equatable, Sendable {
     case command(ApplicationControlCommand)
     case information
     case separator
+    case submenu
 }
 
 package struct ApplicationMenuItemDescriptor: Equatable, Sendable {
@@ -31,6 +32,7 @@ package struct ApplicationMenuItemDescriptor: Equatable, Sendable {
     package let accessibilityHint: String?
     package let accessibilityIdentifier: String?
     package let isEnabled: Bool
+    package let children: [ApplicationMenuItemDescriptor]
 
     package init(
         kind: ApplicationMenuItemKind,
@@ -39,7 +41,8 @@ package struct ApplicationMenuItemDescriptor: Equatable, Sendable {
         accessibilityLabel: String? = nil,
         accessibilityHint: String? = nil,
         accessibilityIdentifier: String? = nil,
-        isEnabled: Bool = true
+        isEnabled: Bool = true,
+        children: [ApplicationMenuItemDescriptor] = []
     ) {
         self.kind = kind
         self.title = title
@@ -48,6 +51,11 @@ package struct ApplicationMenuItemDescriptor: Equatable, Sendable {
         self.accessibilityHint = accessibilityHint
         self.accessibilityIdentifier = accessibilityIdentifier
         self.isEnabled = isEnabled
+        self.children = children
+    }
+
+    package var flattened: [ApplicationMenuItemDescriptor] {
+        [self] + children.flatMap(\.flattened)
     }
 }
 
@@ -117,7 +125,7 @@ package enum ApplicationFocusTimerMenuContext: Equatable, Sendable {
 
 package enum ApplicationControlCopy {
     package static let statusItemLabel = "Erylo controls"
-    package static let statusItemHint = "Opens Focus Timer controls, the Erylo surface, settings, updates, and quitting."
+    package static let statusItemHint = "Opens Erylo, Focus Timer, and app settings."
     package static let showSurface = "Show Erylo"
     package static let hideSurface = "Hide Erylo"
     package static let surfaceAccessibilityLabel = "Erylo surface visibility"
@@ -125,14 +133,14 @@ package enum ApplicationControlCopy {
     package static let hideSurfaceHint = "Hides the Erylo surface on the selected display."
     package static let disabledSurfaceHint = "The Erylo surface is turned off in Settings."
     package static let unavailableSurfaceHint = "The Erylo surface is temporarily unavailable."
-    package static let startFocus15 = "Start 15-Minute Focus Timer"
-    package static let startFocus25 = "Start 25-Minute Focus Timer"
-    package static let startFocus50 = "Start 50-Minute Focus Timer"
-    package static let cancelFocus = "Cancel Focus Timer"
+    package static let focusTimer = "Focus Timer"
+    package static let cancelFocus = "Cancel Timer"
     package static let startFocusHint = "Starts a new focus timer and replaces any focus timer already running."
     package static let replaceFocusHint = "Replaces the current focus timer with this duration."
     package static let cancelFocusHint = "Cancels the current focus timer. It has no effect when no focus timer is running."
     package static let settings = "Settings…"
+    package static let finishSetup = "Finish Setup…"
+    package static let reviewSettings = "Review Settings…"
     package static let startingSettings = "Settings (Starting…)"
     package static let restoringSettings = "Settings (Restoring…)"
     package static let settingsHint = "Opens Erylo Settings."
@@ -140,7 +148,6 @@ package enum ApplicationControlCopy {
     package static let restoringSettingsHint = "Settings will be available after saved utilities finish restoring."
     package static let checkForUpdates = "Check for Updates…"
     package static let checkForUpdatesHint = "Checks for an Erylo update now."
-    package static let shortcutReminder = "Shortcut: Control–Option–Command–E"
     package static let quit = "Quit Erylo"
     package static let quitHint = "Stops Erylo safely and quits."
     package static let starting = "Erylo is starting…"
@@ -148,18 +155,20 @@ package enum ApplicationControlCopy {
     package static let setupRequired = "Setup required"
 
     package static func remainingFocus(_ value: String) -> String {
-        "Focus Timer · \(value) remaining"
+        "Focus Timer · \(value)"
     }
 
-    package static func focusPreset(minutes: Int, replacing: Bool) -> String {
-        replacing
-            ? "Replace with \(minutes)-Minute Focus Timer"
-            : "Start \(minutes)-Minute Focus Timer"
+    package static func focusPreset(minutes: Int) -> String {
+        "\(minutes) Minutes"
     }
 }
 
 package struct ApplicationMenuDescriptor: Equatable, Sendable {
     package let items: [ApplicationMenuItemDescriptor]
+
+    package var allItems: [ApplicationMenuItemDescriptor] {
+        items.flatMap(\.flattened)
+    }
 
     package init(
         canCheckForUpdates: Bool,
@@ -224,21 +233,14 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
                 )
             )
         case .setupRequired:
-            items.append(
-                ApplicationMenuItemDescriptor(
-                    kind: .information,
-                    title: ApplicationControlCopy.setupRequired,
-                    accessibilityIdentifier: "erylo.readiness.setup-required",
-                    isEnabled: false
-                )
-            )
+            break
         case .needsAttention:
-            for (index, notice) in readiness.notices.enumerated() {
+            if let notice = readiness.notices.first {
                 items.append(
                     ApplicationMenuItemDescriptor(
                         kind: .information,
                         title: notice,
-                        accessibilityIdentifier: "erylo.readiness.attention.\(index + 1)",
+                        accessibilityIdentifier: "erylo.readiness.attention",
                         isEnabled: false
                     )
                 )
@@ -246,21 +248,11 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
         case .ready:
             break
         }
-        if case let .active(remainingText) = focusTimer {
-            items.append(
-                ApplicationMenuItemDescriptor(
-                    kind: .information,
-                    title: ApplicationControlCopy.remainingFocus(remainingText),
-                    accessibilityIdentifier: "erylo.focus-timer.remaining",
-                    isEnabled: false
-                )
-            )
-        }
         items.append(ApplicationMenuItemDescriptor(kind: .separator, title: ""))
-        items.append(contentsOf: [
+        var focusTimerItems = [
             ApplicationMenuItemDescriptor(
                 kind: .command(.startFocusTimer15),
-                title: ApplicationControlCopy.focusPreset(minutes: 15, replacing: replacing),
+                title: ApplicationControlCopy.focusPreset(minutes: 15),
                 keyEquivalent: focusCommandsAreAdmitted ? "1" : "",
                 accessibilityLabel: "15-minute Focus Timer",
                 accessibilityHint: replacing
@@ -271,7 +263,7 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
             ),
             ApplicationMenuItemDescriptor(
                 kind: .command(.startFocusTimer25),
-                title: ApplicationControlCopy.focusPreset(minutes: 25, replacing: replacing),
+                title: ApplicationControlCopy.focusPreset(minutes: 25),
                 keyEquivalent: focusCommandsAreAdmitted ? "2" : "",
                 accessibilityLabel: "25-minute Focus Timer",
                 accessibilityHint: replacing
@@ -282,7 +274,7 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
             ),
             ApplicationMenuItemDescriptor(
                 kind: .command(.startFocusTimer50),
-                title: ApplicationControlCopy.focusPreset(minutes: 50, replacing: replacing),
+                title: ApplicationControlCopy.focusPreset(minutes: 50),
                 keyEquivalent: focusCommandsAreAdmitted ? "5" : "",
                 accessibilityLabel: "50-minute Focus Timer",
                 accessibilityHint: replacing
@@ -291,23 +283,52 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
                 accessibilityIdentifier: "erylo.focus-timer.start-50",
                 isEnabled: focusCommandsAreAdmitted
             ),
-            ApplicationMenuItemDescriptor(
+        ]
+        if focusTimer.isActive {
+            focusTimerItems.append(ApplicationMenuItemDescriptor(kind: .separator, title: ""))
+            focusTimerItems.append(ApplicationMenuItemDescriptor(
                 kind: .command(.cancelFocusTimer),
                 title: ApplicationControlCopy.cancelFocus,
                 keyEquivalent: focusCommandsAreAdmitted && focusTimer.isActive ? "." : "",
                 accessibilityLabel: "Cancel Focus Timer",
                 accessibilityHint: ApplicationControlCopy.cancelFocusHint,
                 accessibilityIdentifier: "erylo.focus-timer.cancel",
-                isEnabled: focusCommandsAreAdmitted && focusTimer.isActive
+                isEnabled: focusCommandsAreAdmitted
+            ))
+        }
+        let focusTimerTitle: String = switch focusTimer {
+        case .idle:
+            ApplicationControlCopy.focusTimer
+        case let .active(remainingText):
+            ApplicationControlCopy.remainingFocus(remainingText)
+        }
+        items.append(contentsOf: [
+            ApplicationMenuItemDescriptor(
+                kind: .submenu,
+                title: focusTimerTitle,
+                accessibilityLabel: focusTimerTitle,
+                accessibilityHint: focusTimer.isActive
+                    ? ApplicationControlCopy.replaceFocusHint
+                    : ApplicationControlCopy.startFocusHint,
+                accessibilityIdentifier: "erylo.focus-timer.menu",
+                isEnabled: focusCommandsAreAdmitted,
+                children: focusTimerItems
             ),
             ApplicationMenuItemDescriptor(kind: .separator, title: ""),
             ApplicationMenuItemDescriptor(
                 kind: .command(.showSettings),
-                title: readiness.state == .starting
-                    ? (runtime.coreCommandsAreAdmitted
+                title: switch readiness.state {
+                case .starting:
+                    runtime.coreCommandsAreAdmitted
                         ? ApplicationControlCopy.restoringSettings
-                        : ApplicationControlCopy.startingSettings)
-                    : ApplicationControlCopy.settings,
+                        : ApplicationControlCopy.startingSettings
+                case .setupRequired:
+                    ApplicationControlCopy.finishSetup
+                case .needsAttention:
+                    ApplicationControlCopy.reviewSettings
+                case .ready:
+                    ApplicationControlCopy.settings
+                },
                 keyEquivalent: settingsCanOpen ? "," : "",
                 accessibilityLabel: "Erylo Settings",
                 accessibilityHint: readiness.state == .starting
@@ -331,17 +352,6 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
                 )
             )
         }
-        if surfaceIsActionable {
-            items.append(ApplicationMenuItemDescriptor(kind: .separator, title: ""))
-            items.append(
-                ApplicationMenuItemDescriptor(
-                    kind: .information,
-                    title: ApplicationControlCopy.shortcutReminder,
-                    accessibilityIdentifier: "erylo.surface.shortcut",
-                    isEnabled: false
-                )
-            )
-        }
         items.append(ApplicationMenuItemDescriptor(kind: .separator, title: ""))
         items.append(
             ApplicationMenuItemDescriptor(
@@ -362,7 +372,7 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
 package protocol ApplicationControlPresenting: AnyObject {
     func installStatusMenu(
         descriptorProvider: @escaping @MainActor () -> ApplicationMenuDescriptor,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool
     )
     func presentSettings(model: TrustSettingsViewModel)
     func shutdown()
@@ -375,7 +385,7 @@ package protocol ApplicationControlPlaneOwning: AnyObject {
     @discardableResult
     func installEarlyControls(
         runtimeSnapshotProvider: @escaping @MainActor () -> ApplicationRuntimeControlSnapshot,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
     ) -> Bool
     @discardableResult
@@ -449,17 +459,12 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             presenter: NativeApplicationControlPresenter(),
             availableModules: ProductionCapabilities.settingsModules,
             makeDisplayChoices: {
-                let snapshots = SystemDisplayProvider().enabledDisplays()
-                var externalIndex = 0
-                return snapshots.map { snapshot in
-                    let name: String
-                    if snapshot.isMain {
-                        name = "Main display"
-                    } else {
-                        externalIndex += 1
-                        name = "External display \(externalIndex)"
-                    }
-                    return DisplayChoice(identity: snapshot.identity, name: name)
+                SystemDisplayProvider().enabledDisplays().map { snapshot in
+                    DisplayChoice(
+                        identity: snapshot.uuid,
+                        name: snapshot.localizedName,
+                        isMain: snapshot.isMain
+                    )
                 }
             }
         )
@@ -467,7 +472,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
 
     package func prepareForStartup() async -> DisplayPolicy {
         if let preparedSettings {
-            return preparedSettings.displays.displayPolicy
+            return preparedSettings.displayPolicy
         }
         guard !isShutDown else { return DisplayPolicy(isEnabled: false) }
 
@@ -483,22 +488,22 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             displayChoices: makeDisplayChoices(),
             availableModules: availableModules,
             supportsMotionPreference: false,
-            supportsFullscreenPreference: false,
+            supportsFullscreenPreference: true,
             settingsDidChange: { [weak self] settings in
                 self?.preparedSettings = settings
-                self?.displayPolicyHandler?(settings.displays.displayPolicy)
+                self?.displayPolicyHandler?(settings.displayPolicy)
             }
         )
         viewModel?.setSuccessfulSettingsChangeHandler { [weak self] change in
             self?.handleSuccessfulSettingsChange(change)
         }
-        return settings.displays.displayPolicy
+        return settings.displayPolicy
     }
 
     @discardableResult
     package func installEarlyControls(
         runtimeSnapshotProvider: @escaping @MainActor () -> ApplicationRuntimeControlSnapshot,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
     ) -> Bool {
         guard !isShutDown, viewModel != nil else { return false }
@@ -673,13 +678,13 @@ private extension EryloModule {
 @MainActor
 private final class NativeApplicationControlPresenter: NSObject, ApplicationControlPresenting {
     private var statusItem: NSStatusItem?
-    private var commandHandler: (@MainActor (ApplicationControlCommand) -> Void)?
+    private var commandHandler: (@MainActor (ApplicationControlCommand) -> Bool)?
     private var settingsWindowController: NativeSettingsWindowController?
     private var descriptorProvider: (@MainActor () -> ApplicationMenuDescriptor)?
 
     func installStatusMenu(
         descriptorProvider: @escaping @MainActor () -> ApplicationMenuDescriptor,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool
     ) {
         guard statusItem == nil else { return }
         self.commandHandler = commandHandler
@@ -687,7 +692,10 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
 
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
-            button.title = "Erylo"
+            let mark = Self.makeStatusItemMark()
+            button.image = mark
+            button.imagePosition = .imageOnly
+            button.title = ""
             button.toolTip = ApplicationControlCopy.statusItemHint
             button.setAccessibilityLabel(ApplicationControlCopy.statusItemLabel)
             button.setAccessibilityHelp(ApplicationControlCopy.statusItemHint)
@@ -704,7 +712,14 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
 
     private func rebuild(_ menu: NSMenu, with descriptor: ApplicationMenuDescriptor) {
         menu.removeAllItems()
-        for descriptor in descriptor.items {
+        append(descriptor.items, to: menu)
+    }
+
+    private func append(
+        _ descriptors: [ApplicationMenuItemDescriptor],
+        to menu: NSMenu
+    ) {
+        for descriptor in descriptors {
             switch descriptor.kind {
             case .separator:
                 menu.addItem(.separator())
@@ -718,26 +733,40 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
                 menuItem.representedObject = NSNumber(value: command.rawValue)
                 menuItem.isEnabled = descriptor.isEnabled
                 menuItem.keyEquivalentModifierMask = descriptor.keyEquivalent.isEmpty ? [] : [.command]
-                menuItem.setAccessibilityLabel(descriptor.accessibilityLabel ?? descriptor.title)
-                if let accessibilityHint = descriptor.accessibilityHint {
-                    menuItem.setAccessibilityHelp(accessibilityHint)
-                }
-                if let accessibilityIdentifier = descriptor.accessibilityIdentifier {
-                    menuItem.setAccessibilityIdentifier(accessibilityIdentifier)
-                }
+                configureAccessibility(for: menuItem, from: descriptor)
                 menu.addItem(menuItem)
             case .information:
                 let menuItem = NSMenuItem(title: descriptor.title, action: nil, keyEquivalent: "")
                 menuItem.isEnabled = descriptor.isEnabled
-                menuItem.setAccessibilityLabel(descriptor.accessibilityLabel ?? descriptor.title)
-                if let accessibilityHint = descriptor.accessibilityHint {
-                    menuItem.setAccessibilityHelp(accessibilityHint)
-                }
-                if let accessibilityIdentifier = descriptor.accessibilityIdentifier {
-                    menuItem.setAccessibilityIdentifier(accessibilityIdentifier)
-                }
+                configureAccessibility(for: menuItem, from: descriptor)
+                menu.addItem(menuItem)
+            case .submenu:
+                let menuItem = NSMenuItem(
+                    title: descriptor.title,
+                    action: nil,
+                    keyEquivalent: ""
+                )
+                menuItem.isEnabled = descriptor.isEnabled
+                configureAccessibility(for: menuItem, from: descriptor)
+                let submenu = NSMenu(title: descriptor.title)
+                submenu.autoenablesItems = false
+                append(descriptor.children, to: submenu)
+                menuItem.submenu = submenu
                 menu.addItem(menuItem)
             }
+        }
+    }
+
+    private func configureAccessibility(
+        for menuItem: NSMenuItem,
+        from descriptor: ApplicationMenuItemDescriptor
+    ) {
+        menuItem.setAccessibilityLabel(descriptor.accessibilityLabel ?? descriptor.title)
+        if let accessibilityHint = descriptor.accessibilityHint {
+            menuItem.setAccessibilityHelp(accessibilityHint)
+        }
+        if let accessibilityIdentifier = descriptor.accessibilityIdentifier {
+            menuItem.setAccessibilityIdentifier(accessibilityIdentifier)
         }
     }
 
@@ -746,7 +775,12 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
         if let settingsWindowController {
             controller = settingsWindowController
         } else {
-            controller = NativeSettingsWindowController(model: model)
+            controller = NativeSettingsWindowController(
+                model: model,
+                onStartFocusTimer: { [weak self] in
+                    self?.commandHandler?(.startFocusTimer25) == true
+                }
+            )
             settingsWindowController = controller
         }
         controller.present()
@@ -770,7 +804,29 @@ private final class NativeApplicationControlPresenter: NSObject, ApplicationCont
               let command = ApplicationControlCommand(rawValue: value) else {
             return
         }
-        commandHandler?(command)
+        _ = commandHandler?(command)
+    }
+
+    private static func makeStatusItemMark() -> NSImage {
+        let image = NSImage(
+            size: NSSize(width: 18, height: 18),
+            flipped: true
+        ) { bounds in
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            context.setStrokeColor(NSColor.black.cgColor)
+            context.setLineWidth(1.65)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+            context.addPath(
+                EryloSignalMarkGeometry.path(
+                    in: bounds.insetBy(dx: 1, dy: 4)
+                ).cgPath
+            )
+            context.strokePath()
+            return true
+        }
+        image.isTemplate = true
+        return image
     }
 }
 
@@ -785,19 +841,30 @@ extension NativeApplicationControlPresenter: NSMenuDelegate {
 private final class NativeSettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
 
-    init(model: TrustSettingsViewModel) {
-        let hostingController = NSHostingController(rootView: TrustSettingsView(model: model))
+    init(
+        model: TrustSettingsViewModel,
+        onStartFocusTimer: @escaping @MainActor () -> Bool
+    ) {
+        let hostingController = NSHostingController(
+            rootView: TrustSettingsView(
+                model: model,
+                onStartFocusTimer: onStartFocusTimer
+            )
+        )
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 760, height: 720),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            contentRect: NSRect(x: 0, y: 0, width: 680, height: 620),
+            styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.title = "Erylo Settings"
         window.contentViewController = hostingController
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 620, height: 500)
-        window.center()
+        window.minSize = NSSize(width: 600, height: 500)
+        if !window.setFrameUsingName("EryloSettingsWindow") {
+            window.center()
+        }
+        _ = window.setFrameAutosaveName("EryloSettingsWindow")
         self.window = window
         super.init()
         window.delegate = self

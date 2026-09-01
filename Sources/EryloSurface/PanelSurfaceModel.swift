@@ -1,4 +1,5 @@
 import CoreGraphics
+import EryloActivity
 import EryloCore
 import Foundation
 import Observation
@@ -35,6 +36,9 @@ public final class PanelSurfaceModel {
     public private(set) var stateMachine: PanelStateMachine
     public private(set) var displayGeometry: DisplayGeometry
     public private(set) var interactionHitRegion: HitRegion
+    /// Newly revealed controls stay visually reserved but inert until AppKit's
+    /// exact hit region has caught up with the completed surface morph.
+    public private(set) var isHitRegionSettled = true
     public let metrics: PanelMetrics
     public let activityModel: SurfaceActivityModel
 
@@ -70,6 +74,12 @@ public final class PanelSurfaceModel {
     private var hoverRequiresExit = false
 
     @ObservationIgnored
+    private var targetHitRegion: HitRegion
+
+    @ObservationIgnored
+    private var lastObservedActivity: ObservedActivityKey?
+
+    @ObservationIgnored
     private var reduceMotion = false
 
     @ObservationIgnored
@@ -85,8 +95,13 @@ public final class PanelSurfaceModel {
             state: state,
             metrics: metrics,
             showsFocusTimerLauncher: showsFocusTimerLauncher,
-            minimumNotchWingWidth: minimumNotchWingWidth
+            minimumNotchWingWidth: minimumNotchWingWidth,
+            minimumNotchBodyHeight: minimumNotchBodyHeight
         )
+    }
+
+    package var geometryAnimationKey: PanelSurfaceGeometryAnimationKey {
+        PanelSurfaceGeometryAnimationKey(layout: layout)
     }
 
     public var showsFocusTimerLauncher: Bool {
@@ -107,6 +122,13 @@ public final class PanelSurfaceModel {
         case .standard, .completionAcknowledgement, .volumeLevelChanged, .none:
             0
         }
+    }
+
+    /// Completion is deliberately promoted to Peek. On a notched display its
+    /// acknowledgement row must remain fully below the camera housing so the
+    /// Done control is never clipped by the physical occlusion.
+    private var minimumNotchBodyHeight: CGFloat {
+        state == .peek && isCompletionAcknowledgement ? 40 : 0
     }
 
     package var isTemporalProjectionActive: Bool {
@@ -131,6 +153,19 @@ public final class PanelSurfaceModel {
 
     public var motionStyle: PanelMotionStyle {
         reduceMotion ? .reduced : .standard
+    }
+
+    package var accessibilitySurfaceAction: PanelAccessibilitySurfaceAction? {
+        switch content.interactionRole {
+        case .expand:
+            .expand
+        case .collapse:
+            .collapse
+        case .dismiss:
+            .dismiss
+        case .none:
+            nil
+        }
     }
 
     /// Preserves the original technical-spike construction API with a fully inert activity model.
@@ -165,20 +200,23 @@ public final class PanelSurfaceModel {
         self.timing = timing
         self.activityModel = activityModel
         ownedResources = PanelSurfaceOwnedResources(activityModel: activityModel)
-        let resolvedInitialState: PanelPresentationState =
-            initialState == .expanded && activityModel.current == nil
-                ? .compact
-                : initialState
+        let resolvedInitialState = Self.normalizedInitialState(
+            initialState,
+            current: activityModel.current,
+            action: activityModel.currentAction,
+            queue: activityModel.queueContext
+        )
         var initialStateMachine = PanelStateMachine(initialState: resolvedInitialState)
         if resolvedInitialState == .hidden, activityModel.current != nil {
             initialStateMachine.updateActivityAvailability(true)
         }
         stateMachine = initialStateMachine
-        interactionHitRegion = PanelLayout(
-            display: displayGeometry,
-            state: initialStateMachine.state,
-            metrics: metrics
-        ).hitRegion
+        interactionHitRegion = .empty
+        targetHitRegion = .empty
+        lastObservedActivity = Self.observedActivityKey(activityModel.current)
+        let initialLayout = layout
+        interactionHitRegion = initialLayout.hitRegion
+        targetHitRegion = initialLayout.hitRegion
         ownedResources.activityObserverID = activityModel.addObserver { [weak self] in
             self?.activityDidChange()
         }
@@ -198,6 +236,12 @@ public final class PanelSurfaceModel {
         if event == .hoverBegan, hoverRequiresExit {
             return
         }
+        if event == .primaryAction,
+           content.interactionRole == .dismiss {
+            dispatchCompletionDismissAction()
+            return
+        }
+        guard admits(event) else { return }
         let oldState = state
         if event == .primaryAction,
            activityModel.current == nil,
@@ -208,10 +252,9 @@ public final class PanelSurfaceModel {
         }
         guard state != oldState else { return }
         if isExplicitContraction(event, from: oldState, to: state) {
-            hoverRequiresExit = true
+            hoverRequiresExit = isPointerInside
         }
-        beginHitRegionTransition(to: layout.hitRegion)
-        didChange?()
+        publishStateLayoutChange()
     }
 
     public func setPointerInside(_ isInside: Bool) {
@@ -225,6 +268,9 @@ public final class PanelSurfaceModel {
         let event: PanelEvent
         let delay: Duration
         switch (state, isInside) {
+        case (.compact, true) where !hoverRequiresExit && allowsHoverPeek:
+            event = .hoverBegan
+            delay = timing.hoverEntryDelay
         case (.peek, false):
             event = .hoverEnded
             delay = timing.hoverExitDelay
@@ -232,21 +278,88 @@ public final class PanelSurfaceModel {
             return
         }
 
+        scheduleHoverTransition(event, pointerInside: isInside, after: delay)
+    }
+
+    private func scheduleHoverTransition(
+        _ event: PanelEvent,
+        pointerInside: Bool,
+        after delay: Duration
+    ) {
         pendingHoverOperation = scheduler.schedule(after: delay) { [weak self] in
             guard let self else { return }
             self.pendingHoverOperation = nil
-            guard self.isPointerInside == isInside else { return }
+            guard self.isPointerInside == pointerInside else { return }
             self.transition(event)
         }
     }
 
     public func updateReduceMotion(_ reduceMotion: Bool) {
+        guard self.reduceMotion != reduceMotion else { return }
         self.reduceMotion = reduceMotion
+        guard reduceMotion, pendingMotionOperation != nil else { return }
+        pendingMotionOperation?.cancel()
+        pendingMotionOperation = nil
+        let exactRegion = layout.hitRegion
+        targetHitRegion = exactRegion
+        interactionHitRegion = exactRegion
+        isHitRegionSettled = true
+        didChange?()
+    }
+
+    package func performAccessibilitySurfaceAction() {
+        switch accessibilitySurfaceAction {
+        case .expand:
+            send(.primaryAction)
+        case .collapse:
+            send(.dismiss)
+        case .dismiss:
+            dispatchCompletionDismissAction()
+        case nil:
+            break
+        }
     }
 
     package func setWindowPresented(_ isPresented: Bool) {
         guard isWindowPresented != isPresented else { return }
         isWindowPresented = isPresented
+    }
+
+    /// Physical retirement is a presentation boundary. Preserve valid activity
+    /// content, but discard transient or deliberate expansion so wake, a Space
+    /// change, or a later policy reconciliation can only restore Compact.
+    package func prepareForWindowOrderOut() {
+        cancelPendingHover()
+        pendingMotionOperation?.cancel()
+        pendingMotionOperation = nil
+        isPointerInside = false
+        hoverRequiresExit = false
+
+        let oldState = state
+        let oldInteractionHitRegion = interactionHitRegion
+        let wasHitRegionSettled = isHitRegionSettled
+        if activityModel.current == nil {
+            stateMachine.send(.hide)
+        } else {
+            switch state {
+            case .peek:
+                stateMachine.send(.hoverEnded)
+            case .expanded, .dropTarget:
+                stateMachine.send(.dismiss)
+            case .hidden, .compact:
+                break
+            }
+        }
+
+        let contractedRegion = layout.hitRegion
+        targetHitRegion = contractedRegion
+        interactionHitRegion = contractedRegion
+        isHitRegionSettled = true
+        if state != oldState
+            || interactionHitRegion != oldInteractionHitRegion
+            || !wasHitRegionSettled {
+            didChange?()
+        }
     }
 
     package func setFocusTimerStartHandler(
@@ -257,8 +370,7 @@ public final class PanelSurfaceModel {
             return
         }
         focusTimerStartHandler = handler
-        beginHitRegionTransition(to: layout.hitRegion)
-        didChange?()
+        synchronizeSameStateLayoutIfNeeded()
     }
 
     @discardableResult
@@ -286,18 +398,22 @@ public final class PanelSurfaceModel {
         pendingMotionOperation?.cancel()
         pendingMotionOperation = nil
         isPointerInside = false
+        hoverRequiresExit = false
         let targetRegion = layout.hitRegion
-        guard interactionHitRegion != targetRegion else { return }
+        targetHitRegion = targetRegion
+        let needsChange = interactionHitRegion != targetRegion || !isHitRegionSettled
+        guard needsChange else { return }
         interactionHitRegion = targetRegion
+        isHitRegionSettled = true
         didChange?()
     }
 
     private func transition(_ event: PanelEvent) {
+        guard admits(event) else { return }
         let oldState = state
         stateMachine.send(event)
         if state != oldState {
-            beginHitRegionTransition(to: layout.hitRegion)
-            didChange?()
+            publishStateLayoutChange()
         }
     }
 
@@ -320,15 +436,40 @@ public final class PanelSurfaceModel {
 
     private func beginHitRegionTransition(to targetRegion: HitRegion) {
         pendingMotionOperation?.cancel()
+        self.targetHitRegion = targetRegion
         interactionHitRegion = interactionHitRegion.intersecting(targetRegion)
 
-        let duration = reduceMotion ? timing.reducedMotionDuration : timing.motionDuration
-        pendingMotionOperation = scheduler.schedule(after: duration) { [weak self] in
+        if reduceMotion || interactionHitRegion == targetRegion {
+            interactionHitRegion = targetRegion
+            isHitRegionSettled = true
+            pendingMotionOperation = nil
+            return
+        }
+
+        isHitRegionSettled = false
+        pendingMotionOperation = scheduler.schedule(after: timing.motionDuration) { [weak self] in
             guard let self else { return }
             self.pendingMotionOperation = nil
             self.interactionHitRegion = self.layout.hitRegion
+            self.isHitRegionSettled = true
             self.didChange?()
         }
+    }
+
+    private func publishStateLayoutChange() {
+        let currentLayout = layout
+        beginHitRegionTransition(to: currentLayout.hitRegion)
+        didChange?()
+    }
+
+    /// Activity content and launcher availability can change geometry without a
+    /// presentation-state transition. Shrinking adopts the exact smaller hit region
+    /// immediately; growth remains conservative until the visual morph settles.
+    private func synchronizeSameStateLayoutIfNeeded() {
+        let currentLayout = layout
+        guard currentLayout.hitRegion != targetHitRegion else { return }
+        beginHitRegionTransition(to: currentLayout.hitRegion)
+        didChange?()
     }
 
     private func cancelPendingHover() {
@@ -337,28 +478,66 @@ public final class PanelSurfaceModel {
     }
 
     private func activityDidChange() {
-        updateActivityAvailability(activityModel.current != nil)
-        guard state == .compact,
-              activityModel.current?.activity.presentation.presentationRole
-                == .completionAcknowledgement else {
-            return
-        }
+        let hadPendingHover = pendingHoverOperation != nil
+        let shouldRestoreHoverEntry = hadPendingHover
+            && state == .compact
+            && isPointerInside
+        let shouldRestoreHoverExit = hadPendingHover
+            && state == .peek
+            && !isPointerInside
         cancelPendingHover()
-        stateMachine.send(.hoverBegan)
-        beginHitRegionTransition(to: layout.hitRegion)
-        didChange?()
-    }
-
-    private func updateActivityAvailability(_ hasActivity: Bool) {
-        cancelPendingHover()
+        let previousActivity = lastObservedActivity
+        let nextActivity = Self.observedActivityKey(activityModel.current)
+        lastObservedActivity = nextActivity
+        let hasActivity = activityModel.current != nil
         let oldState = state
         stateMachine.updateActivityAvailability(hasActivity)
+
+        if oldState == .expanded, previousActivity != nextActivity {
+            stateMachine.send(hasActivity ? .dismiss : .hide)
+        } else if state == .expanded, !allowsExpandedPresentation {
+            stateMachine.send(.dismiss)
+        }
+
+        if state == .peek,
+           !isCompletionAcknowledgement,
+           !allowsHoverPeek {
+            stateMachine.send(.hoverEnded)
+        }
+        if state == .compact,
+           isCompletionAcknowledgement {
+            stateMachine.send(.hoverBegan)
+        }
         if state != oldState {
-            if !hasActivity {
-                hoverRequiresExit = true
+            if oldState == .expanded, state != .expanded {
+                hoverRequiresExit = isPointerInside
+            } else if !hasActivity {
+                hoverRequiresExit = isPointerInside
             }
-            beginHitRegionTransition(to: layout.hitRegion)
-            didChange?()
+            publishStateLayoutChange()
+        } else {
+            synchronizeSameStateLayoutIfNeeded()
+        }
+
+        if shouldRestoreHoverEntry,
+           state == .compact,
+           isPointerInside,
+           !hoverRequiresExit,
+           allowsHoverPeek {
+            scheduleHoverTransition(
+                .hoverBegan,
+                pointerInside: true,
+                after: timing.hoverEntryDelay
+            )
+        } else if shouldRestoreHoverExit,
+                  state == .peek,
+                  !isPointerInside,
+                  allowsHoverPeek {
+            scheduleHoverTransition(
+                .hoverEnded,
+                pointerInside: false,
+                after: timing.hoverExitDelay
+            )
         }
     }
 
@@ -367,14 +546,131 @@ public final class PanelSurfaceModel {
         self.displayGeometry = displayGeometry
         pendingMotionOperation?.cancel()
         pendingMotionOperation = nil
-        interactionHitRegion = layout.hitRegion
+        let currentLayout = layout
+        interactionHitRegion = currentLayout.hitRegion
+        targetHitRegion = currentLayout.hitRegion
+        isHitRegionSettled = true
         didChange?()
+    }
+
+    private var currentSurfaceItem: ActivitySurfaceItem? {
+        activityModel.current.map(ActivitySurfaceItem.init)
+    }
+
+    private var isCompletionAcknowledgement: Bool {
+        currentSurfaceItem?.composition == .timerCompletion
+    }
+
+    private var allowsHoverPeek: Bool {
+        currentSurfaceItem?.hasUsefulPeekDetail == true
+    }
+
+    private var allowsExpandedPresentation: Bool {
+        guard let currentSurfaceItem else { return false }
+        return currentSurfaceItem.supportsExpandedPresentation(
+            action: activityModel.currentAction,
+            queue: activityModel.queueContext
+        )
+    }
+
+    private func admits(_ event: PanelEvent) -> Bool {
+        switch (state, event) {
+        case (.compact, .hoverBegan):
+            allowsHoverPeek
+        case (.compact, .primaryAction), (.peek, .primaryAction):
+            activityModel.current == nil || allowsExpandedPresentation
+        default:
+            true
+        }
+    }
+
+    private func dispatchCompletionDismissAction() {
+        guard isCompletionAcknowledgement,
+              let action = activityModel.currentAction,
+              action.intent == .dismiss else {
+            return
+        }
+        _ = activityModel.dispatch(action)
+    }
+
+    private static func normalizedInitialState(
+        _ state: PanelPresentationState,
+        current: PresentedActivity?,
+        action: SurfaceActivityAction?,
+        queue: ActivityQueueContext
+    ) -> PanelPresentationState {
+        guard let current else {
+            return (state == .expanded || state == .peek) ? .compact : state
+        }
+        let item = ActivitySurfaceItem(current)
+        switch state {
+        case .peek:
+            return item.composition == .timerCompletion || item.hasUsefulPeekDetail
+                ? .peek
+                : .compact
+        case .expanded:
+            return item.supportsExpandedPresentation(action: action, queue: queue)
+                ? .expanded
+                : .compact
+        case .hidden, .compact, .dropTarget:
+            return state
+        }
+    }
+
+    private static func observedActivityKey(
+        _ current: PresentedActivity?
+    ) -> ObservedActivityKey? {
+        current.map {
+            ObservedActivityKey(identity: $0.activity.identity, revision: $0.revision)
+        }
+    }
+}
+
+private struct ObservedActivityKey: Equatable {
+    let identity: ActivityIdentity
+    let revision: UInt64
+}
+
+package struct PanelSurfaceGeometryAnimationKey: Equatable, Sendable {
+    package let surfaceSize: CGSize
+    package let cornerRadius: CGFloat
+    package let topCornerRadius: CGFloat
+    package let contentTopInset: CGFloat
+    package let attachment: PanelAttachment
+
+    package init(layout: PanelLayout) {
+        surfaceSize = layout.surfaceFrame.size
+        cornerRadius = layout.cornerRadius
+        topCornerRadius = layout.topCornerRadius
+        contentTopInset = layout.surfaceContentTopInset
+        attachment = layout.attachment
     }
 }
 
 public enum PanelMotionStyle: Equatable, Sendable {
     case standard
     case reduced
+
+    package var allowsHoverOpacityAnimation: Bool {
+        self == .standard
+    }
+}
+
+package enum PanelAccessibilitySurfaceAction: Equatable, Sendable {
+    case expand
+    case collapse
+    case dismiss
+
+    package var label: String {
+        switch self {
+        case .expand:
+            SurfaceStrings.expandAction
+        case .collapse:
+            SurfaceStrings.collapseAction
+        case .dismiss:
+            SurfaceStrings.dismissCompletionAction
+        }
+    }
 }
 
 public struct PanelPointerDisposition: Equatable, Sendable {
@@ -406,8 +702,8 @@ public struct PanelInteractionTiming: Equatable, Sendable {
     }
 
     public static let standard = PanelInteractionTiming(
-        hoverEntryDelay: .milliseconds(80),
-        hoverExitDelay: .milliseconds(140),
+        hoverEntryDelay: .milliseconds(120),
+        hoverExitDelay: .milliseconds(300),
         motionDuration: .milliseconds(220),
         reducedMotionDuration: .milliseconds(120)
     )

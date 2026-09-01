@@ -31,6 +31,7 @@ enum SurfaceHarnessMain {
         harness.verifyLegacyCompatibilityDefaultsAreInert()
         harness.verifyStateContentAccessibilityAndPreviews()
         await harness.verifyFocusTimerProjectionAndLauncher()
+        await harness.verifyProductInteractionSemantics()
         await harness.verifyTemporalProjectionPhysicalVisibility()
         harness.verifyReduceMotionAndRapidStateChanges()
         await harness.verifySharedBrokerVisibilityAndDisabledWork()
@@ -142,11 +143,23 @@ private struct SurfaceHarness {
         let broker = ActivityBroker(expirationScheduler: expirationScheduler)
         let activityModel = SurfaceActivityModel(broker: broker)
         let motionScheduler = ManualOneShotScheduler()
+        let displayGeometry = DisplayGeometry(
+            frame: CGRect(x: 0, y: 0, width: 1_512, height: 982),
+            visibleFrame: CGRect(x: 0, y: 0, width: 1_512, height: 950),
+            backingScaleFactor: 2,
+            topEdgeOcclusion: TopEdgeOcclusion(
+                frame: CGRect(x: 663, y: 950, width: 185, height: 32)
+            )
+        )
         let panelModel = PanelSurfaceModel(
-            displayGeometry: makeDisplaySnapshot(identity: 10).geometry,
+            displayGeometry: displayGeometry,
             scheduler: motionScheduler,
             activityModel: activityModel
         )
+        let layoutChanges = CallbackCounter()
+        panelModel.didChange = { [weak layoutChanges] in
+            layoutChanges?.increment()
+        }
 
         check(panelModel.state == .hidden, "startup defaults to an invisible surface")
         activityModel.start()
@@ -192,11 +205,17 @@ private struct SurfaceHarness {
                 await waitUntil { activityModel.snapshotVersion == fallback.version },
                 "fallback activity becomes visible"
             )
+            motionScheduler.runAll()
+            let fallbackHitRegion = panelModel.interactionHitRegion
+            let layoutChangeBaseline = layoutChanges.count
             let urgent = try await broker.submit(
                 request(
                     id: "urgent-expiry",
+                    source: .volume,
+                    kind: .volume,
                     priority: 90,
-                    title: "Urgent",
+                    title: "Studio Display",
+                    presentationRole: .volumeOutputChanged,
                     ttlMilliseconds: 50
                 )
             )
@@ -206,6 +225,22 @@ private struct SurfaceHarness {
                         && activityModel.current?.activity.identity.identifier.rawValue == "urgent-expiry"
                 },
                 "urgent activity preempts compact current"
+            )
+            check(panelModel.state == .compact, "activity handoff retains compact presentation state")
+            check(
+                layoutChanges.count > layoutChangeBaseline,
+                "same-state activity geometry notifies the native layout owner"
+            )
+            let urgentHitRegion = panelModel.layout.hitRegion
+            check(
+                panelModel.interactionHitRegion
+                    == fallbackHitRegion.intersecting(urgentHitRegion),
+                "same-state activity growth keeps input inside visible geometry"
+            )
+            motionScheduler.runAll()
+            check(
+                panelModel.interactionHitRegion == urgentHitRegion,
+                "same-state activity growth settles on its exact hit region"
             )
             check(
                 await waitUntil { await expirationScheduler.pendingCount == 1 },
@@ -219,6 +254,17 @@ private struct SurfaceHarness {
                 "urgent expiry hands off directly to queued fallback"
             )
             check(panelModel.state == .compact, "queue handoff stays visible without a hidden flash")
+            check(
+                panelModel.interactionHitRegion
+                    == urgentHitRegion.intersecting(fallbackHitRegion),
+                "same-state fallback shrink never accepts input outside visible geometry"
+            )
+            motionScheduler.runAll()
+            check(
+                panelModel.interactionHitRegion == panelModel.layout.hitRegion
+                    && panelModel.interactionHitRegion == fallbackHitRegion,
+                "same-state fallback handoff restores the exact compact hit region"
+            )
             check(
                 activityModel.handoff?.from?.identifier.rawValue == "urgent-expiry"
                     && activityModel.handoff?.to?.identifier.rawValue == "fallback",
@@ -1590,7 +1636,8 @@ private struct SurfaceHarness {
             displays: displays,
             events: events,
             registry: registry,
-            model: model
+            model: model,
+            policy: DisplayPolicy(surfaceScope: .allAvailable)
         )
         await coordinator.startAndWait()
         guard await beginGatedAction(
@@ -1843,11 +1890,12 @@ private struct SurfaceHarness {
         displays: FakeDisplayProvider,
         events: FakeLifecycleEventSource,
         registry: SharedModelPanelRegistry,
-        model: SurfaceActivityModel
+        model: SurfaceActivityModel,
+        policy: DisplayPolicy = .safeDefault
     ) -> PanelCoordinator {
         PanelCoordinator(
             displayProvider: displays,
-            policy: .safeDefault,
+            policy: policy,
             lifecycleEventSource: events,
             activityModel: model,
             panelFactory: { snapshot, activityModel in
@@ -1877,8 +1925,9 @@ private struct SurfaceHarness {
         )
 
         let enabledVariant = DisplayPolicy(
-            enabledDisplayIdentities: [display.identity],
-            selectedDisplayIdentity: display.identity
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [display.uuid],
+            preferredDisplayUUID: display.uuid
         )
         await coordinator.updateAndWait(policy: enabledVariant)
         check(events.registrationCount == 1, "enabled policy update preserves its still-owned event registration")
@@ -2345,22 +2394,28 @@ private struct SurfaceHarness {
     }
 
     mutating func verifyStateContentAccessibilityAndPreviews() {
-        let expectedKinds: [(ActivitySurfacePreviewScenario, ActivityKind, String)] = [
-            (ActivitySurfacePreviewCatalog.generic, .generic, SurfaceStrings.genericKind),
-            (ActivitySurfacePreviewCatalog.battery, .battery, SurfaceStrings.batteryKind),
-            (ActivitySurfacePreviewCatalog.charging, .charging, SurfaceStrings.chargingKind),
-            (ActivitySurfacePreviewCatalog.timer, .timer, SurfaceStrings.timerKind),
-            (ActivitySurfacePreviewCatalog.timerCompact, .timer, SurfaceStrings.timerKind),
-            (ActivitySurfacePreviewCatalog.timerCompletion, .timer, SurfaceStrings.timerKind),
-            (ActivitySurfacePreviewCatalog.meeting, .meeting, SurfaceStrings.meetingKind),
-            (ActivitySurfacePreviewCatalog.volume, .volume, SurfaceStrings.volumeKind),
-            (ActivitySurfacePreviewCatalog.volumeMuted, .volume, SurfaceStrings.volumeKind),
-            (ActivitySurfacePreviewCatalog.volumeOutput, .volume, SurfaceStrings.volumeKind),
-            (ActivitySurfacePreviewCatalog.media, .media, SurfaceStrings.mediaKind),
-            (ActivitySurfacePreviewCatalog.file, .file, SurfaceStrings.fileKind),
+        let expectedKinds: [(
+            ActivitySurfacePreviewScenario,
+            ActivityKind,
+            String,
+            ActivitySurfaceComposition,
+            String?
+        )] = [
+            (ActivitySurfacePreviewCatalog.generic, .generic, SurfaceStrings.genericKind, .standard, nil),
+            (ActivitySurfacePreviewCatalog.battery, .battery, SurfaceStrings.batteryKind, .battery, SurfaceStrings.shortProgressValue(62)),
+            (ActivitySurfacePreviewCatalog.charging, .charging, SurfaceStrings.chargingKind, .charging, SurfaceStrings.shortProgressValue(48)),
+            (ActivitySurfacePreviewCatalog.timer, .timer, SurfaceStrings.timerKind, .timerCountdown, "12:40"),
+            (ActivitySurfacePreviewCatalog.timerCompact, .timer, SurfaceStrings.timerKind, .timerCountdown, "12:40"),
+            (ActivitySurfacePreviewCatalog.timerCompletion, .timer, SurfaceStrings.timerKind, .timerCompletion, "Focus complete"),
+            (ActivitySurfacePreviewCatalog.meeting, .meeting, SurfaceStrings.meetingKind, .standard, nil),
+            (ActivitySurfacePreviewCatalog.volume, .volume, SurfaceStrings.volumeKind, .volumeLevel, SurfaceStrings.shortProgressValue(72)),
+            (ActivitySurfacePreviewCatalog.volumeMuted, .volume, SurfaceStrings.volumeKind, .volumeMuted, SurfaceStrings.volumeMuted),
+            (ActivitySurfacePreviewCatalog.volumeOutput, .volume, SurfaceStrings.volumeKind, .volumeOutput, "Studio Display"),
+            (ActivitySurfacePreviewCatalog.media, .media, SurfaceStrings.mediaKind, .standard, SurfaceStrings.shortProgressValue(41)),
+            (ActivitySurfacePreviewCatalog.file, .file, SurfaceStrings.fileKind, .standard, nil),
         ]
 
-        for (scenario, expectedKind, expectedLabel) in expectedKinds {
+        for (scenario, expectedKind, expectedLabel, expectedComposition, expectedPrincipal) in expectedKinds {
             do {
                 let snapshot = try scenario.snapshot()
                 guard let current = snapshot.current else {
@@ -2370,6 +2425,14 @@ private struct SurfaceHarness {
                 let item = ActivitySurfaceItem(current)
                 check(item.kind == expectedKind, "\(scenario.name) maps the bounded activity kind")
                 check(item.kindLabel == expectedLabel, "\(scenario.name) exposes stable kind copy")
+                check(
+                    item.composition == expectedComposition,
+                    "\(scenario.name) selects its deterministic activity-specific composition"
+                )
+                check(
+                    item.signalPrincipalValue == expectedPrincipal,
+                    "\(scenario.name) selects its deterministic principal signal value"
+                )
                 check(item.title == current.activity.presentation.title, "\(scenario.name) preserves broker title honestly")
                 check(!item.symbolName.isEmpty, "\(scenario.name) includes a non-color status symbol")
                 check(snapshot.queued.count <= ActivityQueueContext.maximumVisibleItems, "\(scenario.name) preview queue remains bounded")
@@ -2403,7 +2466,8 @@ private struct SurfaceHarness {
             check(
                 muted.title == SurfaceStrings.volumeMuted
                     && muted.progressFraction == nil
-                    && muted.shortProgressValue == nil,
+                    && muted.shortProgressValue == nil
+                    && !muted.hasSemanticProgress,
                 "muted preview says Muted and never renders zero percent"
             )
             check(
@@ -2417,7 +2481,8 @@ private struct SurfaceHarness {
             check(
                 output.title == "Studio Display"
                     && output.detail == SurfaceStrings.volumeOutputChanged
-                    && output.notchCompactValue == "Studio Display",
+                    && output.notchCompactValue == "Studio Display"
+                    && !output.hasSemanticProgress,
                 "output preview renders the bounded device name in compact and expanded projections"
             )
             check(
@@ -2469,8 +2534,44 @@ private struct SurfaceHarness {
             check(
                 unmuted.title == SurfaceStrings.volumeUnmuted
                     && unmuted.notchCompactValue == SurfaceStrings.volumeUnmuted
-                    && unmuted.progressFraction == 0.64,
+                    && unmuted.progressFraction == 0.64
+                    && unmuted.composition == .volumeUnmuted,
                 "unmute presentation says Sound on while retaining truthful level progress"
+            )
+
+            guard let completionPresented = try ActivitySurfacePreviewCatalog.timerCompletion
+                .snapshot().current else {
+                check(false, "timer completion preview provides current content")
+                return
+            }
+            let completion = ActivitySurfaceItem(completionPresented)
+            check(
+                completion.composition == .timerCompletion
+                    && completion.symbolName == "checkmark.circle.fill"
+                    && completion.accent == .mint
+                    && completion.title == "Focus complete"
+                    && completion.signalPrincipalValue == "Focus complete"
+                    && !completion.hasSemanticProgress,
+                "timer completion has a dedicated success composition and non-color symbol"
+            )
+            let completionModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.timerCompletion,
+                displayGeometry: notchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            let completionLayout = completionModel.layout
+            let completionBodyHeight = completionLayout.surfaceFrame.height
+                - completionLayout.surfaceContentTopInset
+            check(
+                completionLayout.attachment == .notchIntegrated
+                    && completionLayout.surfaceContentTopInset == 44
+                    && completionBodyHeight >= 40,
+                "notched completion Peek reserves a full forty-point body below the camera housing"
+            )
+            check(
+                completionModel.content.action?.label == "Done"
+                    && completionLayout.hitRegion != .empty,
+                "completion render contract keeps its real Done target visible and interactive"
             )
         } catch {
             recordUnexpected(error, context: "semantic Volume surface previews")
@@ -2492,6 +2593,14 @@ private struct SurfaceHarness {
             check(expanded.accessibility.hint == SurfaceStrings.collapseHint, "expanded accessibility hint explains the focus-safe shortcut")
             check(expanded.accessibility.hint.hasPrefix("Activate Erylo"), "expanded accessibility copy names deliberate activation instead of hover")
             check(
+                expanded.accessibilitySurfaceAction == .collapse
+                    && expanded.accessibilitySurfaceAction?.label
+                        == SurfaceStrings.collapseAction,
+                "expanded surface exposes an explicit named accessibility collapse action"
+            )
+            expanded.performAccessibilitySurfaceAction()
+            check(expanded.state == .compact, "accessibility collapse action follows the safe reducer path")
+            check(
                 SurfaceStrings.actionHint(for: .cancel)
                     == SurfaceStrings.cancelTimerActionHint,
                 "timer cancel exposes an accurate VoiceOver hint"
@@ -2508,14 +2617,47 @@ private struct SurfaceHarness {
             )
             check(compact.accessibility.hint == SurfaceStrings.expandHint, "compact accessibility hint explains expansion")
             check(compact.accessibility.hint.hasPrefix("Activate Erylo"), "compact accessibility copy names deliberate activation instead of hover")
+            check(
+                compact.accessibilitySurfaceAction == .expand
+                    && compact.accessibilitySurfaceAction?.label == SurfaceStrings.expandAction,
+                "compact activity exposes an explicit named accessibility expand action"
+            )
+            compact.performAccessibilitySurfaceAction()
+            check(compact.state == .expanded, "accessibility expand action follows the safe reducer path")
+
+            let completion = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.timerCompletion,
+                displayGeometry: display,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                completion.content.action?.intent == .dismiss
+                    && completion.content.action?.label == "Done",
+                "completion peek exposes one real Done dismiss action"
+            )
+            check(
+                completion.accessibilitySurfaceAction == .dismiss
+                    && completion.accessibilitySurfaceAction?.label
+                        == SurfaceStrings.dismissCompletionAction
+                    && completion.accessibility.hint
+                        == SurfaceStrings.dismissCompletionHint,
+                "completion VoiceOver action dismisses instead of falsely offering expansion"
+            )
 
             let dropTarget = try ActivitySurfacePreviewCatalog.makeModel(
                 scenario: ActivitySurfacePreviewCatalog.dropTarget,
                 displayGeometry: display,
                 scheduler: ManualOneShotScheduler()
             )
-            check(dropTarget.accessibility.value.contains("no files will be stored"), "drop-target accessibility copy never claims storage")
-            check(dropTarget.accessibility.hint == SurfaceStrings.dropTargetHint, "drop target has a distinct VoiceOver hint")
+            check(
+                dropTarget.content.primary == .hidden,
+                "unmounted File Hold exposes no reject-only drop affordance"
+            )
+            check(
+                dropTarget.accessibility.value == SurfaceStrings.hiddenState
+                    && dropTarget.accessibility.hint.isEmpty,
+                "unmounted File Hold exposes no drop instruction to VoiceOver"
+            )
         } catch {
             recordUnexpected(error, context: "preview host")
         }
@@ -2599,9 +2741,12 @@ private struct SurfaceHarness {
             let activity = try Activity(
                 validating: temporalRequest
             )
-            let item = ActivitySurfaceItem(
-                PresentedActivity(activity: activity, submissionSequence: 1, revision: 41)
+            let presented = PresentedActivity(
+                activity: activity,
+                submissionSequence: 1,
+                revision: 41
             )
+            let item = ActivitySurfaceItem(presented)
             guard let projection = item.temporalProjection else {
                 check(false, "timer activity preserves its internal temporal projection")
                 check(false, "timer projection formats MM:SS")
@@ -2616,6 +2761,62 @@ private struct SurfaceHarness {
             check(
                 hourScale.fractionCompleted > 0 && hourScale.fractionCompleted < 1,
                 "timer projection derives progress locally from immutable timestamps"
+            )
+            let compactContent = ActivitySurfaceContent(
+                state: .compact,
+                phase: .active,
+                current: presented,
+                queueContext: .empty,
+                action: nil,
+                actionDispatchState: .idle
+            )
+            let expandedContent = ActivitySurfaceContent(
+                state: .expanded,
+                phase: .active,
+                current: presented,
+                queueContext: .empty,
+                action: nil,
+                actionDispatchState: .idle
+            )
+            let compactAccessibility = PanelSurfaceAccessibility(
+                content: compactContent,
+                temporalSnapshot: nearEnd
+            )
+            let expandedAccessibility = PanelSurfaceAccessibility(
+                content: expandedContent,
+                temporalSnapshot: hourScale
+            )
+            check(
+                compactAccessibility.value == [
+                    SurfaceStrings.compactState,
+                    SurfaceStrings.timerKind,
+                    "Focus Timer",
+                    SurfaceStrings.remainingTime("00:10"),
+                ].joined(separator: ", "),
+                "compact timer VoiceOver value comes from the live timestamp projection exactly once"
+            )
+            check(
+                expandedAccessibility.value == [
+                    SurfaceStrings.expandedState,
+                    SurfaceStrings.timerKind,
+                    "Focus Timer",
+                    SurfaceStrings.remainingTime("1:01:01"),
+                ].joined(separator: ", ")
+                    && !expandedAccessibility.value.contains("62m remaining"),
+                "expanded timer VoiceOver replaces stale request detail with the same live projection"
+            )
+
+            let visualDate = Date(timeIntervalSinceReferenceDate: 75_000)
+            let visualScenario = ActivitySurfacePreviewCatalog.timerVisualQA(
+                at: visualDate,
+                state: .expanded
+            )
+            let visualPresented = try visualScenario.snapshot().current
+            let visualItem = visualPresented.map { ActivitySurfaceItem($0) }
+            check(
+                visualItem?.temporalProjection?.snapshot(at: visualDate).remainingText == "12:40"
+                    && visualItem?.signalPrincipalValue == "12:40",
+                "native timer visual QA exercises temporal projection with a deterministic fallback"
             )
 
             let broker = ActivityBroker()
@@ -2698,6 +2899,304 @@ private struct SurfaceHarness {
             model.accessibility.hint == SurfaceStrings.focusTimerLauncherHint,
             "launcher exposes an accurate VoiceOver choice hint"
         )
+
+        let geometryBroker = ActivityBroker()
+        let geometryActivityModel = SurfaceActivityModel(broker: geometryBroker)
+        let geometryScheduler = ManualOneShotScheduler()
+        let geometryModel = PanelSurfaceModel(
+            displayGeometry: geometry,
+            initialState: .compact,
+            scheduler: geometryScheduler,
+            activityModel: geometryActivityModel
+        )
+        geometryModel.setFocusTimerStartHandler { _ in true }
+        geometryScheduler.runAll()
+        let launcherHitRegion = geometryModel.interactionHitRegion
+        geometryActivityModel.start()
+        check(
+            await waitUntil { geometryActivityModel.phase == .active },
+            "content-driven geometry fixture receives its initial snapshot"
+        )
+        do {
+            _ = try await geometryBroker.submit(temporalRequest)
+            check(
+                await waitUntil { geometryActivityModel.current != nil },
+                "starting a timer replaces the launcher without changing compact state"
+            )
+            let compactTarget = geometryModel.layout.hitRegion
+            check(
+                geometryModel.interactionHitRegion
+                    == launcherHitRegion.intersecting(compactTarget),
+                "same-state launcher shrink immediately constrains the native click region"
+            )
+            geometryScheduler.runAll()
+            check(
+                geometryModel.interactionHitRegion == compactTarget,
+                "same-state launcher shrink settles on the rendered timer geometry"
+            )
+        } catch {
+            recordUnexpected(error, context: "content-driven timer geometry")
+        }
+        await geometryActivityModel.stop()
+    }
+
+    mutating func verifyProductInteractionSemantics() async {
+        let display = makeDisplaySnapshot(identity: 72, isMain: true).geometry
+
+        let launcherScheduler = ManualOneShotScheduler()
+        let launcher = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: launcherScheduler,
+            activityModel: makeEmptyPreviewModel()
+        )
+        let compactGeometryKey = launcher.geometryAnimationKey
+        launcher.setFocusTimerStartHandler { _ in true }
+        let launcherGeometryKey = launcher.geometryAnimationKey
+        launcherScheduler.runAll()
+        launcher.setPointerInside(true)
+        launcherScheduler.runAll()
+        check(
+            launcher.state == .compact && launcher.showsFocusTimerLauncher,
+            "idle Focus Timer launcher survives hover dwell instead of becoming an empty Peek"
+        )
+        check(
+            launcherScheduler.activeOperationCount == 0,
+            "idle launcher hover creates no delayed presentation work"
+        )
+        check(
+            compactGeometryKey != launcherGeometryKey,
+            "same-state launcher geometry produces a distinct animation key"
+        )
+
+        let passiveScenarios = [
+            ActivitySurfacePreviewCatalog.volume,
+            ActivitySurfacePreviewCatalog.volumeMuted,
+            ActivitySurfacePreviewCatalog.volumeOutput,
+            ActivitySurfacePreviewCatalog.battery,
+            ActivitySurfacePreviewCatalog.charging,
+        ]
+        for scenario in passiveScenarios {
+            do {
+                let scheduler = ManualOneShotScheduler()
+                let model = try ActivitySurfacePreviewCatalog.makeModel(
+                    scenario: scenario,
+                    displayGeometry: display,
+                    scheduler: scheduler
+                )
+                model.setPointerInside(true)
+                scheduler.runAll()
+                model.send(.hoverBegan)
+                model.send(.primaryAction)
+                check(
+                    model.state == .compact,
+                    "\(scenario.name) remains a compact passive acknowledgement"
+                )
+                check(
+                    model.accessibilitySurfaceAction == nil
+                        && model.accessibility.hint == SurfaceStrings.passiveStatusHint,
+                    "\(scenario.name) advertises no useless expansion to VoiceOver"
+                )
+            } catch {
+                recordUnexpected(error, context: "passive interaction \(scenario.name)")
+            }
+        }
+
+        do {
+            let scheduler = ManualOneShotScheduler()
+            let activeTimer = ActivitySurfacePreviewScenario(
+                name: "Compact active timer",
+                state: .compact,
+                current: ActivitySurfacePreviewCatalog.timer.current
+            )
+            let model = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: activeTimer,
+                displayGeometry: display,
+                scheduler: scheduler
+            )
+            model.setPointerInside(true)
+            scheduler.runAll()
+            model.send(.hoverBegan)
+            check(
+                model.state == .compact,
+                "Focus Timer suppresses Peek when it would repeat the compact countdown"
+            )
+            model.send(.primaryAction)
+            check(
+                model.state == .expanded,
+                "Focus Timer expands only for its useful Cancel action"
+            )
+            check(
+                !model.isHitRegionSettled
+                    && model.interactionHitRegion != model.layout.hitRegion,
+                "newly revealed timer controls remain gated while the native hit region catches up"
+            )
+            scheduler.runAll()
+            check(
+                model.isHitRegionSettled
+                    && model.interactionHitRegion == model.layout.hitRegion,
+                "timer controls become available only after the exact native hit region settles"
+            )
+            let timerIdentity = model.activityModel.current?.activity.identity
+            model.prepareForWindowOrderOut()
+            check(
+                model.state == .compact
+                    && model.activityModel.current?.activity.identity == timerIdentity
+                    && model.interactionHitRegion == model.layout.hitRegion
+                    && model.isHitRegionSettled
+                    && scheduler.activeOperationCount == 0,
+                "physical order-out preserves the timer but retires Expanded and all transition work"
+            )
+
+            let interruptedScheduler = ManualOneShotScheduler()
+            let interrupted = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: activeTimer,
+                displayGeometry: display,
+                scheduler: interruptedScheduler
+            )
+            interrupted.send(.primaryAction)
+            check(
+                !interrupted.isHitRegionSettled,
+                "an animated expansion advertises its conservative interaction phase"
+            )
+            interrupted.updateReduceMotion(true)
+            check(
+                interrupted.isHitRegionSettled
+                    && interrupted.interactionHitRegion == interrupted.layout.hitRegion
+                    && interruptedScheduler.activeOperationCount == 0,
+                "enabling Reduce Motion settles an in-flight hit-region transition immediately"
+            )
+
+            let titleOnly = ActivitySurfacePreviewScenario(
+                name: "Title-only standard activity",
+                state: .compact,
+                current: request(
+                    id: "title-only-standard",
+                    source: .external,
+                    kind: .generic,
+                    title: "Build succeeded"
+                )
+            )
+            let titleOnlyModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: titleOnly,
+                displayGeometry: display,
+                scheduler: ManualOneShotScheduler()
+            )
+            titleOnlyModel.send(.hoverBegan)
+            titleOnlyModel.send(.primaryAction)
+            check(
+                titleOnlyModel.state == .compact,
+                "standard title-only activity opens neither redundant Peek nor empty Expanded"
+            )
+
+            let detailedScheduler = ManualOneShotScheduler()
+            let detailed = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.generic,
+                displayGeometry: display,
+                scheduler: detailedScheduler
+            )
+            detailed.setPointerInside(true)
+            detailedScheduler.runAll()
+            check(
+                detailed.state == .peek,
+                "standard activity earns Peek only when it adds distinct detail"
+            )
+        } catch {
+            recordUnexpected(error, context: "active interaction policy")
+        }
+
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
+        let scheduler = ManualOneShotScheduler()
+        let panel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .hidden,
+            scheduler: scheduler,
+            activityModel: activityModel
+        )
+        activityModel.start()
+        check(
+            await waitUntil { activityModel.phase == .active },
+            "interaction update fixture receives its initial snapshot"
+        )
+        do {
+            let first = try await broker.submit(
+                request(
+                    id: "hover-update",
+                    source: .external,
+                    kind: .generic,
+                    priority: 70,
+                    title: "First build",
+                    detail: "Ready to inspect"
+                )
+            )
+            check(
+                await waitUntil { activityModel.snapshotVersion == first.version },
+                "interaction update fixture publishes its first activity"
+            )
+            panel.setPointerInside(true)
+            scheduler.runAll()
+            check(panel.state == .peek, "detail activity enters Peek after bounded hover dwell")
+            panel.setPointerInside(false)
+
+            let replacement = try await broker.submit(
+                request(
+                    id: "hover-update",
+                    source: .external,
+                    kind: .generic,
+                    priority: 70,
+                    title: "Second build",
+                    detail: "Still ready to inspect"
+                )
+            )
+            check(
+                await waitUntil { activityModel.snapshotVersion == replacement.version },
+                "activity update lands while hover exit is pending"
+            )
+            check(panel.state == .peek, "activity update preserves the in-flight hover corridor")
+            scheduler.runAll()
+            check(
+                panel.state == .compact,
+                "activity update re-arms hover exit instead of stranding Peek"
+            )
+
+            panel.send(.primaryAction)
+            check(panel.state == .expanded, "detailed activity enters Expanded deliberately")
+            let exactReplacement = try await broker.submit(
+                request(
+                    id: "hover-update",
+                    source: .external,
+                    kind: .generic,
+                    priority: 70,
+                    title: "Third build",
+                    detail: "Replacement revision"
+                )
+            )
+            check(
+                await waitUntil { activityModel.snapshotVersion == exactReplacement.version },
+                "expanded activity replacement reaches the shared model"
+            )
+            check(
+                panel.state == .compact,
+                "exact expanded activity replacement collapses instead of swapping content in place"
+            )
+
+            panel.send(.primaryAction)
+            check(panel.state == .expanded, "replacement can be expanded explicitly")
+            if let replacementIdentity = exactReplacement.current?.activity.identity {
+                _ = await broker.cancel(replacementIdentity)
+            } else {
+                check(false, "replacement snapshot retains its exact activity identity")
+            }
+            check(
+                await waitUntil { activityModel.current == nil && panel.state == .hidden },
+                "expanded activity disappearance hides instead of stranding an empty panel"
+            )
+        } catch {
+            recordUnexpected(error, context: "hover and expanded activity updates")
+        }
+        await activityModel.stop()
+        await broker.shutdown()
     }
 
     mutating func verifyTemporalProjectionPhysicalVisibility() async {
@@ -2749,9 +3248,21 @@ private struct SurfaceHarness {
             }
             let stableVersion = await broker.snapshot().version
 
+            events.emitCurrent(.primaryShortcut)
+            check(panel.state == .expanded, "timer expands deliberately before Space reconciliation")
+            events.emitCurrent(.activeSpaceChanged)
+            check(
+                panel.state == .compact && panel.isTemporalProjectionActive,
+                "active-Space reconciliation contracts Expanded without retiring the timer"
+            )
+            events.emitCurrent(.primaryShortcut)
+            check(panel.state == .expanded, "timer can expand again before workspace sleep")
+
             events.emitCurrent(.workspaceWillSleep)
             check(
-                panel.hideCount == 1 && registry.activeTemporalProjectionCount == 0,
+                panel.hideCount == 1
+                    && panel.state == .compact
+                    && registry.activeTemporalProjectionCount == 0,
                 "workspace sleep orders out the panel and retires all timeline projection work"
             )
             check(
@@ -2814,8 +3325,16 @@ private struct SurfaceHarness {
             activityModel: makeEmptyPreviewModel()
         )
         check(model.motionStyle == .standard, "surface defaults to interruption-safe standard motion")
+        check(
+            model.motionStyle.allowsHoverOpacityAnimation,
+            "standard motion permits the subtle hover opacity response"
+        )
         model.updateReduceMotion(true)
         check(model.motionStyle == .reduced, "system Reduce Motion selects reduced motion content")
+        check(
+            !model.motionStyle.allowsHoverOpacityAnimation,
+            "Reduce Motion suppresses hover opacity animation"
+        )
         model.send(.primaryAction)
         check(scheduler.lastScheduledDelay == .milliseconds(120), "Reduce Motion chooses the tested crossfade/scale duration")
 
@@ -2856,7 +3375,7 @@ private struct SurfaceHarness {
         check(await broker.workState().subscriberCount == 0, "disabled coordinator starts no broker subscriber task")
         check(registry.creationCount == 0, "disabled coordinator constructs no hidden panels")
 
-        await coordinator.updateAndWait(policy: .safeDefault)
+        await coordinator.updateAndWait(policy: DisplayPolicy(surfaceScope: .allAvailable))
         check(
             await waitUntil { await broker.workState().subscriberCount == 1 },
             "re-enabled coordinator starts the shared model's one subscriber"
@@ -2909,6 +3428,7 @@ private struct SurfaceHarness {
         actionIdentifier: String? = nil,
         actionLabel: String? = nil,
         actionIntent: ActivityActionIntent? = nil,
+        presentationRole: ActivityPresentationRole = .standard,
         ttlMilliseconds: Int? = nil
     ) -> ActivityRequest {
         ActivityRequest(
@@ -2922,7 +3442,9 @@ private struct SurfaceHarness {
             actionIdentifier: actionIdentifier,
             actionLabel: actionLabel,
             actionIntent: actionIntent?.rawValue,
-            ttlMilliseconds: ttlMilliseconds
+            ttlMilliseconds: ttlMilliseconds,
+            temporalProgress: nil,
+            presentationRole: presentationRole
         )
     }
 
@@ -3303,6 +3825,15 @@ private final class ManualScheduledOperation: ScheduledOperation {
 }
 
 @MainActor
+private final class CallbackCounter {
+    private(set) var count = 0
+
+    func increment() {
+        count += 1
+    }
+}
+
+@MainActor
 private final class ManualOneShotScheduler: OneShotScheduling {
     private struct Entry {
         let delay: Duration
@@ -3506,6 +4037,10 @@ private final class FakePanel: PanelPresenting {
         surfaceModel.isTemporalProjectionActive
     }
 
+    var state: PanelPresentationState {
+        surfaceModel.state
+    }
+
     init(displayIdentity: DisplayIdentity, surfaceModel: PanelSurfaceModel) {
         self.displayIdentity = displayIdentity
         self.surfaceModel = surfaceModel
@@ -3520,12 +4055,14 @@ private final class FakePanel: PanelPresenting {
     func hide() {
         hideCount += 1
         surfaceModel.setWindowPresented(false)
+        surfaceModel.prepareForWindowOrderOut()
     }
 
     func close() {
         closeCount += 1
         isClosed = true
         surfaceModel.setWindowPresented(false)
+        surfaceModel.prepareForWindowOrderOut()
     }
 
     func update(snapshot: DisplaySnapshot) {
@@ -3550,6 +4087,10 @@ private final class FakePanel: PanelPresenting {
         return item.temporalProjection?.snapshot(at: date)
     }
     func cancelPendingInteractions() {}
+
+    func contractForEnvironmentalTransition() {
+        surfaceModel.prepareForWindowOrderOut()
+    }
 }
 
 @MainActor
@@ -3567,6 +4108,8 @@ private func makeDisplaySnapshot(
     let frame = CGRect(x: originX, y: 0, width: 1_440, height: 900)
     return DisplaySnapshot(
         identity: DisplayIdentity(rawValue: identity),
+        uuid: makeDisplayUUID(identity),
+        localizedName: isMain ? "Built-in Display" : "External Display",
         geometry: DisplayGeometry(
             frame: frame,
             visibleFrame: CGRect(x: originX, y: 0, width: 1_440, height: 875),
@@ -3575,6 +4118,11 @@ private func makeDisplaySnapshot(
         ),
         isMain: isMain
     )
+}
+
+private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
+    let uuid = String(format: "00000000-0000-0000-0000-%012llx", UInt64(value))
+    return DisplayUUID(rawValue: uuid)!
 }
 
 @MainActor
@@ -3598,58 +4146,93 @@ private func writeNativeVisualQA(to directory: URL) throws {
         backingScaleFactor: 2,
         topEdgeOcclusion: nil
     )
-    let visualNow = Date()
-    let temporalRequest = ActivityRequest(
-        identifier: "preview.visual.timer",
-        source: ActivitySource.timer.rawValue,
-        kind: ActivityKind.timer.rawValue,
-        priority: 60,
-        title: "Focus Timer",
-        detail: "13m remaining",
-        progress: 0.36,
-        actionIdentifier: "timer.cancel",
-        actionLabel: "Cancel timer",
-        actionIntent: ActivityActionIntent.cancel.rawValue,
-        temporalProgress: ActivityTemporalProgress(
-            startedAt: visualNow.addingTimeInterval(-456),
-            endsAt: visualNow.addingTimeInterval(760)
-        )
-    )
-    let temporalCompact = ActivitySurfacePreviewScenario(
-        name: "Timer compact visual QA",
-        state: .compact,
-        current: temporalRequest
-    )
-    let temporalExpanded = ActivitySurfacePreviewScenario(
-        name: "Timer expanded visual QA",
-        state: .expanded,
-        current: temporalRequest
-    )
     let compactOutput = ActivitySurfacePreviewScenario(
         name: "Volume output compact visual QA",
         state: .compact,
         current: ActivitySurfacePreviewCatalog.volumeOutput.current
     )
-    let scenarios: [(String, ActivitySurfacePreviewScenario, DisplayGeometry)] = [
-        ("erylo-timer-launcher.png", ActivitySurfacePreviewCatalog.focusTimerLauncher, notchedGeometry),
-        ("erylo-timer-compact.png", temporalCompact, notchedGeometry),
-        ("erylo-timer-expanded.png", temporalExpanded, notchedGeometry),
-        ("erylo-timer-completion.png", ActivitySurfacePreviewCatalog.timerCompletion, notchedGeometry),
-        ("erylo-volume-muted-notched.png", ActivitySurfacePreviewCatalog.volumeMuted, notchedGeometry),
-        ("erylo-volume-output-notched.png", ActivitySurfacePreviewCatalog.volumeOutput, notchedGeometry),
-        ("erylo-volume-muted-notchless.png", ActivitySurfacePreviewCatalog.volumeMuted, notchlessGeometry),
-        ("erylo-volume-output-notchless.png", compactOutput, notchlessGeometry),
+    let scenarios: [NativeVisualQAFixture] = [
+        NativeVisualQAFixture(
+            filename: "erylo-timer-launcher.png",
+            scenario: { ActivitySurfacePreviewCatalog.focusTimerLauncher },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-timer-compact.png",
+            scenario: {
+                ActivitySurfacePreviewCatalog.timerVisualQA(at: Date(), state: .compact)
+            },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-timer-expanded.png",
+            scenario: {
+                ActivitySurfacePreviewCatalog.timerVisualQA(at: Date(), state: .expanded)
+            },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-timer-completion.png",
+            scenario: { ActivitySurfacePreviewCatalog.timerCompletion },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-volume-muted-notched.png",
+            scenario: { ActivitySurfacePreviewCatalog.volumeMuted },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-volume-output-notched.png",
+            scenario: { ActivitySurfacePreviewCatalog.volumeOutput },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-volume-muted-notchless.png",
+            scenario: { ActivitySurfacePreviewCatalog.volumeMuted },
+            geometry: notchlessGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-volume-output-notchless.png",
+            scenario: { compactOutput },
+            geometry: notchlessGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-timer-expanded-light-desktop.png",
+            scenario: {
+                ActivitySurfacePreviewCatalog.timerVisualQA(at: Date(), state: .expanded)
+            },
+            geometry: notchedGeometry,
+            desktop: .light
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-volume-output-notchless-light.png",
+            scenario: { compactOutput },
+            geometry: notchlessGeometry,
+            desktop: .light
+        ),
     ]
+    guard Set(scenarios.map(\.desktop)) == Set(NativeVisualQADesktop.allCases) else {
+        throw VisualQARenderingError.incompleteDesktopContexts
+    }
 
-    for (filename, scenario, geometry) in scenarios {
+    for fixture in scenarios {
+        let scenario = fixture.scenario()
         let model = try ActivitySurfacePreviewCatalog.makeModel(
             scenario: scenario,
-            displayGeometry: geometry,
+            displayGeometry: fixture.geometry,
             scheduler: ManualOneShotScheduler()
         )
         let renderedSize = PanelMetrics.feasibility.maximumSize
         let rootView = ZStack(alignment: .top) {
-            Color(red: 0.035, green: 0.047, blue: 0.067)
+            fixture.desktop.backdrop
             PanelSurfaceView(model: model)
         }
         .frame(
@@ -3657,7 +4240,7 @@ private func writeNativeVisualQA(to directory: URL) throws {
             height: renderedSize.height,
             alignment: .top
         )
-        .environment(\.colorScheme, .dark)
+        .environment(\.colorScheme, fixture.desktop.colorScheme)
         .transaction { transaction in
             transaction.animation = nil
             transaction.disablesAnimations = true
@@ -3677,17 +4260,49 @@ private func writeNativeVisualQA(to directory: URL) throws {
             bytesPerRow: 0,
             bitsPerPixel: 0
         ) else {
-            throw VisualQARenderingError.encodingFailed(filename)
+            throw VisualQARenderingError.encodingFailed(fixture.filename)
         }
         representation.size = renderedSize
         hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
         guard let png = representation.representation(using: .png, properties: [:]) else {
-            throw VisualQARenderingError.encodingFailed(filename)
+            throw VisualQARenderingError.encodingFailed(fixture.filename)
         }
-        try png.write(to: directory.appendingPathComponent(filename), options: .atomic)
+        try png.write(
+            to: directory.appendingPathComponent(fixture.filename),
+            options: .atomic
+        )
+    }
+}
+
+private struct NativeVisualQAFixture {
+    let filename: String
+    let scenario: @MainActor () -> ActivitySurfacePreviewScenario
+    let geometry: DisplayGeometry
+    let desktop: NativeVisualQADesktop
+}
+
+private enum NativeVisualQADesktop: CaseIterable, Hashable {
+    case light
+    case dark
+
+    var backdrop: Color {
+        switch self {
+        case .light:
+            Color(red: 0.87, green: 0.89, blue: 0.92)
+        case .dark:
+            Color(red: 0.035, green: 0.047, blue: 0.067)
+        }
+    }
+
+    var colorScheme: ColorScheme {
+        switch self {
+        case .light: .light
+        case .dark: .dark
+        }
     }
 }
 
 private enum VisualQARenderingError: Error {
     case encodingFailed(String)
+    case incompleteDesktopContexts
 }

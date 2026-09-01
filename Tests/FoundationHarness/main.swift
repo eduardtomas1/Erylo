@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Darwin
 import EryloActivity
@@ -5,6 +6,7 @@ import EryloCore
 import EryloIntegrations
 import EryloSurface
 import EryloWindowing
+import Foundation
 
 @main
 @MainActor
@@ -14,6 +16,7 @@ enum FoundationHarnessMain {
         harness.verifyPanelStateMachine()
         harness.verifyPanelGeometry()
         harness.verifyDisplayPolicy()
+        harness.verifyExpandedInteractionPolicy()
         harness.verifyHoverHysteresisAndMotionInterruption()
         await harness.verifyCoordinatorLifecycle()
         await harness.verifyDemandDrivenPanelLifecycle()
@@ -112,12 +115,16 @@ private struct FoundationHarness {
         check(expanded.surfaceFrame.size == CGSize(width: 376, height: 164), "expanded geometry stays compact while preserving content breathing room")
         check(dropTarget.surfaceFrame.size == CGSize(width: 404, height: 180), "drop target remains a bounded extension of expanded geometry")
         check(
-            [peek, expanded, dropTarget].allSatisfy {
+            [peek, expanded].allSatisfy {
                 $0.attachment == .notchlessPill
                     && $0.surfaceTopInset == 8
                     && $0.hitRegion.contains($0.surfaceFrame.center)
             },
             "every visible notchless state keeps the inset rounded fallback interactive"
+        )
+        check(
+            dropTarget.hitRegion == .empty,
+            "unmounted File Hold compatibility state cannot intercept input"
         )
 
         let notchedDisplay = DisplayGeometry(
@@ -197,17 +204,33 @@ private struct FoundationHarness {
             mirrored,
         ])
         check(
-            defaultResolution.enabledDisplays.map(\.identity) == [external.identity, main.identity],
-            "safe display policy preserves order while removing mirrors and duplicates"
+            defaultResolution.enabledDisplays.map(\.identity) == [main.identity],
+            "safe display policy enables only the current main display"
         )
         check(
             defaultResolution.selectedDisplayIdentity == main.identity,
             "safe display policy selects the main display"
         )
+        check(!DisplayPolicy.safeDefault.allowsFullscreenAuxiliary, "safe policy excludes fullscreen Spaces")
+        check(
+            DisplayPolicy(allowsFullscreenAuxiliary: true).allowsFullscreenAuxiliary,
+            "fullscreen auxiliary participation requires an explicit policy"
+        )
+        check(
+            !PanelCollectionBehaviorPolicy.make(allowsFullscreenAuxiliary: false)
+                .contains(.fullScreenAuxiliary),
+            "native default collection behavior excludes fullscreen Spaces"
+        )
+        check(
+            PanelCollectionBehaviorPolicy.make(allowsFullscreenAuxiliary: true)
+                .contains(.fullScreenAuxiliary),
+            "native collection behavior adds fullscreen auxiliary only after opt-in"
+        )
 
         let selectedExternal = DisplayPolicy(
-            enabledDisplayIdentities: [external.identity],
-            selectedDisplayIdentity: external.identity
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [external.uuid],
+            preferredDisplayUUID: external.uuid
         ).resolve([main, external, mirrored])
         check(
             selectedExternal.enabledDisplays.map(\.identity) == [external.identity],
@@ -218,17 +241,177 @@ private struct FoundationHarness {
             "explicit selected display drives one-at-a-time interactions"
         )
 
+        let explicitlyEmpty = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [],
+            preferredDisplayUUID: external.uuid
+        ).resolve([main, external])
+        check(
+            explicitlyEmpty.enabledDisplays.isEmpty,
+            "explicitly empty display allowlist creates no panels"
+        )
+        check(
+            explicitlyEmpty.selectedDisplayIdentity == nil,
+            "explicitly empty display allowlist has no shortcut target"
+        )
+
         let missingSelection = DisplayPolicy(
-            selectedDisplayIdentity: DisplayIdentity(rawValue: 999)
+            surfaceScope: .allAvailable,
+            preferredDisplayUUID: makeDisplayUUID(999)
         ).resolve([external, main])
         check(
-            missingSelection.selectedDisplayIdentity == main.identity,
-            "missing selected display safely falls back to main"
+            missingSelection.enabledDisplays.count == 2
+                && missingSelection.selectedDisplayIdentity == nil,
+            "missing preferred display never targets a different available display"
+        )
+
+        let fallbackLeft = makeSnapshot(identity: 40)
+        let fallbackRight = makeSnapshot(identity: 20, originX: 1_440)
+        let firstFallback = DisplayPolicy.safeDefault.resolve([fallbackLeft, fallbackRight])
+        let reorderedFallback = DisplayPolicy.safeDefault.resolve([fallbackRight, fallbackLeft])
+        check(
+            firstFallback.selectedDisplayIdentity == fallbackRight.identity
+                && reorderedFallback.selectedDisplayIdentity == fallbackRight.identity,
+            "mainless fallback selection remains stable across provider reordering"
+        )
+
+        let staleAllowlist = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [makeDisplayUUID(999)],
+            preferredDisplayUUID: makeDisplayUUID(999)
+        ).resolve([external, main])
+        check(
+            staleAllowlist.enabledDisplays.isEmpty
+                && staleAllowlist.selectedDisplayIdentity == nil,
+            "stale custom display UUIDs remain unavailable instead of targeting main"
+        )
+
+        let staleMainlessAllowlist = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [makeDisplayUUID(999)]
+        ).resolve([fallbackLeft, fallbackRight])
+        check(
+            staleMainlessAllowlist.enabledDisplays.isEmpty
+                && staleMainlessAllowlist.selectedDisplayIdentity == nil,
+            "stale mainless custom scope never substitutes a different display"
+        )
+
+        let rebootedExternal = makeSnapshot(
+            identity: 220,
+            uuid: external.uuid,
+            originX: 1_440
+        )
+        let stablePreference = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [external.uuid],
+            preferredDisplayUUID: external.uuid
+        ).resolve([main, rebootedExternal])
+        check(
+            stablePreference.enabledDisplays.map(\.identity) == [rebootedExternal.identity]
+                && stablePreference.selectedDisplayIdentity == rebootedExternal.identity,
+            "stable UUID preference remaps to the display's new session identity"
+        )
+
+        let reusedSessionIdentity = makeSnapshot(
+            identity: external.identity.rawValue,
+            uuid: makeDisplayUUID(777),
+            originX: 1_440
+        )
+        let reusedIdentityResolution = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [external.uuid],
+            preferredDisplayUUID: external.uuid
+        ).resolve([main, reusedSessionIdentity])
+        check(
+            reusedIdentityResolution.enabledDisplays.isEmpty
+                && reusedIdentityResolution.selectedDisplayIdentity == nil,
+            "reused Core Graphics ID with a different UUID never matches saved preference"
         )
 
         let disabled = DisplayPolicy(isEnabled: false).resolve([main, external])
         check(disabled.enabledDisplays.isEmpty, "disabled display policy creates no enabled surfaces")
         check(disabled.selectedDisplayIdentity == nil, "disabled display policy has no shortcut target")
+    }
+
+    mutating func verifyExpandedInteractionPolicy() {
+        let hitRegion = HitRegion.roundedRectangle(
+            CGRect(x: 20, y: 20, width: 200, height: 100),
+            cornerRadius: 20
+        )
+        for state in PanelPresentationState.allCases where state != .expanded {
+            let policy = ExpandedInteractionPolicy(
+                state: state,
+                isWindowPresented: true,
+                hitRegion: hitRegion
+            )
+            check(!policy.allowsKeyInteraction, "\(state.rawValue) cannot become key")
+            check(
+                !policy.requiresMouseDownMonitoring,
+                "\(state.rawValue) owns no outside-click monitors"
+            )
+            check(
+                !policy.shouldHandleEscape(panelIsKey: true),
+                "\(state.rawValue) ignores Escape dismissal"
+            )
+        }
+
+        let expanded = ExpandedInteractionPolicy(
+            state: .expanded,
+            isWindowPresented: true,
+            hitRegion: hitRegion
+        )
+        check(expanded.allowsKeyInteraction, "presented Expanded state permits key interaction")
+        check(
+            expanded.requiresMouseDownMonitoring,
+            "presented Expanded state demands paired outside-click monitors"
+        )
+        check(
+            expanded.mouseDownDecision(at: CGPoint(x: 120, y: 70)) == .keepOpen,
+            "clicks inside the current native hit region preserve Expanded actions"
+        )
+        check(
+            expanded.mouseDownDecision(at: CGPoint(x: 20, y: 20)) == .dismiss,
+            "transparent rounded corners dismiss as outside clicks"
+        )
+        check(
+            expanded.mouseDownDecision(at: CGPoint(x: 240, y: 70)) == .dismiss,
+            "clicks beyond the current native hit region dismiss Expanded"
+        )
+        check(
+            expanded.shouldHandleEscape(panelIsKey: true),
+            "Escape dismisses when Expanded owns key interaction"
+        )
+        check(
+            !expanded.shouldHandleEscape(panelIsKey: false),
+            "Escape does not act when another window owns key interaction"
+        )
+
+        let orderedOut = ExpandedInteractionPolicy(
+            state: .expanded,
+            isWindowPresented: false,
+            hitRegion: hitRegion
+        )
+        check(!orderedOut.allowsKeyInteraction, "ordered-out Expanded state cannot become key")
+        check(
+            !orderedOut.requiresMouseDownMonitoring,
+            "ordered-out Expanded state owns no outside-click monitors"
+        )
+
+        var leasePolicy = ExpandedInteractionLeasePolicy()
+        check(!leasePolicy.admits(0), "inactive dismissal lease rejects callbacks")
+        let firstLease = leasePolicy.activate()
+        check(leasePolicy.admits(firstLease), "active dismissal lease admits its callback")
+        leasePolicy.retire()
+        check(!leasePolicy.admits(firstLease), "retired dismissal lease rejects queued callbacks")
+        let secondLease = leasePolicy.activate()
+        check(
+            secondLease != firstLease && leasePolicy.admits(secondLease),
+            "reinstalled monitors own a fresh dismissal lease"
+        )
+        check(
+            !leasePolicy.admits(firstLease),
+            "stale monitor callbacks cannot dismiss a later Expanded session"
+        )
     }
 
     mutating func verifyHoverHysteresisAndMotionInterruption() {
@@ -242,15 +425,38 @@ private struct FoundationHarness {
         )
 
         model.setPointerInside(true)
+        check(
+            scheduler.lastScheduledDelay == .milliseconds(120),
+            "hover entry uses the controlled 120 millisecond dwell"
+        )
         model.setPointerInside(false)
+        check(
+            scheduler.activeOperationCount == 0,
+            "leaving before hover dwell cancels pending Peek work"
+        )
         scheduler.runAll()
         check(model.state == .compact, "pointer transit keeps compact geometry stable")
 
         model.setPointerInside(true)
-        check(model.state == .compact, "hover highlights without changing panel geometry")
+        scheduler.runNext()
+        check(model.state == .peek, "sustained hover reveals Peek after its one-shot dwell")
+        model.setPointerInside(false)
+        check(
+            scheduler.lastScheduledDelay == .milliseconds(300),
+            "Peek exit uses the controlled 300 millisecond grace period"
+        )
+        model.setPointerInside(true)
+        scheduler.runAll()
+        check(model.state == .peek, "re-entry cancels the pending Peek exit")
+        model.setPointerInside(false)
+        scheduler.runAll()
+        check(model.state == .compact, "completed hover exit returns Peek to compact")
+
+        model.setPointerInside(true)
+        check(model.state == .compact, "click can preempt the pending hover dwell")
         model.send(.primaryAction)
         scheduler.runAll()
-        check(model.state == .expanded, "click deliberately expands the stable compact surface")
+        check(model.state == .expanded, "click deliberately expands the compact surface")
 
         let motionScheduler = ManualOneShotScheduler()
         let motionModel = PanelSurfaceModel(
@@ -381,8 +587,8 @@ private struct FoundationHarness {
         }
         stableScheduler.runAll()
         check(
-            stableModel.state == .compact,
-            "stationary notch hover cannot oscillate surface geometry"
+            stableModel.state == .peek,
+            "stationary notch hover settles in Peek without geometry oscillation"
         )
         check(
             stableScheduler.activeOperationCount == 0,
@@ -433,6 +639,38 @@ private struct FoundationHarness {
             !hiddenModel.pointerDisposition(at: topAnchorPoint).acceptsMouseEvents,
             "hidden notch anchor remains click-through"
         )
+
+        let launcherScheduler = ManualOneShotScheduler()
+        let launcherModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: launcherScheduler,
+            activityModel: SurfaceActivityModel(inert: ())
+        )
+        let launcherChanges = CallbackCounter()
+        launcherModel.didChange = { [weak launcherChanges] in
+            launcherChanges?.increment()
+        }
+        let compactHitRegion = launcherModel.interactionHitRegion
+        launcherModel.setFocusTimerStartHandler { _ in true }
+        check(launcherModel.state == .compact, "launcher availability is a same-state layout mutation")
+        check(launcherChanges.count == 1, "same-state layout mutation notifies its AppKit owner")
+        let launcherTarget = launcherModel.layout.hitRegion
+        check(
+            launcherModel.interactionHitRegion
+                == compactHitRegion.intersecting(launcherTarget),
+            "same-state growth keeps the native hit region inside visible geometry"
+        )
+        check(
+            launcherScheduler.activeOperationCount == 1,
+            "same-state growth owns one bounded hit-region settlement"
+        )
+        launcherScheduler.runAll()
+        check(
+            launcherModel.interactionHitRegion == launcherTarget
+                && launcherChanges.count == 2,
+            "same-state growth adopts the exact target after the morph settles"
+        )
     }
 
     mutating func verifyCoordinatorLifecycle() async {
@@ -446,7 +684,10 @@ private struct FoundationHarness {
         let activityModel = SurfaceActivityModel(broker: broker)
         let coordinator = PanelCoordinator(
             displayProvider: provider,
-            policy: DisplayPolicy(selectedDisplayIdentity: external.identity),
+            policy: DisplayPolicy(
+                surfaceScope: .allAvailable,
+                preferredDisplayUUID: external.uuid
+            ),
             lifecycleEventSource: eventSource,
             activityModel: activityModel,
             panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
@@ -486,6 +727,32 @@ private struct FoundationHarness {
         eventSource.emit(.pointerMoved(CGPoint(x: -100, y: -100)))
         let mainPanel = registry.latestPanel(for: main.identity)
         let externalPanel = registry.latestPanel(for: external.identity)
+        check(
+            mainPanel?.fullscreenAuxiliaryUpdates == [false]
+                && externalPanel?.fullscreenAuxiliaryUpdates == [false],
+            "new panels start excluded from fullscreen Spaces"
+        )
+        var fullscreenPolicy = coordinator.policy
+        fullscreenPolicy.allowsFullscreenAuxiliary = true
+        coordinator.update(policy: fullscreenPolicy)
+        check(
+            mainPanel?.fullscreenAuxiliaryUpdates.last == true
+                && externalPanel?.fullscreenAuxiliaryUpdates.last == true,
+            "fullscreen opt-in updates every existing panel"
+        )
+        let contractionBaseline = (
+            mainPanel?.cancellationCount ?? 0,
+            externalPanel?.cancellationCount ?? 0
+        )
+        fullscreenPolicy.allowsFullscreenAuxiliary = false
+        coordinator.update(policy: fullscreenPolicy)
+        check(
+            mainPanel?.fullscreenAuxiliaryUpdates.last == false
+                && externalPanel?.fullscreenAuxiliaryUpdates.last == false
+                && mainPanel?.cancellationCount == contractionBaseline.0 + 1
+                && externalPanel?.cancellationCount == contractionBaseline.1 + 1,
+            "fullscreen opt-out contracts transient state before updating existing panels"
+        )
         let mainPointerBaseline = mainPanel?.pointerUpdateCount ?? 0
         let externalPointerBaseline = externalPanel?.pointerUpdateCount ?? 0
 
@@ -530,7 +797,7 @@ private struct FoundationHarness {
         check(registry.latestPanel(for: external.identity)?.primaryActionCount == 1, "shortcut targets selected display")
         check(registry.latestPanel(for: main.identity)?.primaryActionCount == 0, "shortcut does not fan out")
 
-        let replacement = makeSnapshot(identity: 40, originX: 1_440)
+        let replacement = makeSnapshot(identity: 40, uuid: external.uuid, originX: 1_440)
         provider.displays = [main, replacement]
         eventSource.emit(.displayConfigurationChanged)
         check(registry.creationCount == 3, "hot-plug adds only the new display panel")
@@ -624,7 +891,10 @@ private struct FoundationHarness {
         let model = SurfaceActivityModel(broker: ActivityBroker())
         let coordinator = PanelCoordinator(
             displayProvider: FakeDisplayProvider(displays: [main, selected]),
-            policy: DisplayPolicy(selectedDisplayIdentity: selected.identity),
+            policy: DisplayPolicy(
+                surfaceScope: .allAvailable,
+                preferredDisplayUUID: selected.uuid
+            ),
             lifecycleEventSource: events,
             activityModel: model,
             panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
@@ -804,6 +1074,7 @@ private func makeActiveActivityModel() -> SurfaceActivityModel {
 
 private func makeSnapshot(
     identity: UInt32,
+    uuid: DisplayUUID? = nil,
     originX: CGFloat = 0,
     isMain: Bool = false,
     isMirrored: Bool = false
@@ -811,6 +1082,8 @@ private func makeSnapshot(
     let frame = CGRect(x: originX, y: 0, width: 1_440, height: 900)
     return DisplaySnapshot(
         identity: DisplayIdentity(rawValue: identity),
+        uuid: uuid ?? makeDisplayUUID(identity),
+        localizedName: isMain ? "Built-in Display" : "External Display",
         geometry: DisplayGeometry(
             frame: frame,
             visibleFrame: CGRect(x: originX, y: 0, width: 1_440, height: 875),
@@ -822,12 +1095,26 @@ private func makeSnapshot(
     )
 }
 
+private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
+    let uuid = String(format: "00000000-0000-0000-0000-%012llx", UInt64(value))
+    return DisplayUUID(rawValue: uuid)!
+}
+
 @MainActor
 private final class ManualScheduledOperation: ScheduledOperation {
     private(set) var isCancelled = false
 
     func cancel() {
         isCancelled = true
+    }
+}
+
+@MainActor
+private final class CallbackCounter {
+    private(set) var count = 0
+
+    func increment() {
+        count += 1
     }
 }
 
@@ -954,6 +1241,7 @@ private final class FakePanel: PanelPresenting {
     private(set) var lastPointerPosition: CGPoint?
     private(set) var primaryActionCount = 0
     private(set) var cancellationCount = 0
+    private(set) var fullscreenAuxiliaryUpdates: [Bool] = []
 
     init(displayIdentity: DisplayIdentity) {
         self.displayIdentity = displayIdentity
@@ -986,6 +1274,11 @@ private final class FakePanel: PanelPresenting {
 
     func cancelPendingInteractions() {
         cancellationCount += 1
+    }
+
+    func setFullscreenAuxiliaryEnabled(_ enabled: Bool) {
+        guard fullscreenAuxiliaryUpdates.last != enabled else { return }
+        fullscreenAuxiliaryUpdates.append(enabled)
     }
 }
 

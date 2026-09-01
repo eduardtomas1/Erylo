@@ -2,10 +2,18 @@
 
 # Erylo
 
-### Your focus, one glance away.
+### On cue. Out of view.
 
 Erylo turns the quiet space around your MacBook's notch into a useful part of
 your day—present when it matters, invisible when it does not.
+
+Today it is deliberately narrow: a Focus Timer, plus optional event-driven
+Battery and Volume acknowledgements. The broader activity layer is groundwork,
+not a claim that the planned utilities already ship.
+
+<img src="docs/images/erylo-timer-expanded.png" width="756" alt="Erylo extending from the MacBook notch with a live Focus Timer, progress, and cancel action">
+
+<sub>The production SwiftUI Focus Timer rendered by Erylo's deterministic native macOS harness.</sub>
 
 <p>
   <img alt="macOS 14 or newer" src="https://img.shields.io/badge/macOS-14%2B-111111?style=flat-square&logo=apple&logoColor=white">
@@ -13,10 +21,6 @@ your day—present when it matters, invisible when it does not.
   <img alt="Local first" src="https://img.shields.io/badge/local--first-no%20analytics-2E8B74?style=flat-square">
   <img alt="Apache 2.0 license" src="https://img.shields.io/badge/license-Apache%202.0-5D88E5?style=flat-square">
 </p>
-
-<img src="docs/images/erylo-timer-expanded.png" width="756" alt="Erylo extending from the MacBook notch with a live Focus Timer, progress, and cancel action">
-
-<sub>The real Focus Timer running in Erylo's native notch-attached surface.</sub>
 
 </div>
 
@@ -29,11 +33,11 @@ the compact launcher, or use the same presets in the Erylo menu. Its progress
 lives at the top edge of the display, where it can be checked without opening
 an app, moving a window, or breaking concentration.
 
-When you want more detail, reveal Erylo with a click or
-<kbd>Control</kbd> + <kbd>Option</kbd> + <kbd>Command</kbd> + <kbd>E</kbd>.
-Cancel from the expanded surface or directly from the menu. When the session
-ends, Erylo briefly opens a readable **Focus complete** acknowledgement, then
-disappears.
+The running timer stays compact on hover because a larger duplicate adds no
+value. Click it or press <kbd>Control</kbd> + <kbd>Option</kbd> +
+<kbd>Command</kbd> + <kbd>E</kbd> for the expanded controls. Cancel there or
+directly from the menu. When the session ends, Erylo briefly opens a readable
+**Focus complete** acknowledgement, then disappears.
 
 <p align="center">
   <img src="docs/images/erylo-timer-launcher.png" width="560" alt="Erylo's compact native Focus Timer launcher with 15, 25, and 50 minute presets below MacBook notch geometry">
@@ -78,8 +82,8 @@ disappears.
     </td>
     <td width="50%" valign="top">
       <strong>Calm by default</strong><br>
-      No idle animation, permanent dashboard, or hover-triggered opening. Erylo
-      waits for deliberate interaction.
+      No idle animation or permanent dashboard. Hover reveals only a short,
+      non-activating Peek; full expansion waits for a click or shortcut.
     </td>
   </tr>
   <tr>
@@ -138,7 +142,7 @@ disappears.
 <p align="center">
   <img src="docs/images/erylo-volume-muted-notched.png" width="480" alt="Erylo's compact notch-native muted acknowledgement with a speaker slash symbol and the word Muted">
   <br>
-  <img src="docs/images/erylo-volume-output-notched.png" width="480" alt="Erylo's expanded notch-native output-change acknowledgement naming Studio Display">
+  <img src="docs/images/erylo-volume-output-notched.png" width="480" alt="Erylo's compact notch-native output-change acknowledgement naming Studio Display">
 </p>
 
 These are the complete live utilities today. The screenshots show native
@@ -172,9 +176,10 @@ cd Erylo
 swift run Erylo
 ```
 
-Look for **Erylo** in the menu bar. From there you can start or cancel a Focus
-Timer, show or hide the surface, open Settings to enable Battery or Volume, check
-for updates when a signed feed is configured, or quit cleanly.
+Look for Erylo's top-edge signal mark in the menu bar. From there you can start
+or cancel a Focus Timer, show or hide the surface, open Settings to enable
+Battery or Volume, check for updates when a signed feed is configured, or quit
+cleanly.
 
 > Erylo does not publish a signed end-user download yet. The release pipeline is
 > in place, but real Developer ID signing, notarization, and update publication
@@ -186,6 +191,7 @@ for updates when a signed feed is configured, or quit cleanly.
 The product README stays intentionally human. The deeper material lives here:
 
 - [Development guide](docs/DEVELOPMENT.md)
+- [Product design system](docs/DESIGN_SYSTEM.md)
 - [Architecture notes](docs/FOUNDATION.md)
 - [Glance provider lifecycle](docs/GLANCE_LIFECYCLE.md)
 - [Compatibility and hardware gates](docs/COMPATIBILITY_MATRIX.md)
@@ -199,7 +205,7 @@ The product README stays intentionally human. The deeper material lives here:
 
 <div align="center">
 
-**Glance. Act. Disappear.**
+**On cue. Out of view.**
 
 Erylo is open source under the [Apache License 2.0](LICENSE).
 

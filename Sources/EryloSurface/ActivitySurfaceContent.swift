@@ -49,6 +49,21 @@ package struct ActivitySurfaceTemporalSnapshot: Equatable, Sendable {
     package let fractionCompleted: Double
 }
 
+/// A deterministic rendering decision derived only from the bounded activity
+/// contract. Keeping this separate from the SwiftUI hierarchy prevents built-in
+/// signals from falling back to a generic title/detail card as the view evolves.
+package enum ActivitySurfaceComposition: Equatable, Sendable {
+    case timerCountdown
+    case timerCompletion
+    case volumeLevel
+    case volumeMuted
+    case volumeUnmuted
+    case volumeOutput
+    case battery
+    case charging
+    case standard
+}
+
 public struct ActivitySurfaceItem: Equatable, Sendable {
     public let identity: ActivityIdentity
     public let revision: UInt64
@@ -106,6 +121,84 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
         }
     }
 
+    package var composition: ActivitySurfaceComposition {
+        if kind == .timer, presentationRole == .completionAcknowledgement {
+            return .timerCompletion
+        }
+        if kind == .volume {
+            return switch presentationRole {
+            case .volumeLevelChanged, .standard:
+                .volumeLevel
+            case .volumeMuted:
+                .volumeMuted
+            case .volumeUnmuted:
+                .volumeUnmuted
+            case .volumeOutputChanged:
+                .volumeOutput
+            case .completionAcknowledgement:
+                .standard
+            }
+        }
+        return switch kind {
+        case .timer:
+            .timerCountdown
+        case .battery:
+            .battery
+        case .charging:
+            .charging
+        case .generic, .meeting, .media, .file, .volume:
+            .standard
+        }
+    }
+
+    /// Static principal copy for deterministic previews and non-temporal
+    /// activities. Timestamp-backed timers replace this with their local
+    /// projection only while the physical surface is visible.
+    package var signalPrincipalValue: String? {
+        switch composition {
+        case .timerCountdown:
+            detail ?? shortProgressValue ?? title
+        case .timerCompletion:
+            title
+        case .volumeLevel, .volumeUnmuted, .battery, .charging:
+            shortProgressValue ?? detail ?? title
+        case .volumeMuted, .volumeOutput:
+            title
+        case .standard:
+            shortProgressValue
+        }
+    }
+
+    /// A signal line is information, never decoration. Only a validated scalar
+    /// or timestamp projection earns the extra visual channel.
+    package var hasSemanticProgress: Bool {
+        progressFraction != nil || temporalProjection != nil
+    }
+
+    package var hasUsefulPeekDetail: Bool {
+        guard composition == .standard,
+              let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !detail.isEmpty else {
+            return false
+        }
+        return detail.caseInsensitiveCompare(title) != .orderedSame
+    }
+
+    package func supportsExpandedPresentation(
+        action: SurfaceActivityAction?,
+        queue: ActivityQueueContext
+    ) -> Bool {
+        switch composition {
+        case .timerCountdown:
+            action != nil
+        case .standard:
+            hasUsefulPeekDetail || action != nil || !queue.items.isEmpty
+        case .timerCompletion, .volumeLevel, .volumeMuted, .volumeUnmuted,
+             .volumeOutput, .battery, .charging:
+            false
+        }
+    }
+
     public var accessibilitySummary: String {
         let components: [String?] = switch presentationRole {
         case .volumeLevelChanged:
@@ -122,10 +215,26 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
         return components.compactMap { $0 }.joined(separator: ", ")
     }
 
+    package func accessibilitySummary(
+        temporalSnapshot: ActivitySurfaceTemporalSnapshot?
+    ) -> String {
+        guard temporalProjection != nil, let temporalSnapshot else {
+            return accessibilitySummary
+        }
+        return [
+            kindLabel,
+            title,
+            SurfaceStrings.remainingTime(temporalSnapshot.remainingText),
+        ].joined(separator: ", ")
+    }
+
     private static func descriptor(
         for kind: ActivityKind,
         presentationRole: ActivityPresentationRole
     ) -> (kindLabel: String, symbolName: String, accent: ActivityAccent) {
+        if kind == .timer, presentationRole == .completionAcknowledgement {
+            return (SurfaceStrings.timerKind, "checkmark.circle.fill", .mint)
+        }
         if kind == .volume {
             return switch presentationRole {
             case .volumeMuted:
@@ -261,6 +370,13 @@ public enum ActivitySurfacePrimaryContent: Equatable, Sendable {
     case dropTarget(title: String, detail: String)
 }
 
+package enum ActivitySurfaceInteractionRole: Equatable, Sendable {
+    case none
+    case expand
+    case collapse
+    case dismiss
+}
+
 public struct ActivitySurfaceContent: Equatable, Sendable {
     public let state: PanelPresentationState
     public let primary: ActivitySurfacePrimaryContent
@@ -268,6 +384,7 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
     public let action: SurfaceActivityAction?
     public let actionStatus: String?
     public let showsFocusTimerLauncher: Bool
+    package let interactionRole: ActivitySurfaceInteractionRole
 
     public init(
         state: PanelPresentationState,
@@ -280,22 +397,22 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
     ) {
         self.state = state
         self.showsFocusTimerLauncher = showsFocusTimerLauncher
+        let item = current.map(ActivitySurfaceItem.init)
         switch state {
         case .hidden:
             primary = .hidden
         case .dropTarget:
-            primary = .dropTarget(
-                title: SurfaceStrings.dropTargetTitle,
-                detail: SurfaceStrings.dropTargetDetail
-            )
+            // File Hold is not mounted. Keep the compatibility state inert so
+            // production never advertises a drop operation it will reject.
+            primary = .hidden
         case .compact, .peek, .expanded:
             if phase == .degraded {
                 primary = .degraded(
                     title: SurfaceStrings.degradedTitle,
                     detail: SurfaceStrings.degradedDetail
                 )
-            } else if let current {
-                primary = .activity(ActivitySurfaceItem(current))
+            } else if let item {
+                primary = .activity(item)
             } else {
                 primary = .empty(
                     title: showsFocusTimerLauncher
@@ -307,7 +424,26 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
         }
 
         queue = state == .expanded ? queueContext : .empty
-        self.action = state == .expanded ? action : nil
+        let isCompletion = item?.composition == .timerCompletion
+        self.action = state == .expanded || isCompletion ? action : nil
+        interactionRole = switch state {
+        case .hidden, .dropTarget:
+            .none
+        case .expanded:
+            .collapse
+        case .compact, .peek:
+            if isCompletion, action?.intent == .dismiss {
+                .dismiss
+            } else if let item,
+                      item.supportsExpandedPresentation(
+                          action: action,
+                          queue: queueContext
+                      ) {
+                .expand
+            } else {
+                .none
+            }
+        }
         actionStatus = switch actionDispatchState {
         case .idle, .handled:
             nil
@@ -327,6 +463,13 @@ public struct PanelSurfaceAccessibility: Equatable, Sendable {
     public let hint: String
 
     public init(content: ActivitySurfaceContent) {
+        self.init(content: content, temporalSnapshot: nil)
+    }
+
+    package init(
+        content: ActivitySurfaceContent,
+        temporalSnapshot: ActivitySurfaceTemporalSnapshot?
+    ) {
         label = SurfaceStrings.surfaceLabel
         let stateName: String
         switch content.state {
@@ -339,7 +482,7 @@ public struct PanelSurfaceAccessibility: Equatable, Sendable {
         case .expanded:
             stateName = SurfaceStrings.expandedState
         case .dropTarget:
-            stateName = SurfaceStrings.dropTargetState
+            stateName = SurfaceStrings.hiddenState
         }
 
         let primaryValue: String
@@ -347,7 +490,10 @@ public struct PanelSurfaceAccessibility: Equatable, Sendable {
         case .hidden:
             primaryValue = stateName
         case let .activity(item):
-            primaryValue = [stateName, item.accessibilitySummary].joined(separator: ", ")
+            primaryValue = [
+                stateName,
+                item.accessibilitySummary(temporalSnapshot: temporalSnapshot),
+            ].joined(separator: ", ")
         case let .empty(title, detail):
             primaryValue = [stateName, title, detail]
                 .compactMap { $0 }
@@ -364,19 +510,28 @@ public struct PanelSurfaceAccessibility: Equatable, Sendable {
             if content.showsFocusTimerLauncher {
                 SurfaceStrings.focusTimerLauncherHint
             } else {
-                switch content.primary {
-            case .activity:
-                SurfaceStrings.expandHint
-            case .empty, .degraded:
-                SurfaceStrings.hideHint
-            case .hidden, .dropTarget:
-                ""
+                switch content.interactionRole {
+                case .expand:
+                    SurfaceStrings.expandHint
+                case .dismiss:
+                    SurfaceStrings.dismissCompletionHint
+                case .none:
+                    switch content.primary {
+                    case .empty, .degraded:
+                        SurfaceStrings.hideHint
+                    case .activity:
+                        SurfaceStrings.passiveStatusHint
+                    case .hidden, .dropTarget:
+                        ""
+                    }
+                case .collapse:
+                    SurfaceStrings.collapseHint
                 }
             }
         case .expanded:
             SurfaceStrings.collapseHint
         case .dropTarget:
-            SurfaceStrings.dropTargetHint
+            ""
         }
     }
 }

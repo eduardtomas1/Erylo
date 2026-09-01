@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0" stop-color="#354158"/>
+      <stop offset="0.48" stop-color="#1A2230"/>
+      <stop offset="1" stop-color="#090C12"/>
+    </linearGradient>
+    <radialGradient id="ambient" cx="36%" cy="17%" r="72%">
+      <stop offset="0" stop-color="#7A91B8" stop-opacity="0.30"/>
+      <stop offset="0.52" stop-color="#253146" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="surface" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0" stop-color="#151A22"/>
+      <stop offset="0.5" stop-color="#090C11"/>
+      <stop offset="1" stop-color="#020305"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.34"/>
+      <stop offset="0.48" stop-color="#FFFFFF" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#6B9BFF" stop-opacity="0.16"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0" stop-color="#62F2C1" stop-opacity="0.26"/>
+      <stop offset="0.18" stop-color="#62F2C1"/>
+      <stop offset="0.72" stop-color="#62F2C1"/>
+      <stop offset="1" stop-color="#6B9BFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- One dimensional object: the top-edge surface itself. The system applies
+       the final platform mask; this inset field remains useful as an SVG review source. -->
+  <rect x="48" y="36" width="928" height="928" rx="218" fill="url(#background)"/>
+  <rect x="48" y="36" width="928" height="928" rx="218" fill="url(#ambient)"/>
+
+  <!-- A manual offset silhouette gives depth without renderer-specific filters. -->
+  <path
+    d="M172 272 H344 C386 272 406 294 418 342 C429 387 454 412 494 412 H530 C570 412 595 387 606 342 C618 294 638 272 680 272 H852 V570 C852 647 790 710 713 710 H311 C234 710 172 647 172 570 Z"
+    fill="#000000"
+    fill-opacity="0.34"
+    transform="translate(0 18)"
+  />
+
+  <path
+    d="M172 258 H344 C386 258 406 280 418 328 C429 373 454 398 494 398 H530 C570 398 595 373 606 328 C618 280 638 258 680 258 H852 V556 C852 633 790 696 713 696 H311 C234 696 172 633 172 556 Z"
+    fill="url(#surface)"
+    stroke="url(#edge)"
+    stroke-width="5"
+    stroke-linejoin="round"
+  />
+
+  <!-- The one activity signal is embedded in the surface, never styled as a slider. -->
+  <rect x="316" y="590" width="392" height="10" rx="5" fill="#F4F7FA" fill-opacity="0.07"/>
+  <rect x="316" y="590" width="272" height="10" rx="5" fill="url(#signal)"/>
+
+  <!-- Restrained live-value cues occupy the safe wings of the physical notch. -->
+  <circle cx="320" cy="330" r="27" fill="none" stroke="#F4F7FA" stroke-opacity="0.92" stroke-width="14"/>
+  <path d="M320 303 V330 L338 343" fill="none" stroke="#F4F7FA" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="674" y="320" width="74" height="20" rx="10" fill="#F4F7FA" fill-opacity="0.92"/>
+</svg>

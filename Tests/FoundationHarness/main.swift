@@ -17,6 +17,7 @@ enum FoundationHarnessMain {
         harness.verifyPanelGeometry()
         harness.verifyDisplayPolicy()
         harness.verifyExpandedInteractionPolicy()
+        harness.verifyNativeKeyRetirementContract()
         harness.verifyPassiveActivityAnnouncementPolicy()
         harness.verifyAutomaticWindowMorphStaging()
         harness.verifyHoverHysteresisAndMotionInterruption()
@@ -542,6 +543,74 @@ private struct FoundationHarness {
         check(
             !leasePolicy.admits(firstLease),
             "stale monitor callbacks cannot dismiss a later Expanded session"
+        )
+    }
+
+    mutating func verifyNativeKeyRetirementContract() {
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: true,
+                panelIsKey: true,
+                isWindowPresented: true,
+                wantsSurfacePresentation: true
+            ) == .none,
+            "a still-eligible key panel keeps its current AppKit ownership"
+        )
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: false,
+                panelIsKey: true,
+                isWindowPresented: true,
+                wantsSurfacePresentation: true
+            ) == .orderOutAndRestore,
+            "a contracting key panel uses AppKit ordering while preserving its visible surface"
+        )
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: false,
+                panelIsKey: true,
+                isWindowPresented: true,
+                wantsSurfacePresentation: false
+            ) == .orderOut,
+            "a hidden key panel orders out without restoring stale presentation"
+        )
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: false,
+                panelIsKey: false,
+                isWindowPresented: true,
+                wantsSurfacePresentation: true
+            ) == .none,
+            "a non-key panel performs no unnecessary ordering cycle"
+        )
+
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let windowingDirectory = repository.appendingPathComponent("Sources/EryloWindowing")
+        let directResignPattern = try? NSRegularExpression(
+            pattern: #"\bresignKey\s*\("#
+        )
+        let windowingSources = (try? FileManager.default.contentsOfDirectory(
+            at: windowingDirectory,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        let containsDirectResign = windowingSources
+            .filter { $0.pathExtension == "swift" }
+            .contains { sourceURL in
+                guard let source = try? String(contentsOf: sourceURL, encoding: .utf8),
+                      let directResignPattern else {
+                    return true
+                }
+                return directResignPattern.firstMatch(
+                    in: source,
+                    range: NSRange(source.startIndex..., in: source)
+                ) != nil
+            }
+        check(
+            !windowingSources.isEmpty && directResignPattern != nil && !containsDirectResign,
+            "windowing sources never invoke AppKit's key-resignation notification hook directly"
         )
     }
 

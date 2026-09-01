@@ -1472,16 +1472,18 @@ private final class TrustHarness {
             displayChoices: displayChoices
         )
 
-        let fixtures: [(String, TrustSettingsViewModel, ColorScheme)] = [
-            ("erylo-onboarding-light.png", onboardingModel, .light),
-            ("erylo-onboarding-dark.png", onboardingModel, .dark),
-            ("erylo-settings-light.png", settingsModel, .light),
-            ("erylo-settings-dark.png", settingsModel, .dark),
+        let fixtures: [(String, TrustSettingsViewModel, ColorScheme, Bool)] = [
+            ("erylo-onboarding-light.png", onboardingModel, .light, false),
+            ("erylo-onboarding-dark.png", onboardingModel, .dark, false),
+            ("erylo-settings-light.png", settingsModel, .light, false),
+            ("erylo-settings-dark.png", settingsModel, .dark, false),
+            ("erylo-settings-lower-light.png", settingsModel, .light, true),
         ]
-        for (filename, model, colorScheme) in fixtures {
+        for (filename, model, colorScheme, startsAtBottom) in fixtures {
             let view = TrustSettingsView(
                 model: model,
-                onStartFocusTimer: { true }
+                onStartFocusTimer: { true },
+                startsAtBottomForVisualQA: startsAtBottom
             )
             .frame(width: 680, height: 620)
             .environment(\.colorScheme, colorScheme)

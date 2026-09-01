@@ -207,6 +207,19 @@ public enum ActivitySurfacePreviewCatalog {
         )
     )
 
+    public static let volumeUnmuted = ActivitySurfacePreviewScenario(
+        name: "Volume unmuted",
+        state: .compact,
+        current: request(
+            identifier: "preview.volume.unmuted",
+            source: .volume,
+            kind: .volume,
+            title: "Sound on",
+            progress: 0.64,
+            presentationRole: .volumeUnmuted
+        )
+    )
+
     public static let volumeOutput = ActivitySurfacePreviewScenario(
         name: "Volume output changed",
         state: .compact,
@@ -272,6 +285,7 @@ public enum ActivitySurfacePreviewCatalog {
         meeting,
         volume,
         volumeMuted,
+        volumeUnmuted,
         volumeOutput,
         media,
         file,

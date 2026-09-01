@@ -102,14 +102,15 @@ jobs:
           .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
           shopt -s nullglob
           settings_visual_files=("$ERYLO_SETTINGS_VISUAL_QA_DIRECTORY"/*.png)
-          if (( ${#settings_visual_files[@]} != 4 )); then
-            echo "Expected exactly 4 native settings QA images; found ${#settings_visual_files[@]}." >&2
+          if (( ${#settings_visual_files[@]} != 5 )); then
+            echo "Expected exactly 5 native settings QA images; found ${#settings_visual_files[@]}." >&2
             exit 1
           fi
           expected_settings_visual_names=(
             erylo-onboarding-dark.png
             erylo-onboarding-light.png
             erylo-settings-dark.png
+            erylo-settings-lower-light.png
             erylo-settings-light.png
           )
           actual_settings_visual_names=()
@@ -131,8 +132,8 @@ jobs:
           .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
           shopt -s nullglob
           surface_visual_files=("$ERYLO_VISUAL_QA_DIRECTORY"/*.png)
-          if (( ${#surface_visual_files[@]} != 15 )); then
-            echo "Expected exactly 15 native surface QA images; found ${#surface_visual_files[@]}." >&2
+          if (( ${#surface_visual_files[@]} != 16 )); then
+            echo "Expected exactly 16 native surface QA images; found ${#surface_visual_files[@]}." >&2
             exit 1
           fi
           expected_surface_visual_names=(
@@ -148,6 +149,7 @@ jobs:
             erylo-timer-launcher-notchless.png
             erylo-volume-muted-notched.png
             erylo-volume-muted-notchless.png
+            erylo-volume-unmuted-notched.png
             erylo-volume-output-notched.png
             erylo-volume-output-notchless-light.png
             erylo-volume-output-notchless.png

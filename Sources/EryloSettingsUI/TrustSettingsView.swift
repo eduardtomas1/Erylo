@@ -13,6 +13,7 @@ public struct TrustSettingsView: View {
     private let model: TrustSettingsViewModel
     private let destinationChooser: any DiagnosticsDestinationChoosing
     private let onStartFocusTimer: (@MainActor () -> Bool)?
+    private let startsAtBottomForVisualQA: Bool
 
     @State private var isResetConfirmationPresented = false
     @State private var focusTimerStartFailed = false
@@ -26,6 +27,22 @@ public struct TrustSettingsView: View {
         self.model = model
         self.destinationChooser = destinationChooser
         self.onStartFocusTimer = onStartFocusTimer
+        startsAtBottomForVisualQA = false
+    }
+
+    /// Package-only visual-proof seam. Production Settings always starts at
+    /// the top; the deterministic harness can also prove the lower native
+    /// controls without exposing a test preference to users.
+    @MainActor
+    package init(
+        model: TrustSettingsViewModel,
+        onStartFocusTimer: (@MainActor () -> Bool)?,
+        startsAtBottomForVisualQA: Bool
+    ) {
+        self.model = model
+        destinationChooser = SystemDiagnosticsDestinationChooser()
+        self.onStartFocusTimer = onStartFocusTimer
+        self.startsAtBottomForVisualQA = startsAtBottomForVisualQA
     }
 
     public var body: some View {
@@ -47,6 +64,7 @@ public struct TrustSettingsView: View {
                 }
                 .formStyle(.grouped)
                 .scrollContentBackground(.hidden)
+                .defaultScrollAnchor(startsAtBottomForVisualQA ? .bottom : .top)
                 .frame(maxWidth: 720)
             } else {
                 onboardingView
@@ -183,17 +201,17 @@ public struct TrustSettingsView: View {
 
                     HStack(alignment: .top, spacing: 24) {
                         onboardingPromise(
-                            symbol: "cursorarrow",
+                            symbol: "cursorarrow.rays",
                             title: "Stays out of the way",
-                            detail: "Hover never activates your app or steals focus."
+                            detail: "Hover never activates Erylo or steals focus."
                         )
                         onboardingPromise(
-                            symbol: "bolt.slash",
+                            symbol: "moon.zzz",
                             title: "Sleeps when idle",
-                            detail: "No polling or permanent animation loop."
+                            detail: "No background loop runs while Erylo is idle."
                         )
                         onboardingPromise(
-                            symbol: "lock",
+                            symbol: "lock.shield",
                             title: "Local by design",
                             detail: "No account, analytics, or automatic upload."
                         )
@@ -248,7 +266,7 @@ public struct TrustSettingsView: View {
 
                     Text("Battery and Volume stay off until you enable them in Settings.")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                         .padding(.top, 9)
 
                     Spacer(minLength: 28)
@@ -268,10 +286,10 @@ public struct TrustSettingsView: View {
     ) -> some View {
         VStack(spacing: 8) {
             Image(systemName: symbol)
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(Color.accentColor)
-                .symbolRenderingMode(.hierarchical)
-                .frame(height: 24)
+                .symbolRenderingMode(.monochrome)
+                .frame(width: 28, height: 24)
                 .accessibilityHidden(true)
 
             Text(title)
@@ -297,7 +315,7 @@ public struct TrustSettingsView: View {
         } header: {
             Text("Utilities")
         } footer: {
-            Text("Disabled utilities stop completely.")
+            settingsFooter("Disabled utilities stop completely.")
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(TrustAccessibilityCopy.moduleGroupLabel)
@@ -466,7 +484,7 @@ public struct TrustSettingsView: View {
         } header: {
             Text("Displays")
         } footer: {
-            Text("Automatic uses one main display. All Displays is opt-in. The menu and shortcut target can only be an enabled, connected display.")
+            settingsFooter("Automatic uses one main display. All Displays is opt-in. The menu and shortcut target can only be an enabled, connected display.")
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(TrustAccessibilityCopy.displayGroupLabel)
@@ -576,8 +594,15 @@ public struct TrustSettingsView: View {
         } header: {
             Text("Advanced")
         } footer: {
-            Text("Diagnostics are redacted and saved only when you choose a file. Erylo has no analytics or automatic upload.")
+            settingsFooter("Diagnostics are redacted and saved only when you choose a file. Erylo has no analytics or automatic upload.")
         }
+    }
+
+    private func settingsFooter(_ text: String) -> some View {
+        Text(text)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func settingIcon(_ systemName: String) -> some View {
@@ -678,6 +703,10 @@ private struct OnboardingSurfacePreview: View {
                     }
                     .padding(.bottom, 1)
                 }
+                // The preview is a permanently black surface. Keep its
+                // semantic foreground independent from the host appearance.
+                .foregroundStyle(Color.white)
+                .environment(\.colorScheme, .dark)
                 .frame(width: 330, height: 44)
 
                 Spacer(minLength: 22)

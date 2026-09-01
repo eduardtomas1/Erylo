@@ -151,6 +151,12 @@ public struct ActivitySurfaceItem: Equatable, Sendable {
         }
     }
 
+    /// Timer identity remains Amber wherever the countdown is composed. Completion replaces the
+    /// timer glyph with a distinct success symbol and therefore retains its Mint descriptor.
+    package var semanticSymbolAccent: ActivityAccent {
+        composition == .timerCountdown ? .amber : accent
+    }
+
     /// Static principal copy for deterministic previews and non-temporal
     /// activities. Timestamp-backed timers replace this with their local
     /// projection only while the physical surface is visible.

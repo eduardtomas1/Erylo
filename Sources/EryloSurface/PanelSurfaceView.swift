@@ -5,6 +5,7 @@ import SwiftUI
 public struct PanelSurfaceView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
     @Namespace private var continuityNamespace
     @FocusState private var focusedControl: PanelFocusableControl?
 
@@ -56,6 +57,15 @@ public struct PanelSurfaceView: View {
             0
         )
         let acceptsBackgroundTap = model.acceptsBackgroundTap
+        let notchlessShadowOpacity = colorScheme == .light
+            ? PanelSurfaceVisualMetrics.notchlessLightShadowOpacity
+            : PanelSurfaceVisualMetrics.notchlessDarkShadowOpacity
+        let notchlessShadowRadius = colorScheme == .light
+            ? PanelSurfaceVisualMetrics.notchlessLightShadowRadius
+            : PanelSurfaceVisualMetrics.notchlessDarkShadowRadius
+        let notchlessShadowOffsetY = colorScheme == .light
+            ? PanelSurfaceVisualMetrics.notchlessLightShadowOffsetY
+            : PanelSurfaceVisualMetrics.notchlessDarkShadowOffsetY
         let presentationTransitionKey = SurfacePresentationTransitionKey(content: content)
         let currentSnapshotVersion = model.activityModel.snapshotVersion
         let currentActivityIdentity = model.activityModel.current?.activity.identity
@@ -144,10 +154,10 @@ public struct PanelSurfaceView: View {
         }
         .shadow(
             color: layout.attachment == .notchlessPill
-                ? Color.black.opacity(0.28)
+                ? Color.black.opacity(notchlessShadowOpacity)
                 : .clear,
-            radius: 7,
-            y: 2
+            radius: notchlessShadowRadius,
+            y: notchlessShadowOffsetY
         )
         .offset(y: layout.surfaceTopInset)
         .frame(
@@ -213,12 +223,20 @@ public struct PanelSurfaceView: View {
             Spacer(minLength: 0)
             HStack(spacing: 0) {
                 notchCompactLeading(content)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.leading, PanelSurfaceVisualMetrics.notchWingOuterPadding)
+                    .padding(.trailing, PanelSurfaceVisualMetrics.notchWingCameraClearance)
                     .frame(width: wingWidth)
+                    .clipped()
                 Color.clear
                     .frame(width: resolvedOcclusionWidth)
                     .accessibilityHidden(true)
                 notchCompactTrailing(content, temporalSnapshot: temporalSnapshot)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.leading, PanelSurfaceVisualMetrics.notchWingCameraClearance)
+                    .padding(.trailing, PanelSurfaceVisualMetrics.notchWingOuterPadding)
                     .frame(width: wingWidth)
+                    .clipped()
             }
             .frame(height: 14)
             notchCompactSignalLine(content, temporalSnapshot: temporalSnapshot)
@@ -372,6 +390,7 @@ public struct PanelSurfaceView: View {
             HStack(spacing: 6) {
                 Image(systemName: "timer")
                     .font(.system(size: 11, weight: .semibold))
+                    .symbolRenderingMode(.monochrome)
                     .foregroundStyle(EryloPalette.amber)
                     .accessibilityHidden(true)
                 Text(SurfaceStrings.focusTimerLauncherTitle)
@@ -380,7 +399,7 @@ public struct PanelSurfaceView: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 2)
-            HStack(spacing: 2) {
+            HStack(spacing: PanelSurfaceVisualMetrics.focusTimerPresetSpacing) {
                 ForEach([15, 25, 50], id: \.self) { minutes in
                     Button("\(minutes)m") {
                         model.startFocusTimer(minutes: minutes)
@@ -396,11 +415,6 @@ public struct PanelSurfaceView: View {
                     .focused($focusedControl, equals: .focusTimerPreset(minutes))
                 }
             }
-            .padding(3)
-            .background(
-                Capsule(style: .continuous)
-                    .fill(EryloPalette.cloud.opacity(0.07))
-            )
             .opacity(model.isHitRegionSettled ? 1 : 0)
             .allowsHitTesting(model.isHitRegionSettled)
             .accessibilityHidden(!model.isHitRegionSettled)
@@ -774,7 +788,14 @@ public struct PanelSurfaceView: View {
 
             Spacer(minLength: 4)
             actionArea(content)
-                .padding(.horizontal, 19)
+                .frame(maxWidth: .infinity)
+                .padding(.leading, PanelSurfaceVisualMetrics.expandedActionLeadingInset)
+                .padding(
+                    .trailing,
+                    content.queue.items.isEmpty
+                        ? PanelSurfaceVisualMetrics.expandedActionLeadingInset
+                        : PanelSurfaceVisualMetrics.expandedActionTrailingInset
+                )
                 .padding(.bottom, 14)
         }
     }
@@ -979,7 +1000,8 @@ public struct PanelSurfaceView: View {
                 HStack(spacing: 7) {
                     Image(systemName: item.symbolName)
                         .font(.system(size: 9, weight: .semibold))
-                        .foregroundStyle(accentColor(item.accent))
+                        .symbolRenderingMode(.monochrome)
+                        .foregroundStyle(accentColor(item.semanticSymbolAccent))
                         .accessibilityHidden(true)
                     Text(item.kindLabel)
                         .font(.system(size: 10, weight: .medium))
@@ -1097,7 +1119,8 @@ public struct PanelSurfaceView: View {
     private func activitySymbol(_ item: ActivitySurfaceItem, size: CGFloat) -> some View {
         Image(systemName: item.symbolName)
             .font(.system(size: size, weight: .semibold))
-            .foregroundStyle(accentColor(item.accent))
+            .symbolRenderingMode(.monochrome)
+            .foregroundStyle(accentColor(item.semanticSymbolAccent))
             .frame(width: size + 6, height: size + 6)
             .matchedGeometryEffect(
                 id: SignalContinuityID(identity: item.identity, element: .symbol),
@@ -1418,20 +1441,39 @@ private struct SurfaceActionButtonStyle: ButtonStyle {
 private struct FocusTimerPresetButtonStyle: ButtonStyle {
     let reduceMotion: Bool
 
+    private var shape: RoundedRectangle {
+        RoundedRectangle(
+            cornerRadius: PanelSurfaceVisualMetrics.focusTimerPresetCornerRadius,
+            style: .continuous
+        )
+    }
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 10, weight: .semibold, design: .rounded))
             .monospacedDigit()
             .foregroundStyle(configuration.isPressed ? EryloPalette.cloud : EryloPalette.mist)
-            .frame(minWidth: 38, minHeight: 28)
+            .frame(
+                minWidth: PanelSurfaceVisualMetrics.focusTimerPresetMinimumWidth,
+                minHeight: PanelSurfaceVisualMetrics.focusTimerPresetMinimumHeight
+            )
             .background(
-                Capsule(style: .continuous)
+                shape
                     .fill(
                         configuration.isPressed
-                            ? EryloPalette.amber.opacity(0.24)
-                            : Color.clear
+                            ? EryloPalette.amber.opacity(0.18)
+                            : EryloPalette.cloud.opacity(0.045)
                     )
+                    .overlay {
+                        shape.stroke(
+                            configuration.isPressed
+                                ? EryloPalette.amber.opacity(0.34)
+                                : EryloPalette.cloud.opacity(0.12),
+                            lineWidth: 0.5
+                        )
+                    }
             )
+            .contentShape(shape)
             .scaleEffect(!reduceMotion && configuration.isPressed ? 0.97 : 1)
             .animation(
                 reduceMotion ? nil : .easeOut(duration: 0.08),

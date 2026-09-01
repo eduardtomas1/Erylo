@@ -445,7 +445,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
 
     private func synchronizeExpandedInteraction() {
         let policy = expandedInteractionPolicy
-        panel.allowsKeyInteraction = policy.allowsKeyInteraction
+        applyKeyInteractionEligibility(policy.allowsKeyInteraction)
 
         if policy.requiresMouseDownMonitoring {
             expandedMouseDownMonitor.start { [weak self] screenPoint in
@@ -458,7 +458,27 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
 
     private func retireExpandedInteraction() {
         expandedMouseDownMonitor.stop()
-        panel.allowsKeyInteraction = false
+        applyKeyInteractionEligibility(false)
+    }
+
+    private func applyKeyInteractionEligibility(_ allowsKeyInteraction: Bool) {
+        panel.allowsKeyInteraction = allowsKeyInteraction
+        let retirementAction = PanelKeyRetirementPolicy.action(
+            allowsKeyInteraction: allowsKeyInteraction,
+            panelIsKey: panel.isKeyWindow,
+            isWindowPresented: isVisible,
+            wantsSurfacePresentation: wantsSurfacePresentation
+        )
+        guard retirementAction != .none else { return }
+
+        pendingDeliberateKeyRequest = nil
+        model.retireDeliberateControlFocus()
+        panel.orderOut(nil)
+        if retirementAction == .orderOutAndRestore {
+            // Preserve a still-demanded nonactivating surface without making it
+            // key again now that keyboard eligibility has been withdrawn.
+            panel.orderFrontRegardless()
+        }
     }
 
     private func handleExpandedMouseDown(screenPoint: CGPoint) {

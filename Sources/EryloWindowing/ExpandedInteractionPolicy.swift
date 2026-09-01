@@ -13,6 +13,28 @@ package enum PanelEscapeDecision: Equatable, Sendable {
     case retireKeyFocus
 }
 
+package enum PanelKeyRetirementAction: Equatable, Sendable {
+    case none
+    case orderOut
+    case orderOutAndRestore
+}
+
+/// AppKit retires key status as part of window ordering. Its key-resignation
+/// override is a notification hook and is never a supported direct operation.
+package enum PanelKeyRetirementPolicy {
+    package static func action(
+        allowsKeyInteraction: Bool,
+        panelIsKey: Bool,
+        isWindowPresented: Bool,
+        wantsSurfacePresentation: Bool
+    ) -> PanelKeyRetirementAction {
+        guard panelIsKey, !allowsKeyInteraction else { return .none }
+        return isWindowPresented && wantsSurfacePresentation
+            ? .orderOutAndRestore
+            : .orderOut
+    }
+}
+
 package enum DeliberatePanelFocusPolicy {
     package static func shouldFocusExistingControls(
         state: PanelPresentationState,

@@ -2413,6 +2413,7 @@ private struct SurfaceHarness {
             (ActivitySurfacePreviewCatalog.meeting, .meeting, SurfaceStrings.meetingKind, .standard, nil),
             (ActivitySurfacePreviewCatalog.volume, .volume, SurfaceStrings.volumeKind, .volumeLevel, SurfaceStrings.shortProgressValue(72)),
             (ActivitySurfacePreviewCatalog.volumeMuted, .volume, SurfaceStrings.volumeKind, .volumeMuted, SurfaceStrings.volumeMuted),
+            (ActivitySurfacePreviewCatalog.volumeUnmuted, .volume, SurfaceStrings.volumeKind, .volumeUnmuted, SurfaceStrings.shortProgressValue(64)),
             (ActivitySurfacePreviewCatalog.volumeOutput, .volume, SurfaceStrings.volumeKind, .volumeOutput, "Studio Display"),
             (ActivitySurfacePreviewCatalog.media, .media, SurfaceStrings.mediaKind, .standard, SurfaceStrings.shortProgressValue(41)),
             (ActivitySurfacePreviewCatalog.file, .file, SurfaceStrings.fileKind, .standard, nil),
@@ -2445,15 +2446,23 @@ private struct SurfaceHarness {
         }
 
         do {
-            guard let levelPresented = try ActivitySurfacePreviewCatalog.volume.snapshot().current,
+            guard let timerPresented = try ActivitySurfacePreviewCatalog.timer.snapshot().current,
+                  let levelPresented = try ActivitySurfacePreviewCatalog.volume.snapshot().current,
                   let mutedPresented = try ActivitySurfacePreviewCatalog.volumeMuted.snapshot().current,
+                  let unmutedPresented = try ActivitySurfacePreviewCatalog.volumeUnmuted.snapshot().current,
                   let outputPresented = try ActivitySurfacePreviewCatalog.volumeOutput.snapshot().current else {
-                check(false, "production-faithful Volume previews provide current content")
+                check(false, "production-faithful Timer and Volume previews provide current content")
                 return
             }
+            let timer = ActivitySurfaceItem(timerPresented)
             let level = ActivitySurfaceItem(levelPresented)
             let muted = ActivitySurfaceItem(mutedPresented)
+            let unmuted = ActivitySurfaceItem(unmutedPresented)
             let output = ActivitySurfaceItem(outputPresented)
+            check(
+                timer.semanticSymbolAccent == .amber,
+                "countdown timer keeps its semantic Amber glyph independently of attachment"
+            )
             check(
                 level.title == "Volume"
                     && level.shortProgressValue == SurfaceStrings.shortProgressValue(72),
@@ -2512,28 +2521,61 @@ private struct SurfaceHarness {
                 displayGeometry: notchedDisplay,
                 scheduler: ManualOneShotScheduler()
             )
+            let levelModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewCatalog.volume,
+                displayGeometry: notchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            let levelWingWidth = (
+                levelModel.layout.surfaceFrame.width
+                    - (notchedDisplay.topEdgeOcclusion?.frame.width ?? 0)
+            ) / 2
             check(
-                mutedModel.layout.surfaceFrame.width >= 304,
-                "notch-native Muted state reserves enough wing width for unclipped copy"
+                mutedModel.layout.surfaceFrame.width >= 340
+                    && levelWingWidth
+                        >= PanelSurfaceVisualMetrics.minimumCompactNotchWingWidth,
+                "notch-native signal states reserve enough wing width for padded glyph and copy"
+            )
+            check(
+                (12...16).contains(PanelSurfaceVisualMetrics.notchWingOuterPadding)
+                    && PanelSurfaceVisualMetrics.notchWingCameraClearance > 0
+                    && PanelSurfaceVisualMetrics.notchWingContentWidth(for: levelWingWidth) >= 28,
+                "notch wings keep safe outer padding, camera clearance, and useful content width"
             )
 
-            let unmutedRequest = ActivityRequest(
-                identifier: "preview.volume.unmuted",
-                source: ActivitySource.volume.rawValue,
-                kind: ActivityKind.volume.rawValue,
-                priority: ActivityPriority.high.rawValue,
-                title: "Sound on",
-                progress: 0.64,
-                temporalProgress: nil,
-                presentationRole: .volumeUnmuted
-            )
-            let unmuted = ActivitySurfaceItem(
-                PresentedActivity(
-                    activity: try Activity(validating: unmutedRequest),
-                    submissionSequence: 1,
-                    revision: 1
+            let longOutputName = "Conference Room Display With an Intentionally Long Name"
+            let longOutputScenario = ActivitySurfacePreviewScenario(
+                name: "Long Volume output name",
+                state: .compact,
+                current: ActivityRequest(
+                    identifier: "preview.volume.output.long",
+                    source: ActivitySource.volume.rawValue,
+                    kind: ActivityKind.volume.rawValue,
+                    priority: ActivityPriority.high.rawValue,
+                    title: longOutputName,
+                    detail: SurfaceStrings.volumeOutputChanged,
+                    temporalProgress: nil,
+                    presentationRole: .volumeOutputChanged
                 )
             )
+            let longOutputModel = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: longOutputScenario,
+                displayGeometry: notchedDisplay,
+                scheduler: ManualOneShotScheduler()
+            )
+            let longOutputWingWidth = (
+                longOutputModel.layout.surfaceFrame.width
+                    - (notchedDisplay.topEdgeOcclusion?.frame.width ?? 0)
+            ) / 2
+            let longOutputItem = try longOutputScenario.snapshot().current.map(ActivitySurfaceItem.init)
+            check(
+                longOutputWingWidth == 82
+                    && PanelSurfaceVisualMetrics.notchWingContentWidth(for: longOutputWingWidth) == 62
+                    && longOutputItem?.notchCompactValue == longOutputName
+                    && longOutputItem?.accessibilitySummary.contains(longOutputName) == true,
+                "long output names retain full semantics inside one bounded truncating notch wing"
+            )
+
             check(
                 unmuted.title == SurfaceStrings.volumeUnmuted
                     && unmuted.notchCompactValue == SurfaceStrings.volumeUnmuted
@@ -2552,6 +2594,7 @@ private struct SurfaceHarness {
                 completion.composition == .timerCompletion
                     && completion.symbolName == "checkmark.circle.fill"
                     && completion.accent == .mint
+                    && completion.semanticSymbolAccent == .mint
                     && completion.title == "Focus complete"
                     && completion.signalPrincipalValue == "Focus complete"
                     && !completion.hasSemanticProgress,
@@ -2650,6 +2693,18 @@ private struct SurfaceHarness {
                 queuedActionLayout.surfaceFrame.height
                     <= PanelMetrics.feasibility.maximumSize.height,
                 "worst-case standard queue and action remain inside the fixed maximum envelope"
+            )
+            check(
+                PanelSurfaceVisualMetrics.expandedActionTrailingInset
+                    > PanelSurfaceVisualMetrics.expandedActionLeadingInset,
+                "queued expanded action reserves an explicit trailing safety inset"
+            )
+            check(
+                PanelSurfaceVisualMetrics.notchlessLightShadowOpacity
+                    < PanelSurfaceVisualMetrics.notchlessDarkShadowOpacity
+                    && PanelSurfaceVisualMetrics.notchlessLightShadowRadius
+                        < PanelSurfaceVisualMetrics.notchlessDarkShadowRadius,
+                "light notchless surfaces use a quieter shadow than dark surfaces"
             )
 
             let clampedQueuedActionModel = try ActivitySurfacePreviewCatalog.makeModel(
@@ -2815,7 +2870,7 @@ private struct SurfaceHarness {
             ),
             "degraded stream state has honest fallback copy"
         )
-        check(ActivitySurfacePreviewCatalog.representative.count == 15, "preview seam includes launcher, timer lifecycle, and representative Volume states")
+        check(ActivitySurfacePreviewCatalog.representative.count == 16, "preview seam includes launcher, timer lifecycle, and representative Volume states")
 
         do {
             guard let current = try ActivitySurfacePreviewCatalog.generic.snapshot().current else {
@@ -3025,6 +3080,13 @@ private struct SurfaceHarness {
         check(model.startFocusTimer(minutes: 50), "launcher accepts the 50-minute preset")
         check(!model.startFocusTimer(minutes: 30), "launcher rejects non-preset durations")
         check(launchedMinutes == [15, 25, 50], "launcher routes only the three closed preset values")
+        check(
+            PanelSurfaceVisualMetrics.focusTimerPresetSpacing > 0
+                && PanelSurfaceVisualMetrics.focusTimerPresetMinimumWidth * 3
+                    + PanelSurfaceVisualMetrics.focusTimerPresetSpacing * 2
+                    <= PanelMetrics.feasibility.notchlessTimerLauncherSize.width,
+            "three routed timer presets retain visibly separate bounded control regions"
+        )
         check(
             model.accessibility.hint == SurfaceStrings.focusTimerLauncherHint,
             "launcher exposes an accurate VoiceOver choice hint"
@@ -4675,6 +4737,12 @@ private func writeNativeVisualQA(to directory: URL) throws {
         NativeVisualQAFixture(
             filename: "erylo-volume-muted-notched.png",
             scenario: { ActivitySurfacePreviewCatalog.volumeMuted },
+            geometry: notchedGeometry,
+            desktop: .dark
+        ),
+        NativeVisualQAFixture(
+            filename: "erylo-volume-unmuted-notched.png",
+            scenario: { ActivitySurfacePreviewCatalog.volumeUnmuted },
             geometry: notchedGeometry,
             desktop: .dark
         ),

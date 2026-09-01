@@ -34,6 +34,7 @@ Sources/EryloSurface/ActivitySurfaceContent.swift
 Sources/EryloSurface/ActivitySurfacePreview.swift
 Sources/EryloSurface/PanelSurfaceModel.swift
 Sources/EryloSurface/PanelSurfaceView.swift
+Sources/EryloSurface/PanelSurfaceVisualMetrics.swift
 Sources/EryloSurface/SurfaceActivityModel.swift
 Sources/EryloSurface/SurfaceStrings.swift
 Sources/EryloTrust/Diagnostics.swift

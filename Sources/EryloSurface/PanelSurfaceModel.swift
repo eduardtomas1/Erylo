@@ -163,15 +163,21 @@ public final class PanelSurfaceModel {
     }
 
     private var minimumNotchWingWidth: CGFloat {
-        if showsTemporalTimer { return 48 }
+        if showsTemporalTimer {
+            return PanelSurfaceVisualMetrics.minimumCompactNotchWingWidth
+        }
         return switch activityModel.current?.activity.presentation.presentationRole {
         case .volumeMuted, .volumeUnmuted:
-            42
+            PanelSurfaceVisualMetrics.statusCompactNotchWingWidth
         case .volumeOutputChanged:
             82
         case .standard:
-            currentSurfaceItem?.composition == .standard ? 76 : 0
-        case .completionAcknowledgement, .volumeLevelChanged, .none:
+            currentSurfaceItem?.composition == .standard
+                ? 76
+                : PanelSurfaceVisualMetrics.minimumCompactNotchWingWidth
+        case .volumeLevelChanged:
+            PanelSurfaceVisualMetrics.minimumCompactNotchWingWidth
+        case .completionAcknowledgement, .none:
             0
         }
     }

@@ -1,6 +1,6 @@
 # Trust, settings, onboarding, and diagnostics foundation
 
-The trust-domain and SwiftUI settings targets are mounted by `EryloAppRuntime` in one contained native settings window. First launch gives a concise explanation of the top-edge surface, the `Control-Option-Command-E` shortcut, and the three shipping activities. Its primary action starts a real 25-minute Focus Timer through the same application command path as the menu and completes setup; Continue completes setup without starting work. The window activates the accessory app only when it is intentionally presented; the passive panel remains nonactivating.
+The trust-domain and SwiftUI settings targets are mounted by `EryloAppRuntime` in one contained native settings window. First launch presents a focused welcome surface that explains the three shipping utility categories, makes no permission request, and performs no utility work. Its single Continue action completes setup and reveals the grouped Settings form. The window activates the accessory app only when it is intentionally presented; the passive panel remains nonactivating.
 
 ## Safe defaults and persistence
 
@@ -58,7 +58,7 @@ provider and retired-expiry cleanup. An explicit successful Volume enable report
 **Volume is on — adjust it to see Erylo** beside that row; provider/start failures
 also stay row-local, while persisted startup restore produces no feedback banner.
 Focus Timer is owned separately by `ApplicationRuntime` and starts only from a
-deliberate menu or first-run command. Settings describes it without a dead
+deliberate menu choice or the Settings timer action. Settings presents it without a dead
 module toggle. Calendar, media, File Hold, and local-integration rows are omitted
 and remain defensively rejected by the model, so they cannot request
 permission, open a socket or file, invoke media automation, or perform network work.
@@ -85,7 +85,7 @@ The schema has no message, path, URL, file, media, meeting, attendee, payload, t
 
 `TrustSettingsView` and `TrustSettingsViewModel` live in `EryloSettingsUI`. The view uses a grouped native `Form`, semantic macOS colors, native toggles, pickers, buttons, confirmation, and save panels with explicit accessibility labels and hints. It presents only Battery and Volume as configurable modules, hides unsupported behavior controls, and removes roadmap and diagnostic-consent rows. Module enable guidance and failures render beside the row that caused them. No focus binding, application activation, custom keyboard interception, or permission work occurs during browsing. Display choices use `NSScreen.localizedName`, are keyed by stable UUID, deduplicated, and bounded; names are stripped of controls and capped before `ForEach` and VoiceOver see them. Preferred choices include only enabled, connected displays. A saved unavailable preference remains a visible, valid picker state with explicit fail-closed copy. Async results carry local sequence numbers so an older completion cannot overwrite newer UI intent.
 
-`EryloAppRuntime` owns a native status item and exactly one reusable settings window. The compact menu exposes Show/Hide Erylo, one stateful Focus Timer submenu, Settings, Quit, and Check for Updates only when the signed-feed updater has safely started. Inapplicable Cancel and instructional shortcut rows are omitted. Menu and first-run actions route back through the runtime, repeated Quit requests collapse to one termination request, and shutdown removes the status item/window and terminally drains trust settings before the panel, broker, and updater are released.
+`EryloAppRuntime` owns a native status item and exactly one reusable settings window. The compact menu exposes Show/Hide Erylo, one stateful Focus Timer submenu, Settings, Quit, and Check for Updates only when the signed-feed updater has safely started. Inapplicable Cancel and instructional shortcut rows are omitted. Menu and Settings actions route back through the runtime, repeated Quit requests collapse to one termination request, and shutdown removes the status item/window and terminally drains trust settings before the panel, broker, and updater are released.
 
 ## Verification boundary
 

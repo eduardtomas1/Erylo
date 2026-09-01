@@ -90,8 +90,6 @@ public struct TrustSettingsView: View {
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.top, 7)
-                .accessibilityLabel(TrustAccessibilityCopy.onboardingLabel)
-                .accessibilityHint(TrustAccessibilityCopy.onboardingHint)
 
             VStack(alignment: .leading, spacing: 18) {
                 onboardingFeature(

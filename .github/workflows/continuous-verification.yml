@@ -98,13 +98,27 @@ jobs:
         if: matrix.target == 'EryloTrustTests'
         env:
           ERYLO_SETTINGS_VISUAL_QA_DIRECTORY: ${{ runner.temp }}/erylo-native-settings-visual-qa
-        run: .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
+        run: |
+          .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
+          shopt -s nullglob
+          settings_visual_files=("$ERYLO_SETTINGS_VISUAL_QA_DIRECTORY"/*.png)
+          if (( ${#settings_visual_files[@]} != 4 )); then
+            echo "Expected exactly 4 native settings QA images; found ${#settings_visual_files[@]}." >&2
+            exit 1
+          fi
 
       - name: Run EryloSurfaceTests and render native visual QA
         if: matrix.target == 'EryloSurfaceTests'
         env:
           ERYLO_VISUAL_QA_DIRECTORY: ${{ runner.temp }}/erylo-native-visual-qa
-        run: .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
+        run: |
+          .github/scripts/run-ci-shard.sh target "${{ matrix.target }}"
+          shopt -s nullglob
+          surface_visual_files=("$ERYLO_VISUAL_QA_DIRECTORY"/*.png)
+          if (( ${#surface_visual_files[@]} != 10 )); then
+            echo "Expected exactly 10 native surface QA images; found ${#surface_visual_files[@]}." >&2
+            exit 1
+          fi
 
       - name: Upload native visual QA
         if: ${{ !cancelled() && matrix.target == 'EryloSurfaceTests' }}
@@ -112,7 +126,7 @@ jobs:
         with:
           name: erylo-native-visual-qa-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/erylo-native-visual-qa/*.png
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
           compression-level: 0
           overwrite: false
@@ -123,7 +137,7 @@ jobs:
         with:
           name: erylo-native-settings-visual-qa-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/erylo-native-settings-visual-qa/*.png
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
           compression-level: 0
           overwrite: false

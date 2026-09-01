@@ -137,6 +137,8 @@ package enum ApplicationControlCopy {
     package static let cancelFocus = "Cancel Timer"
     package static let startFocusHint = "Starts a new focus timer and replaces any focus timer already running."
     package static let replaceFocusHint = "Replaces the current focus timer with this duration."
+    package static let focusMenuHint = "Opens timer duration choices."
+    package static let activeFocusMenuHint = "Opens timer duration choices and Cancel Timer."
     package static let cancelFocusHint = "Cancels the current focus timer. It has no effect when no focus timer is running."
     package static let settings = "Settings…"
     package static let finishSetup = "Finish Setup…"
@@ -308,8 +310,8 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
                 title: focusTimerTitle,
                 accessibilityLabel: focusTimerTitle,
                 accessibilityHint: focusTimer.isActive
-                    ? ApplicationControlCopy.replaceFocusHint
-                    : ApplicationControlCopy.startFocusHint,
+                    ? ApplicationControlCopy.activeFocusMenuHint
+                    : ApplicationControlCopy.focusMenuHint,
                 accessibilityIdentifier: "erylo.focus-timer.menu",
                 isEnabled: focusCommandsAreAdmitted,
                 children: focusTimerItems

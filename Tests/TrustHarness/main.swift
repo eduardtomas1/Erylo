@@ -1207,7 +1207,6 @@ private final class TrustHarness {
             + EryloModule.allCases.map(TrustAccessibilityCopy.moduleLabel)
         let hints = [
             TrustAccessibilityCopy.onboardingHint,
-            TrustAccessibilityCopy.onboardingStartFocusHint,
             TrustAccessibilityCopy.focusTimerHint,
             TrustAccessibilityCopy.displayScopePickerHint,
             TrustAccessibilityCopy.preferredDisplayPickerHint,
@@ -1232,9 +1231,8 @@ private final class TrustHarness {
         )
         check(
             !TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("hover")
-                && TrustAccessibilityCopy.onboardingInteractionExplanation.contains("useful secondary detail")
-                && TrustAccessibilityCopy.onboardingStartFocusHint.contains("only when"),
-            "onboarding copy limits Peek claims and preserves command-admission truth"
+                && TrustAccessibilityCopy.onboardingInteractionExplanation.contains("useful secondary detail"),
+            "onboarding copy limits Peek claims to activities with useful secondary detail"
         )
         let mark = EryloSignalMarkGeometry.path(
             in: CGRect(x: 0, y: 0, width: 36, height: 20)

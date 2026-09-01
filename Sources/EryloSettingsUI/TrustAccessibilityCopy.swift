@@ -4,8 +4,9 @@ public enum TrustAccessibilityCopy {
     // Retained for clients compiled against the original contained settings UI.
     public static let productPromiseLabel = "Erylo product promise"
     public static let productPromiseHint = "Explains what Erylo does and how it protects focus and privacy."
-    public static let onboardingLabel = "How to use Erylo"
-    public static let onboardingHint = "Explains where Erylo appears and where to find its controls."
+    public static let onboardingLabel = "Erylo introduction"
+    public static let onboardingHint = "Summarizes the quiet top-edge signal surface."
+    @available(*, deprecated, message: "The shipping first-run screen no longer starts a timer.")
     public static let onboardingStartFocusHint = "Starts a 25 minute Focus Timer and finishes setup only when the timer is accepted."
     public static let onboardingSurfaceExplanation = "A quiet signal surface at the top of your display, visible only when something deserves your attention."
     public static let onboardingControlExplanation = "Start Focus Timer from the menu bar. Battery and Volume stay off until you enable them in Settings."

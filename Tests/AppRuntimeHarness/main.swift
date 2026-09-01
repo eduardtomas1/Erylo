@@ -647,7 +647,7 @@ private struct AppRuntimeHarness {
                     && !model.settings.onboardingCompleted
                     && plane.readinessSnapshot.state == .setupRequired
                     && model.onboardingActionFailure?.contains("could not start") == true,
-                "rejected first-run command keeps setup visible with inline failure"
+                "rejected optional setup command keeps setup visible with inline failure"
             )
             commandAdmission = true
             let acceptedStart = await model.startFocusTimerAndCompleteOnboarding {
@@ -659,7 +659,7 @@ private struct AppRuntimeHarness {
                     && model.onboardingActionFailure == nil
                     && plane.readinessSnapshot.state == .ready
                     && plane.readinessSnapshot.notices.isEmpty,
-                "accepted first-run command persists onboarding and clears setup-required readiness"
+                "accepted optional setup command persists onboarding and clears setup-required readiness"
             )
             await model.setModuleEnabled(.timer, enabled: true)
             check(await settingsOwner.moduleMutationCount == 0, "unavailable timer control cannot reach provider mutation")
@@ -1923,6 +1923,7 @@ private struct AppRuntimeHarness {
                 $0.kind == .submenu
                     && $0.title == ApplicationControlCopy.focusTimer
                     && $0.children.count == 3
+                    && $0.accessibilityHint == ApplicationControlCopy.focusMenuHint
             }),
             "idle presets live under one native Focus Timer submenu"
         )
@@ -1932,7 +1933,10 @@ private struct AppRuntimeHarness {
         )
         check(
             activeMenu.items.contains(where: {
-                $0.kind == .submenu && $0.title.contains("24:59") && $0.isEnabled
+                $0.kind == .submenu
+                    && $0.title.contains("24:59")
+                    && $0.isEnabled
+                    && $0.accessibilityHint == ApplicationControlCopy.activeFocusMenuHint
             }),
             "active status menu exposes remaining time in the actionable submenu title"
         )

@@ -388,11 +388,11 @@ public struct PanelSurfaceView: View {
     private func focusTimerLauncher() -> some View {
         HStack(spacing: 9) {
             HStack(spacing: 6) {
-                Image(systemName: "timer")
-                    .font(.system(size: 11, weight: .semibold))
-                    .symbolRenderingMode(.monochrome)
-                    .foregroundStyle(Color.white)
-                    .colorMultiply(EryloPalette.amber)
+                SurfaceSemanticSymbol(
+                    systemName: "timer",
+                    font: .system(size: 11, weight: .semibold),
+                    color: EryloPalette.amber
+                )
                     .accessibilityHidden(true)
                 Text(SurfaceStrings.focusTimerLauncherTitle)
                     .font(.system(size: 11, weight: .semibold))
@@ -999,11 +999,11 @@ public struct PanelSurfaceView: View {
 
             ForEach(visibleItems, id: \.revision) { item in
                 HStack(spacing: 7) {
-                    Image(systemName: item.symbolName)
-                        .font(.system(size: 9, weight: .semibold))
-                        .symbolRenderingMode(.monochrome)
-                        .foregroundStyle(Color.white)
-                        .colorMultiply(accentColor(item.semanticSymbolAccent))
+                    SurfaceSemanticSymbol(
+                        systemName: item.symbolName,
+                        font: .system(size: 9, weight: .semibold),
+                        color: accentColor(item.semanticSymbolAccent)
+                    )
                         .accessibilityHidden(true)
                     Text(item.kindLabel)
                         .font(.system(size: 10, weight: .medium))
@@ -1119,11 +1119,11 @@ public struct PanelSurfaceView: View {
     }
 
     private func activitySymbol(_ item: ActivitySurfaceItem, size: CGFloat) -> some View {
-        Image(systemName: item.symbolName)
-            .font(.system(size: size, weight: .semibold))
-            .symbolRenderingMode(.monochrome)
-            .foregroundStyle(Color.white)
-            .colorMultiply(accentColor(item.semanticSymbolAccent))
+        SurfaceSemanticSymbol(
+            systemName: item.symbolName,
+            font: .system(size: size, weight: .semibold),
+            color: accentColor(item.semanticSymbolAccent)
+        )
             .frame(width: size + 6, height: size + 6)
             .matchedGeometryEffect(
                 id: SignalContinuityID(identity: item.identity, element: .symbol),
@@ -1371,6 +1371,30 @@ private struct SurfaceSignalLine: View {
         .frame(maxWidth: .infinity)
         .frame(height: height)
         .accessibilityHidden(true)
+    }
+}
+
+/// Renders a fixed semantic color through an SF Symbol alpha mask. AppKit's
+/// opaque notch snapshot path can resolve a symbol `ShapeStyle` as primary
+/// grayscale; a literal color layer behind the mask keeps the visible pixels
+/// topology-independent while preserving the native symbol geometry.
+private struct SurfaceSemanticSymbol: View {
+    let systemName: String
+    let font: Font
+    let color: Color
+
+    var body: some View {
+        Image(systemName: systemName)
+            .font(font)
+            .symbolRenderingMode(.monochrome)
+            .foregroundStyle(Color.clear)
+            .overlay {
+                color.mask {
+                    Image(systemName: systemName)
+                        .font(font)
+                        .symbolRenderingMode(.monochrome)
+                }
+            }
     }
 }
 

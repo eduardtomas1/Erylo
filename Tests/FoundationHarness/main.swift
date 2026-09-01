@@ -23,7 +23,7 @@ enum FoundationHarnessMain {
         await harness.verifyCoordinatorLifecycle()
         await harness.verifyPassiveAnnouncementDelivery()
         await harness.verifyDemandDrivenPanelLifecycle()
-        await harness.verifyComposedDemandPreservation()
+        await harness.verifyComposedDemandContraction()
         await harness.verifyDisabledProvider()
         harness.finish()
     }
@@ -46,8 +46,8 @@ private struct FoundationHarness {
         check(hidden.send(.primaryAction) == .compact, "primary shortcut reveals a hidden surface")
 
         var hiddenDrop = PanelStateMachine()
-        check(hiddenDrop.send(.dragEntered) == .dropTarget, "delivered hidden drag entry reveals the honest drop target")
-        check(hiddenDrop.send(.dragExited) == .hidden, "hidden drag exit restores invisible rest")
+        check(hiddenDrop.send(.dragEntered) == .dropTarget, "dormant drop reducer records a hidden drag entry")
+        check(hiddenDrop.send(.dragExited) == .hidden, "dormant hidden drag exit restores invisible rest")
 
         var activityVisibility = PanelStateMachine()
         check(activityVisibility.updateActivityAvailability(true) == .compact, "first activity reveals compact state")
@@ -1345,7 +1345,7 @@ private struct FoundationHarness {
         check(!events.isRunning && !events.isPointerMonitoringEnabled, "shutdown rejects pending or replayed presentation demand")
     }
 
-    mutating func verifyComposedDemandPreservation() async {
+    mutating func verifyComposedDemandContraction() async {
         let broker = ActivityBroker()
         let activityModel = SurfaceActivityModel(broker: broker)
         let events = FakeLifecycleEventSource()
@@ -1402,41 +1402,6 @@ private struct FoundationHarness {
         events.emit(.primaryShortcut)
         check(panel.state == .hidden && !panel.isPresented, "second shortcut hides the retained empty surface")
         check(!events.isPointerMonitoringEnabled, "empty surface contraction removes final pointer monitoring")
-
-        do {
-            _ = try await broker.submit(request("drop-exit"))
-        } catch {
-            check(false, "drop-exit activity validates")
-        }
-        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
-        panel.send(.dragEntered)
-        check(panel.state == .dropTarget, "drag entry demands the composed drop target")
-        if let identity = await broker.snapshot().current?.activity.identity {
-            _ = await broker.cancel(identity)
-        }
-        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
-        check(panel.state == .dropTarget && panel.isPresented, "activity loss preserves active drop-target demand")
-        check(events.isPointerMonitoringEnabled, "active drop target retains pointer monitoring after activity loss")
-        panel.send(.dragExited)
-        check(panel.state == .hidden && !panel.isPresented, "drag exit restores hidden after activity loss")
-        check(!events.isPointerMonitoringEnabled, "drag exit removes final pointer monitoring")
-
-        do {
-            _ = try await broker.submit(request("drop-complete"))
-        } catch {
-            check(false, "drop-complete activity validates")
-        }
-        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
-        panel.send(.dragEntered)
-        if let identity = await broker.snapshot().current?.activity.identity {
-            _ = await broker.cancel(identity)
-        }
-        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
-        panel.send(.dropCompleted)
-        check(panel.state == .expanded && panel.isPresented, "drop completion settles into demanded expanded state")
-        check(events.isPointerMonitoringEnabled, "completed empty drop remains monitored while expanded")
-        events.emit(.primaryShortcut)
-        check(panel.state == .hidden && !events.isPointerMonitoringEnabled, "one shortcut contracts the completed empty drop")
 
         await coordinator.shutdown()
         check(!events.isRunning && !events.isPointerMonitoringEnabled, "composed demand fixture shuts down with zero event work")

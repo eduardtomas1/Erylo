@@ -1634,12 +1634,13 @@ private struct SurfaceHarness {
         ])
         let events = FakeLifecycleEventSource()
         let registry = SharedModelPanelRegistry()
+        let enabledPolicy = DisplayPolicy(surfaceScope: .allAvailable)
         let coordinator = makeCoordinator(
             displays: displays,
             events: events,
             registry: registry,
             model: model,
-            policy: DisplayPolicy(surfaceScope: .allAvailable)
+            policy: enabledPolicy
         )
         await coordinator.startAndWait()
         guard await beginGatedAction(
@@ -1668,7 +1669,7 @@ private struct SurfaceHarness {
 
         var enableReturned = false
         let enableTask = Task { @MainActor in
-            await coordinator.updateAndWait(policy: .safeDefault)
+            await coordinator.updateAndWait(policy: enabledPolicy)
             enableReturned = true
         }
         for _ in 0..<50 { await Task.yield() }
@@ -3054,9 +3055,10 @@ private struct SurfaceHarness {
             )
             let compactTarget = geometryModel.layout.hitRegion
             check(
-                geometryModel.interactionHitRegion
-                    == launcherHitRegion.intersecting(compactTarget),
-                "same-state launcher shrink immediately constrains the native click region"
+                launcherHitRegion.intersecting(compactTarget) == .empty
+                    && geometryModel.interactionHitRegion == .empty
+                    && !geometryModel.isHitRegionSettled,
+                "disjoint launcher shrink admits no native click region while settling"
             )
             geometryScheduler.runAll()
             check(
@@ -3230,9 +3232,17 @@ private struct SurfaceHarness {
                     title: "Build succeeded"
                 )
             )
+            let titleOnlyDisplay = DisplayGeometry(
+                frame: display.frame,
+                visibleFrame: display.visibleFrame,
+                backingScaleFactor: display.backingScaleFactor,
+                topEdgeOcclusion: TopEdgeOcclusion(
+                    frame: CGRect(x: 610, y: 856, width: 220, height: 44)
+                )
+            )
             let titleOnlyModel = try ActivitySurfacePreviewCatalog.makeModel(
                 scenario: titleOnly,
-                displayGeometry: display,
+                displayGeometry: titleOnlyDisplay,
                 scheduler: ManualOneShotScheduler()
             )
             titleOnlyModel.send(.hoverBegan)
@@ -3241,7 +3251,7 @@ private struct SurfaceHarness {
                 titleOnlyModel.state == .compact,
                 "standard title-only activity opens neither redundant Peek nor empty Expanded"
             )
-            let titleWingWidth = display.topEdgeOcclusion.map {
+            let titleWingWidth = titleOnlyDisplay.topEdgeOcclusion.map {
                 (titleOnlyModel.layout.surfaceFrame.width - $0.frame.width) / 2
             }
             check(

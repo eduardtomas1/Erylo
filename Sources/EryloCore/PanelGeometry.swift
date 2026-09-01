@@ -109,6 +109,16 @@ public enum HitRegion: Equatable, Sendable {
                     result.append(component)
                 }
             }
+            let sharedBounds = components
+                .dropFirst()
+                .reduce(components[0].rect) { bounds, component in
+                    bounds.intersection(component.rect)
+                }
+            guard !sharedBounds.isNull,
+                  sharedBounds.width > 0,
+                  sharedBounds.height > 0 else {
+                return .empty
+            }
             return components.count == 1
                 ? .roundedRectangle(
                     components[0].rect,

@@ -363,6 +363,13 @@ public final class PanelSurfaceModel {
         if resolvedInitialState == .hidden, activityModel.current != nil {
             initialStateMachine.updateActivityAvailability(true)
         }
+        if initialStateMachine.state == .compact,
+           activityModel.current.map(ActivitySurfaceItem.init)?.composition == .timerCompletion {
+            // A lazily created panel may receive an already-current completion
+            // before its observer is installed. Mirror activityDidChange so its
+            // routed Done control is visible on the first presented frame.
+            initialStateMachine.send(.hoverBegan)
+        }
         stateMachine = initialStateMachine
         renderedState = initialStateMachine.state
         interactionHitRegion = .empty

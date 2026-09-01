@@ -304,6 +304,18 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
         case let .active(remainingText):
             ApplicationControlCopy.remainingFocus(remainingText)
         }
+        let settingsTitle: String = switch readiness.state {
+        case .starting:
+            runtime.coreCommandsAreAdmitted
+                ? ApplicationControlCopy.restoringSettings
+                : ApplicationControlCopy.startingSettings
+        case .setupRequired:
+            ApplicationControlCopy.finishSetup
+        case .needsAttention:
+            ApplicationControlCopy.reviewSettings
+        case .ready:
+            ApplicationControlCopy.settings
+        }
         items.append(contentsOf: [
             ApplicationMenuItemDescriptor(
                 kind: .submenu,
@@ -319,18 +331,7 @@ package struct ApplicationMenuDescriptor: Equatable, Sendable {
             ApplicationMenuItemDescriptor(kind: .separator, title: ""),
             ApplicationMenuItemDescriptor(
                 kind: .command(.showSettings),
-                title: switch readiness.state {
-                case .starting:
-                    runtime.coreCommandsAreAdmitted
-                        ? ApplicationControlCopy.restoringSettings
-                        : ApplicationControlCopy.startingSettings
-                case .setupRequired:
-                    ApplicationControlCopy.finishSetup
-                case .needsAttention:
-                    ApplicationControlCopy.reviewSettings
-                case .ready:
-                    ApplicationControlCopy.settings
-                },
+                title: settingsTitle,
                 keyEquivalent: settingsCanOpen ? "," : "",
                 accessibilityLabel: "Erylo Settings",
                 accessibilityHint: readiness.state == .starting

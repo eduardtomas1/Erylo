@@ -34,8 +34,8 @@ lives at the top edge of the display, where it can be checked without opening
 an app, moving a window, or breaking concentration.
 
 The running timer stays compact on hover because a larger duplicate adds no
-value. Click it or press <kbd>Control</kbd> + <kbd>Option</kbd> +
-<kbd>Command</kbd> + <kbd>E</kbd> for the expanded controls. Cancel there or
+value. Click it or press <kbd>Control</kbd> + <kbd>Command</kbd> + <kbd>E</kbd>
+for the expanded controls. Cancel there or
 directly from the menu. When the session ends, Erylo briefly opens a readable
 **Focus complete** acknowledgement, then disappears.
 

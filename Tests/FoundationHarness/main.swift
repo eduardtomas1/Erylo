@@ -17,8 +17,11 @@ enum FoundationHarnessMain {
         harness.verifyPanelGeometry()
         harness.verifyDisplayPolicy()
         harness.verifyExpandedInteractionPolicy()
+        harness.verifyPassiveActivityAnnouncementPolicy()
+        harness.verifyAutomaticWindowMorphStaging()
         harness.verifyHoverHysteresisAndMotionInterruption()
         await harness.verifyCoordinatorLifecycle()
+        await harness.verifyPassiveAnnouncementDelivery()
         await harness.verifyDemandDrivenPanelLifecycle()
         await harness.verifyComposedDemandPreservation()
         await harness.verifyDisabledProvider()
@@ -390,6 +393,24 @@ private struct FoundationHarness {
             )
         }
 
+        for state in [PanelPresentationState.compact, .peek] {
+            let controlled = ExpandedInteractionPolicy(
+                state: state,
+                isWindowPresented: true,
+                hitRegion: hitRegion,
+                hasExplicitControls: true
+            )
+            check(
+                controlled.allowsKeyInteraction,
+                "control-bearing \(state.rawValue) is eligible for deliberate keyboard interaction"
+            )
+            check(
+                !controlled.requiresMouseDownMonitoring
+                    && !controlled.shouldHandleEscape(panelIsKey: true),
+                "control-bearing \(state.rawValue) does not inherit Expanded dismissal behavior"
+            )
+        }
+
         let expanded = ExpandedInteractionPolicy(
             state: .expanded,
             isWindowPresented: true,
@@ -427,6 +448,15 @@ private struct FoundationHarness {
                 isWindowPresented: true
             ),
             "shortcut expansion deliberately transfers keyboard focus"
+        )
+        check(
+            DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: .hidden,
+                to: .compact,
+                isWindowPresented: true,
+                hasExplicitControls: true
+            ),
+            "shortcut reveal deliberately focuses a control-bearing compact launcher"
         )
         check(
             !DeliberatePanelFocusPolicy.shouldRequestKey(
@@ -468,6 +498,151 @@ private struct FoundationHarness {
             !leasePolicy.admits(firstLease),
             "stale monitor callbacks cannot dismiss a later Expanded session"
         )
+    }
+
+    mutating func verifyPassiveActivityAnnouncementPolicy() {
+        do {
+            var policy = PassiveActivityAnnouncementPolicy()
+            let battery50 = try makeSurfaceItem(
+                identifier: "battery-status",
+                kind: .battery,
+                progress: 0.50,
+                revision: 1
+            )
+            let battery50Revision = try makeSurfaceItem(
+                identifier: "battery-status",
+                kind: .battery,
+                progress: 0.50,
+                revision: 2
+            )
+            let battery60 = try makeSurfaceItem(
+                identifier: "battery-status",
+                kind: .battery,
+                progress: 0.60,
+                revision: 3
+            )
+            check(
+                policy.announcement(for: battery50) == "Battery, 50 percent",
+                "first passive Battery value earns one semantic announcement"
+            )
+            check(
+                policy.announcement(for: battery50) == nil
+                    && policy.announcement(for: battery50Revision) == nil,
+                "observer churn and an equivalent revision do not repeat an announcement"
+            )
+            check(
+                policy.announcement(for: battery60) == "Battery, 60 percent"
+                    && policy.announcement(for: battery50) == "Battery, 50 percent",
+                "real passive value changes announce, including a return to a prior value"
+            )
+
+            let volume = try makeSurfaceItem(
+                identifier: "volume-status",
+                kind: .volume,
+                progress: 0.35,
+                revision: 1
+            )
+            let timer = try makeSurfaceItem(
+                identifier: "timer-status",
+                kind: .timer,
+                progress: 0.35,
+                revision: 1
+            )
+            check(
+                policy.announcement(for: volume) == "Volume, 35 percent",
+                "Volume earns a nonduplicative semantic announcement"
+            )
+            check(
+                policy.announcement(for: timer) == nil && policy.announcement(for: nil) == nil,
+                "interactive and absent activities never use the passive announcement route"
+            )
+
+            for index in 0..<PassiveActivityAnnouncementPolicy.maximumRememberedActivities {
+                _ = policy.announcement(
+                    for: try makeSurfaceItem(
+                        identifier: "bounded-battery-\(index)",
+                        kind: .battery,
+                        progress: 0.25,
+                        revision: 1
+                    )
+                )
+            }
+            check(
+                policy.announcement(for: battery50) == "Battery, 50 percent",
+                "bounded announcement memory evicts its oldest semantic identity"
+            )
+        } catch {
+            check(false, "passive announcement fixtures validate")
+        }
+    }
+
+    mutating func verifyPassiveAnnouncementDelivery() async {
+        let main = makeSnapshot(identity: 61, isMain: true)
+        let external = makeSnapshot(identity: 62, originX: 1_440)
+        let displays = FakeDisplayProvider(displays: [main, external])
+        let events = FakeLifecycleEventSource()
+        let registry = DemandPanelRegistry()
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
+        let announcer = RecordingPanelAccessibilityAnnouncer()
+        let coordinator = PanelCoordinator(
+            displayProvider: displays,
+            policy: DisplayPolicy(surfaceScope: .allAvailable),
+            lifecycleEventSource: events,
+            activityModel: activityModel,
+            accessibilityAnnouncer: announcer,
+            panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
+        )
+
+        await coordinator.startAndWait()
+        do {
+            _ = try await broker.submit(
+                ActivityRequest(
+                    identifier: "coordinator-battery",
+                    source: ActivitySource.battery.rawValue,
+                    kind: ActivityKind.battery.rawValue,
+                    priority: 50,
+                    title: "Battery",
+                    progress: 0.50
+                )
+            )
+            for _ in 0..<2_000 where registry.creationCount != 2 {
+                await Task.yield()
+            }
+            check(
+                announcer.announcements.isEmpty,
+                "passive speech waits until a real demand-reporting panel is presented"
+            )
+            registry.panels.forEach { $0.setDemand(true) }
+            check(
+                registry.panels.allSatisfy { $0.showCount == 1 }
+                    && announcer.announcements == ["Battery, 50 percent"],
+                "late panel demand speaks one passive cue across multiple displays"
+            )
+
+            let equivalentSnapshot = try await broker.submit(
+                ActivityRequest(
+                    identifier: "coordinator-battery",
+                    source: ActivitySource.battery.rawValue,
+                    kind: ActivityKind.battery.rawValue,
+                    priority: 50,
+                    title: "Battery",
+                    progress: 0.50
+                )
+            )
+            for _ in 0..<2_000
+                where activityModel.snapshotVersion < equivalentSnapshot.version {
+                await Task.yield()
+            }
+            check(
+                activityModel.snapshotVersion == equivalentSnapshot.version
+                    && announcer.announcements.count == 1,
+                "consumed equivalent broker revisions do not repeat passive speech"
+            )
+        } catch {
+            check(false, "coordinator passive announcement fixture validates")
+        }
+        await coordinator.shutdown()
     }
 
     mutating func verifyHoverHysteresisAndMotionInterruption() {
@@ -726,6 +901,125 @@ private struct FoundationHarness {
             launcherModel.interactionHitRegion == launcherTarget
                 && launcherChanges.count == 2,
             "same-state growth adopts the exact target after the morph settles"
+        )
+    }
+
+    mutating func verifyAutomaticWindowMorphStaging() {
+        let display = makeSnapshot(identity: 11, isMain: true).geometry
+        let scheduler = ManualOneShotScheduler()
+        let model = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: scheduler,
+            activityModel: makeActiveActivityModel()
+        )
+        model.setWindowPresented(false)
+
+        check(
+            model.stageForWindowOrderIn()
+                && model.state == .compact
+                && model.renderedState == .hidden
+                && model.interactionHitRegion == .empty,
+            "automatic order-in commits a real inert Hidden frame"
+        )
+
+        model.setWindowPresented(true)
+        model.send(.hoverBegan)
+        check(
+            model.state == .peek && model.renderedState == .hidden,
+            "a Compact-to-Peek handoff cannot bypass the staged entrance"
+        )
+        check(
+            model.commitStagedWindowOrderIn()
+                && model.renderedState == .peek,
+            "the staged entrance reveals the newest valid logical destination"
+        )
+        scheduler.runAll()
+        check(
+            model.interactionHitRegion == model.layout.hitRegion,
+            "the revealed destination earns its exact hit region only after motion settles"
+        )
+
+        let exitDelay = model.stageForWindowOrderOut()
+        check(
+            exitDelay == .milliseconds(220)
+                && model.state == .peek
+                && model.renderedState == .hidden
+                && model.interactionHitRegion == .empty,
+            "standard dismissal reaches click-through Hidden before physical order-out"
+        )
+
+        model.updateReduceMotion(true)
+        check(
+            model.stageForWindowOrderOut() == nil
+                && model.renderedState == .hidden
+                && model.interactionHitRegion == .empty,
+            "Reduce Motion keeps physical dismissal synchronous"
+        )
+
+        let completionScheduler = ManualOneShotScheduler()
+        guard let completionSnapshot = try? ActivitySurfacePreviewCatalog.timerCompletion.snapshot() else {
+            check(false, "timer completion entrance fixture validates")
+            return
+        }
+        let completionModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .peek,
+            scheduler: completionScheduler,
+            activityModel: SurfaceActivityModel(previewSnapshot: completionSnapshot)
+        )
+        completionModel.setWindowPresented(false)
+        check(
+            completionModel.stageForWindowOrderIn()
+                && completionModel.state == .peek
+                && completionModel.renderedState == .hidden,
+            "automatic timer completion Peek begins from committed Hidden geometry"
+        )
+        completionModel.setWindowPresented(true)
+        check(
+            completionModel.commitStagedWindowOrderIn()
+                && completionModel.renderedState == .peek,
+            "automatic timer completion reveals Peek through the staged morph"
+        )
+
+        let genericPeekModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .peek,
+            scheduler: ManualOneShotScheduler(),
+            activityModel: makeActiveActivityModel()
+        )
+        check(
+            !DeliberatePanelFocusLeasePolicy.admits(
+                pending: genericPeekModel.deliberateFocusDestination,
+                current: completionModel.deliberateFocusDestination
+            ),
+            "an automatic same-state activity handoff cannot inherit another activity's pending focus"
+        )
+
+        let launcherModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .hidden,
+            scheduler: ManualOneShotScheduler(),
+            activityModel: SurfaceActivityModel(inert: ())
+        )
+        launcherModel.setFocusTimerStartHandler { _ in true }
+        launcherModel.setWindowPresented(false)
+        let launcherOrigin = launcherModel.state
+        launcherModel.send(.primaryAction)
+        check(
+            launcherModel.stageForWindowOrderIn()
+                && launcherModel.renderedState == .hidden
+                && launcherModel.logicalContentHasExplicitControls,
+            "staged launcher retains its logical control-bearing destination"
+        )
+        check(
+            DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: launcherOrigin,
+                to: launcherModel.state,
+                isWindowPresented: true,
+                hasExplicitControls: launcherModel.logicalContentHasExplicitControls
+            ),
+            "Hidden-to-Compact launcher shortcut retains deliberate focus admission after reentrancy"
         )
     }
 
@@ -1132,6 +1426,52 @@ private func makeActiveActivityModel() -> SurfaceActivityModel {
     return SurfaceActivityModel(previewSnapshot: snapshot)
 }
 
+private func makeSurfaceItem(
+    identifier: String,
+    kind: ActivityKind,
+    progress: Double,
+    revision: UInt64
+) throws -> ActivitySurfaceItem {
+    let source: ActivitySource = switch kind {
+    case .battery, .charging:
+        .battery
+    case .timer:
+        .timer
+    case .meeting:
+        .calendar
+    case .volume:
+        .volume
+    case .media, .file, .generic:
+        .external
+    }
+    let activity = try Activity(
+        validating: ActivityRequest(
+            identifier: identifier,
+            source: source.rawValue,
+            kind: kind.rawValue,
+            priority: 50,
+            title: kind.rawValue.capitalized,
+            progress: progress
+        )
+    )
+    return ActivitySurfaceItem(
+        PresentedActivity(
+            activity: activity,
+            submissionSequence: 1,
+            revision: revision
+        )
+    )
+}
+
+@MainActor
+private final class RecordingPanelAccessibilityAnnouncer: PanelAccessibilityAnnouncing {
+    private(set) var announcements: [String] = []
+
+    func announce(_ text: String) {
+        announcements.append(text)
+    }
+}
+
 private func makeSnapshot(
     identity: UInt32,
     uuid: DisplayUUID? = nil,
@@ -1402,6 +1742,11 @@ private final class DemandPanel: PanelPresenting, PanelPresentationDemandReporti
     func replayDemandRegistration(_ registration: Int, isDemanded: Bool) {
         guard demandRegistrations.indices.contains(registration) else { return }
         demandRegistrations[registration](isDemanded)
+    }
+
+    func setDemand(_ isDemanded: Bool) {
+        self.isDemanded = isDemanded
+        demandHandler?(isDemanded)
     }
 
     func show() {

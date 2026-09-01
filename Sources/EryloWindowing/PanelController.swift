@@ -44,7 +44,8 @@ package final class PanelWindowTransitionGate {
     }
 
     /// Orders the transparent window first while its rendered model is Hidden,
-    /// then commits Compact after one display frame so SwiftUI owns the morph.
+    /// then commits the latest visible destination after one display frame so
+    /// SwiftUI owns the morph.
     package func orderIn(
         stageHidden: @MainActor () -> Bool,
         orderFront: @MainActor () -> Void,
@@ -102,6 +103,15 @@ package final class PanelWindowTransitionGate {
     }
 }
 
+package enum DeliberatePanelFocusLeasePolicy {
+    package static func admits(
+        pending: PanelDeliberateFocusDestination,
+        current: PanelDeliberateFocusDestination
+    ) -> Bool {
+        pending == current
+    }
+}
+
 @MainActor
 final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     PanelPresentationDemandReporting, PanelFocusTimerLaunching,
@@ -123,6 +133,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     private var lastReportedPresentationDemand = false
     private var presentationDemandHandler: (@MainActor @Sendable (Bool) -> Void)?
     private var isFullscreenAuxiliaryEnabled = false
+    private var pendingDeliberateKeyRequest: PanelDeliberateFocusDestination?
 
     var isActivitySurfaceVisible: Bool {
         isVisible && model.renderedState != .hidden
@@ -190,7 +201,13 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         isVisible = true
         windowTransitionGate.orderIn(
             stageHidden: { [weak self] in
-                self?.model.stageForWindowOrderIn() ?? false
+                guard let self else { return false }
+                let isStaged = self.model.stageForWindowOrderIn()
+                // SwiftUI commits asynchronously. A transparent mount prevents
+                // AppKit from flashing the previously cached final frame before
+                // the real Hidden frame has reached the render server.
+                self.panel.alphaValue = isStaged ? 0 : 1
+                return isStaged
             },
             orderFront: { [weak self] in
                 guard let self, self.isVisible else { return }
@@ -199,7 +216,8 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
             },
             commitCompact: { [weak self] in
                 guard let self, self.isVisible else { return }
-                self.model.commitStagedWindowOrderIn()
+                guard self.model.commitStagedWindowOrderIn() else { return }
+                self.panel.alphaValue = 1
             }
         )
         synchronizeExpandedInteraction()
@@ -209,6 +227,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
 
     func close() {
         windowTransitionGate.cancel()
+        pendingDeliberateKeyRequest = nil
         beginLogicalHide()
         panel.escapeDismissalHandler = nil
         model.setWindowPresented(false)
@@ -217,14 +236,18 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     }
 
     func hide() {
+        pendingDeliberateKeyRequest = nil
         beginLogicalHide()
-        let delay = model.state == .hidden
-            ? model.windowOrderOutDelay
-            : nil
+        let wasUnrevealedEntrance = windowTransitionGate.pendingKind == .orderInCommit
+            && panel.alphaValue == 0
+        // Nothing has reached the screen when the one-frame entrance is still
+        // transparent, so there is no exit to animate. Every visible standard-
+        // motion surface explicitly reaches Hidden before AppKit orders it out.
+        let delay = wasUnrevealedEntrance ? nil : model.stageForWindowOrderOut()
         windowTransitionGate.orderOut(after: delay) { [weak self] in
             guard let self,
                   !self.isVisible,
-                  self.model.state == .hidden else {
+                  self.model.renderedState == .hidden else {
                 return
             }
             self.performPhysicalOrderOut()
@@ -233,6 +256,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
 
     func hideImmediatelyForEnvironmentalTransition() {
         windowTransitionGate.cancel()
+        pendingDeliberateKeyRequest = nil
         beginLogicalHide()
         performPhysicalOrderOut()
     }
@@ -255,14 +279,18 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     func performPrimaryAction() {
         // Shortcut and menu actions enter through the native owner. Pointer
         // taps mutate the model inside PanelSurfaceView and remain nonactivating.
+        pendingDeliberateKeyRequest = nil
         let oldState = model.state
         model.send(.primaryAction)
-        if DeliberatePanelFocusPolicy.shouldRequestKey(
+        let isDeliberateFocusDestination = DeliberatePanelFocusPolicy.shouldRequestKey(
             from: oldState,
             to: model.state,
-            isWindowPresented: isVisible
-        ) {
-            panel.makeKeyAndOrderFront(nil)
+            isWindowPresented: true,
+            hasExplicitControls: model.logicalContentHasExplicitControls
+        )
+        if isDeliberateFocusDestination {
+            pendingDeliberateKeyRequest = model.deliberateFocusDestination
+            fulfillPendingDeliberateKeyRequestIfReady()
         }
     }
 
@@ -275,6 +303,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     }
 
     func contractForEnvironmentalTransition() {
+        pendingDeliberateKeyRequest = nil
         retireExpandedInteraction()
         model.prepareForWindowOrderOut()
     }
@@ -296,7 +325,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         panel.isReleasedWhenClosed = false
         panel.ignoresMouseEvents = true
         panel.escapeDismissalHandler = { [weak self] in
-            self?.dismissExpandedSurfaceForEscape()
+            self?.dismissExpandedSurfaceForEscape() ?? false
         }
     }
 
@@ -320,6 +349,14 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
     }
 
     private func refreshLayout() {
+        if windowTransitionGate.pendingKind == .orderInCommit,
+           model.motionStyle == .reduced {
+            // Reduce Motion can change during the one-frame transparent mount.
+            // Reveal the model's synchronously resolved state and retire the
+            // now-invalid delayed commit instead of leaving an invisible panel.
+            windowTransitionGate.cancel()
+            panel.alphaValue = 1
+        }
         if !isVisible,
            windowTransitionGate.hasPendingOrderOut,
            model.motionStyle == .reduced {
@@ -334,6 +371,7 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         rootView.hitRegion = model.interactionHitRegion
         rootView.needsLayout = true
         synchronizeExpandedInteraction()
+        fulfillPendingDeliberateKeyRequestIfReady()
         reportPresentationDemandIfNeeded()
         if isVisible {
             updatePointer(screenPoint: NSEvent.mouseLocation)
@@ -354,14 +392,41 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         model.prepareForWindowOrderOut()
         panel.ignoresMouseEvents = true
         panel.orderOut(nil)
+        panel.alphaValue = 1
     }
 
     private var expandedInteractionPolicy: ExpandedInteractionPolicy {
         ExpandedInteractionPolicy(
             state: model.state,
             isWindowPresented: isVisible,
-            hitRegion: model.interactionHitRegion
+            hitRegion: model.interactionHitRegion,
+            hasExplicitControls: model.content.hasExplicitControls
         )
+    }
+
+    private func fulfillPendingDeliberateKeyRequestIfReady() {
+        guard let pendingDeliberateKeyRequest else { return }
+        guard isVisible else { return }
+        guard DeliberatePanelFocusLeasePolicy.admits(
+            pending: pendingDeliberateKeyRequest,
+            current: model.deliberateFocusDestination
+        ) else {
+            self.pendingDeliberateKeyRequest = nil
+            return
+        }
+        if model.renderedState != .hidden,
+           model.state != .expanded,
+           !model.content.hasExplicitControls {
+            self.pendingDeliberateKeyRequest = nil
+            return
+        }
+        guard model.renderedState == model.state,
+              model.isHitRegionSettled,
+              expandedInteractionPolicy.allowsKeyInteraction else {
+            return
+        }
+        self.pendingDeliberateKeyRequest = nil
+        panel.makeKeyAndOrderFront(nil)
     }
 
     private func synchronizeExpandedInteraction() {
@@ -390,11 +455,12 @@ final class PanelController: PanelPresenting, PanelActivityVisibilityReporting,
         model.send(.dismiss)
     }
 
-    private func dismissExpandedSurfaceForEscape() {
+    private func dismissExpandedSurfaceForEscape() -> Bool {
         guard expandedInteractionPolicy.shouldHandleEscape(panelIsKey: panel.isKeyWindow) else {
-            return
+            return false
         }
         model.send(.dismiss)
+        return true
     }
 
     private func reportPresentationDemandIfNeeded(force: Bool = false) {

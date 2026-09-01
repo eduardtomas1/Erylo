@@ -33,7 +33,9 @@ public struct TrustSettingsView: View {
             Color(nsColor: .windowBackgroundColor)
                 .ignoresSafeArea()
 
-            if model.settings.onboardingCompleted {
+            if model.recoveryReport != nil {
+                settingsRecoveryView
+            } else if model.settings.onboardingCompleted {
                 Form {
                     activitySection
                     displaySection
@@ -67,6 +69,89 @@ public struct TrustSettingsView: View {
         }
     }
 
+    private var settingsRecoveryView: some View {
+        GeometryReader { proxy in
+            ScrollView(.vertical) {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 40)
+
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 34, weight: .medium))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+
+                    Text("Saved Settings Need Attention")
+                        .font(.system(size: 26, weight: .semibold))
+                        .padding(.top, 18)
+                        .accessibilityAddTraits(.isHeader)
+
+                    Text("Erylo opened with safe defaults because the saved settings could not be read safely. Your existing saved data has not been changed.")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 8)
+
+                    Label(
+                        "Reset is the only action that can replace the saved value.",
+                        systemImage: "lock.shield"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 22)
+
+                    if let statusMessage = model.statusMessage {
+                        Text(statusMessage)
+                            .font(.callout)
+                            .foregroundStyle(statusMessageIsFailure ? Color.red : Color.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 18)
+                            .accessibilityLabel("Settings status: \(statusMessage)")
+                    }
+
+                    HStack(spacing: 12) {
+                        Button {
+                            Task {
+                                guard let destination = await destinationChooser.chooseDestination() else {
+                                    return
+                                }
+                                await model.exportDiagnostics(to: destination)
+                            }
+                        } label: {
+                            Text("Export Diagnostics…")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityHint(TrustAccessibilityCopy.diagnosticsExportHint)
+
+                        Button("Reset Settings…", role: .destructive) {
+                            isResetConfirmationPresented = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityHint("Replaces the unreadable saved value with safe defaults after confirmation.")
+                    }
+                    .controlSize(.large)
+                    .padding(.top, 26)
+                    .disabled(model.isWorking)
+
+                    if model.isWorking {
+                        ProgressView("Working…")
+                            .controlSize(.small)
+                            .padding(.top, 16)
+                    }
+
+                    Spacer(minLength: 40)
+                }
+                .frame(maxWidth: 500)
+                .padding(.horizontal, 44)
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+                .accessibilityElement(children: .contain)
+            }
+        }
+    }
+
     private var onboardingView: some View {
         GeometryReader { proxy in
             ScrollView(.vertical) {
@@ -81,7 +166,7 @@ public struct TrustSettingsView: View {
                         .frame(width: 48, height: 28)
                         .accessibilityHidden(true)
 
-                    Text("Meet Erylo")
+                    Text("Your focus, at the top edge")
                         .font(.system(size: 30, weight: .semibold))
                         .padding(.top, 16)
                         .accessibilityAddTraits(.isHeader)
@@ -97,24 +182,24 @@ public struct TrustSettingsView: View {
                         .frame(maxWidth: 440)
                         .padding(.top, 24)
 
-                    VStack(alignment: .leading, spacing: 16) {
-                        onboardingFeature(
-                            symbol: "timer",
-                            title: "A timer that stays in context",
-                            detail: "Start 15, 25, or 50 minutes from the menu bar. The deadline survives a relaunch."
+                    HStack(alignment: .top, spacing: 24) {
+                        onboardingPromise(
+                            symbol: "cursorarrow",
+                            title: "Stays out of the way",
+                            detail: "Hover never activates your app or steals focus."
                         )
-                        onboardingFeature(
-                            symbol: "sparkles",
-                            title: "Signals, not another dashboard",
-                            detail: "Battery and Volume appear briefly, never take focus, and disappear on their own."
+                        onboardingPromise(
+                            symbol: "bolt.slash",
+                            title: "Sleeps when idle",
+                            detail: "No polling or permanent animation loop."
                         )
-                        onboardingFeature(
-                            symbol: "hand.raised.fill",
-                            title: "Quiet by default",
-                            detail: "No account, no analytics, and no permission request until you enable a utility."
+                        onboardingPromise(
+                            symbol: "lock",
+                            title: "Local by design",
+                            detail: "No account, analytics, or automatic upload."
                         )
                     }
-                    .frame(maxWidth: 430)
+                    .frame(maxWidth: 500)
                     .padding(.top, 24)
 
                     if let failure = model.onboardingActionFailure {
@@ -128,25 +213,41 @@ public struct TrustSettingsView: View {
 
                     Spacer(minLength: 28)
 
-                    Button {
-                        Task { await model.completeOnboarding() }
-                    } label: {
-                        HStack(spacing: 8) {
-                            if model.isWorking {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .accessibilityHidden(true)
+                    HStack(spacing: 12) {
+                        if let onStartFocusTimer {
+                            Button {
+                                Task {
+                                    _ = await model.startFocusTimerAndCompleteOnboarding(
+                                        using: onStartFocusTimer
+                                    )
+                                }
+                            } label: {
+                                HStack(spacing: 7) {
+                                    Image(systemName: "timer")
+                                        .accessibilityHidden(true)
+                                    Text("Start 25-Minute Focus")
+                                }
                             }
-                            Text("Get Started")
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityHint("Starts a 25 minute Focus Timer and finishes setup. No permission is requested.")
+
+                            Button("Continue to Settings") {
+                                Task { await model.completeOnboarding() }
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            Button("Continue to Settings") {
+                                Task { await model.completeOnboarding() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
                         }
-                        .frame(minWidth: 82)
                     }
-                    .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .keyboardShortcut(.defaultAction)
                     .disabled(model.isWorking)
 
-                    Text("Everything stays off until you choose it in Settings.")
+                    Text("Battery and Volume stay off until you enable them in Settings.")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                         .padding(.top, 9)
@@ -161,28 +262,30 @@ public struct TrustSettingsView: View {
         }
     }
 
-    private func onboardingFeature(
+    private func onboardingPromise(
         symbol: String,
         title: String,
         detail: String
     ) -> some View {
-        HStack(alignment: .top, spacing: 14) {
+        VStack(spacing: 8) {
             Image(systemName: symbol)
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(Color.accentColor)
                 .symbolRenderingMode(.hierarchical)
-                .frame(width: 28, height: 26)
+                .frame(height: 24)
                 .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.body.weight(.medium))
-                Text(detail)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .multilineTextAlignment(.center)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
     }
 
     private var activitySection: some View {
@@ -273,7 +376,7 @@ public struct TrustSettingsView: View {
                                     : Color.secondary
                             )
                             .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityLabel("\(ModuleCopy.title(for: module)) status: \(feedback)")
+                            .accessibilityHidden(true)
                     }
                 }
             }
@@ -281,6 +384,7 @@ public struct TrustSettingsView: View {
         .toggleStyle(.switch)
         .padding(.vertical, 3)
         .accessibilityLabel(TrustAccessibilityCopy.moduleLabel(module))
+        .accessibilityValue(model.moduleAccessibilityValue(for: module))
         .accessibilityHint(TrustAccessibilityCopy.moduleHint(module))
     }
 
@@ -529,6 +633,7 @@ public struct TrustSettingsView: View {
         return statusMessage.localizedCaseInsensitiveContains("could not")
             || statusMessage.localizedCaseInsensitiveContains("failed")
             || statusMessage.localizedCaseInsensitiveContains("needs attention")
+            || statusMessage.localizedCaseInsensitiveContains("must be reset")
     }
 }
 
@@ -537,50 +642,90 @@ public struct TrustSettingsView: View {
 /// always-running animation.
 private struct OnboardingSurfacePreview: View {
     var body: some View {
-        VStack(spacing: 11) {
-            ZStack(alignment: .bottom) {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .fill(Color.black)
-
-                HStack(spacing: 0) {
-                    Image(systemName: "timer")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(Color.accentColor)
-                        .accessibilityHidden(true)
-
-                    Spacer(minLength: 28)
-
-                    Text("25:00")
-                        .font(.system(size: 13, weight: .semibold))
-                        .monospacedDigit()
-                        .foregroundStyle(.white)
-                }
-                .padding(.horizontal, 18)
-                .frame(height: 38)
-
-                Capsule(style: .continuous)
-                    .fill(Color.accentColor)
-                    .frame(width: 138, height: 2)
-                    .padding(.bottom, 1)
-            }
-            .frame(maxWidth: 320, minHeight: 40, maxHeight: 40)
-            .shadow(color: .black.opacity(0.22), radius: 7, y: 3)
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Preview: Focus Timer, 25 minutes remaining")
-
-            Text("Glance. Act. Keep going.")
-                .font(.callout.weight(.medium))
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 18)
-        .frame(maxWidth: .infinity)
-        .background(
+        ZStack(alignment: .top) {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor))
-        )
+
+            VStack(spacing: 0) {
+                ZStack(alignment: .bottom) {
+                    OnboardingTopEdgeSurfaceShape()
+                        .fill(Color.black)
+
+                    HStack(spacing: 0) {
+                        Image(systemName: "timer")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 66)
+                            .accessibilityHidden(true)
+
+                        Spacer(minLength: 142)
+
+                        Text("24:59")
+                            .font(.system(size: 12, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .frame(width: 66)
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(height: 43)
+
+                    HStack(spacing: 0) {
+                        Capsule(style: .continuous)
+                            .fill(Color.accentColor)
+                            .frame(width: 86, height: 2)
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(0.16))
+                            .frame(width: 108, height: 2)
+                    }
+                    .padding(.bottom, 1)
+                }
+                .frame(width: 330, height: 44)
+
+                Spacer(minLength: 22)
+
+                Text("Focus stays visible. Your work stays frontmost.")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+
+                Text("Control-Command-E reveals the controls only when you ask.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+
+                Spacer(minLength: 20)
+            }
+        }
+        .frame(height: 132)
+        .frame(maxWidth: .infinity)
         .overlay {
             RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Preview: Focus Timer, 24 minutes 59 seconds remaining. Control-Command-E reveals controls.")
+    }
+}
+
+/// A preview of the shipping top-edge relationship, not a floating card. The
+/// flat top is attached to the simulated display edge; only the lower corners
+/// soften into the screen.
+private struct OnboardingTopEdgeSurfaceShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let radius = min(17, rect.height / 2)
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - radius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX - radius, y: rect.maxY),
+            control: CGPoint(x: rect.maxX, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.maxY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX, y: rect.maxY - radius),
+            control: CGPoint(x: rect.minX, y: rect.maxY)
+        )
+        path.closeSubpath()
+        return path
     }
 }

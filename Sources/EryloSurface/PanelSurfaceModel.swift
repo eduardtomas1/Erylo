@@ -4,6 +4,23 @@ import EryloCore
 import Foundation
 import Observation
 
+package struct PanelDeliberateFocusDestination: Equatable, Sendable {
+    private let state: PanelPresentationState
+    private let activitySource: String?
+    private let activityIdentifier: String?
+    private let activityRevision: UInt64?
+
+    fileprivate init(
+        state: PanelPresentationState,
+        current: PresentedActivity?
+    ) {
+        self.state = state
+        activitySource = current?.activity.identity.source.rawValue
+        activityIdentifier = current?.activity.identity.identifier.rawValue
+        activityRevision = current?.revision
+    }
+}
+
 @MainActor
 private final class PanelSurfaceOwnedResources {
     let activityModel: SurfaceActivityModel
@@ -80,6 +97,14 @@ public final class PanelSurfaceModel {
     @ObservationIgnored
     private var targetHitRegion: HitRegion
 
+    /// A physically new window is mounted with Hidden geometry for one real
+    /// display frame before its current logical state is committed. Keep this
+    /// independent from the reducer so an activity handoff can change the
+    /// destination (for example Compact to Peek) without exposing the final
+    /// geometry before the entrance begins.
+    @ObservationIgnored
+    private var isWindowOrderInStaged = false
+
     @ObservationIgnored
     private var lastObservedActivity: ObservedActivityKey?
 
@@ -108,7 +133,13 @@ public final class PanelSurfaceModel {
     }
 
     public var showsFocusTimerLauncher: Bool {
-        renderedState == .compact
+        showsFocusTimerLauncher(in: renderedState)
+    }
+
+    private func showsFocusTimerLauncher(
+        in presentationState: PanelPresentationState
+    ) -> Bool {
+        presentationState == .compact
             && activityModel.current == nil
             && focusTimerStartHandler != nil
     }
@@ -217,6 +248,28 @@ public final class PanelSurfaceModel {
             action: activityModel.currentAction,
             actionDispatchState: activityModel.actionDispatchState,
             showsFocusTimerLauncher: showsFocusTimerLauncher
+        )
+    }
+
+    /// Focus admission follows the reducer destination, not the temporarily
+    /// staged render. A synchronous presentation-demand callback can move
+    /// `renderedState` back to Hidden before the shortcut owner resumes.
+    package var logicalContentHasExplicitControls: Bool {
+        ActivitySurfaceContent(
+            state: state,
+            phase: activityModel.phase,
+            current: activityModel.current,
+            queueContext: activityModel.queueContext,
+            action: activityModel.currentAction,
+            actionDispatchState: activityModel.actionDispatchState,
+            showsFocusTimerLauncher: showsFocusTimerLauncher(in: state)
+        ).hasExplicitControls
+    }
+
+    package var deliberateFocusDestination: PanelDeliberateFocusDestination {
+        PanelDeliberateFocusDestination(
+            state: state,
+            current: activityModel.current
         )
     }
 
@@ -375,6 +428,7 @@ public final class PanelSurfaceModel {
 
         pendingMotionOperation?.cancel()
         pendingMotionOperation = nil
+        isWindowOrderInStaged = false
         renderedState = state
         let exactRegion = layout.hitRegion
         targetHitRegion = exactRegion
@@ -401,22 +455,27 @@ public final class PanelSurfaceModel {
     package func setWindowPresented(_ isPresented: Bool) {
         guard isWindowPresented != isPresented else { return }
         isWindowPresented = isPresented
+        if !isPresented {
+            isWindowOrderInStaged = false
+        }
     }
 
-    /// Stages a physically ordered-in Compact panel at zero rendered geometry.
+    /// Stages a physically ordered-in panel at zero rendered geometry.
     /// Logical state is deliberately untouched so the presentation demand that
-    /// caused the order-in cannot recursively withdraw itself.
+    /// caused the order-in cannot recursively withdraw itself. The destination
+    /// may be Compact or Peek and may change while the window is staged.
     @discardableResult
     package func stageForWindowOrderIn() -> Bool {
         guard !reduceMotion,
               !isWindowPresented,
-              state == .compact,
+              state == .compact || state == .peek,
               renderedState == state else {
             return false
         }
 
         pendingMotionOperation?.cancel()
         pendingMotionOperation = nil
+        isWindowOrderInStaged = true
         renderedState = .hidden
         let hiddenRegion = layout.hitRegion
         targetHitRegion = hiddenRegion
@@ -429,19 +488,51 @@ public final class PanelSurfaceModel {
     /// Commits the staged render after the window gate's one-frame delay. Every guard is a
     /// stale-callback barrier for activity loss, environmental retirement, or a
     /// newer visibility request.
-    package func commitStagedWindowOrderIn() {
+    @discardableResult
+    package func commitStagedWindowOrderIn() -> Bool {
         guard isWindowPresented,
-              state == .compact,
+              isWindowOrderInStaged,
+              state != .hidden,
               renderedState == .hidden else {
-            return
+            return false
         }
-        renderedState = .compact
+        isWindowOrderInStaged = false
+        renderedState = state
         publishRenderedLayoutChange()
+        return true
     }
 
     /// A nil delay is the Reduce Motion contract: no physical exit staging.
     package var windowOrderOutDelay: Duration? {
         reduceMotion ? nil : timing.motionDuration
+    }
+
+    /// Keeps the physical window alive while SwiftUI morphs the currently
+    /// rendered surface to Hidden. Logical demand is not rewritten here: menu
+    /// visibility and coordinator policy remain the source of truth.
+    @discardableResult
+    package func stageForWindowOrderOut() -> Duration? {
+        guard isWindowPresented else { return nil }
+        isWindowOrderInStaged = false
+        let delay = reduceMotion ? nil : timing.motionDuration
+
+        cancelPendingHover()
+        pendingMotionOperation?.cancel()
+        pendingMotionOperation = nil
+        isPointerInside = false
+        hoverRequiresExit = false
+
+        guard renderedState != .hidden else {
+            return delay
+        }
+
+        renderedState = .hidden
+        let hiddenRegion = layout.hitRegion
+        targetHitRegion = hiddenRegion
+        interactionHitRegion = interactionHitRegion.intersecting(hiddenRegion)
+        isHitRegionSettled = interactionHitRegion == hiddenRegion
+        didChange?()
+        return delay
     }
 
     /// Physical retirement is a presentation boundary. Preserve valid activity
@@ -451,6 +542,7 @@ public final class PanelSurfaceModel {
         cancelPendingHover()
         pendingMotionOperation?.cancel()
         pendingMotionOperation = nil
+        isWindowOrderInStaged = false
         isPointerInside = false
         hoverRequiresExit = false
 
@@ -585,6 +677,16 @@ public final class PanelSurfaceModel {
     }
 
     private func publishStateLayoutChange() {
+        if isWindowOrderInStaged {
+            if state == .hidden {
+                isWindowOrderInStaged = false
+            } else {
+                // Preserve the committed Hidden frame while the logical target
+                // evolves. The order-in gate will reveal the newest valid state.
+                didChange?()
+                return
+            }
+        }
         renderedState = state
         publishRenderedLayoutChange()
     }

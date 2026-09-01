@@ -764,6 +764,8 @@ private struct AppRuntimeHarness {
 
         var recoveredSettings = EryloSettings.safeDefaults
         recoveredSettings.onboardingCompleted = true
+        recoveredSettings.modules.battery = true
+        recoveredSettings.modules.volume = true
         let failedBattery = PersistedModuleRestoreResult(
             module: .battery,
             update: TrustSettingsUpdateResult(
@@ -819,16 +821,16 @@ private struct AppRuntimeHarness {
         check(recoveryPlane.readinessSnapshot.state == .needsAttention, "unsafe fallback and restore failures produce needs-attention readiness")
         check(
             recoveryPlane.readinessSnapshot.notices == [
-                "Safe defaults were used.",
-                "Battery could not start and was left off.",
-                "Volume could not start and was left off.",
+                "Saved settings need to be reset. Existing data was left unchanged.",
+                "Battery could not start. Its enabled setting was kept.",
+                "Volume could not start. Its enabled setting was kept.",
             ],
             "every restore result is aggregated into bounded user-facing recovery copy"
         )
         let recoveryCopy = recoveryPresenter.menu?.items.map(\.title).joined(separator: " ") ?? ""
         check(
-            recoveryCopy.contains("Safe defaults were used.")
-                && !recoveryCopy.contains("Battery could not start and was left off.")
+            recoveryCopy.contains("Saved settings need to be reset.")
+                && !recoveryCopy.contains("Battery could not start.")
                 && recoveryPresenter.menu?.items.first(where: {
                     $0.kind == .command(.showSettings)
                 })?.title == ApplicationControlCopy.reviewSettings
@@ -838,94 +840,60 @@ private struct AppRuntimeHarness {
         )
         _ = recoveryPlane.presentSettings()
         check(
-            recoveryPresenter.presentedModel?.statusMessage?.contains("Volume could not start") == true,
-            "Settings receives the same bounded recovery outcome after settlement"
+            recoveryPresenter.presentedModel?.statusMessage?.contains("Volume could not start") == true
+                && recoveryPresenter.presentedModel?.recoveryReport?.requiresExplicitReset == true,
+            "Settings receives the same bounded recovery outcome and a protected recovery state"
         )
         if let recoveryModel = recoveryPresenter.presentedModel {
             await recoveryModel.setLaunchAtLoginEnabled(true)
             check(
                 recoveryPlane.readinessSnapshot.state == .needsAttention
                     && recoveryPlane.readinessSnapshot.notices == [
-                        "Battery could not start and was left off.",
-                        "Volume could not start and was left off.",
+                        "Saved settings need to be reset. Existing data was left unchanged.",
+                        "Battery could not start. Its enabled setting was kept.",
+                        "Volume could not start. Its enabled setting was kept.",
                     ],
-                "a successful Login Item write persists recovery but retains provider failures"
+                "an ordinary Login Item write cannot clear protected recovery"
             )
             await recoveryModel.setCrashAndDiagnosticSharingConsent(false)
             check(
                 recoveryPlane.readinessSnapshot.state == .needsAttention
                     && recoveryPlane.readinessSnapshot.notices == [
-                        "Battery could not start and was left off.",
-                        "Volume could not start and was left off.",
+                        "Saved settings need to be reset. Existing data was left unchanged.",
+                        "Battery could not start. Its enabled setting was kept.",
+                        "Volume could not start. Its enabled setting was kept.",
                     ],
-                "an unrelated successful Settings write clears only the recovered-file notice"
+                "an unrelated Settings write cannot clear protected recovery"
             )
             await recoveryModel.completeOnboarding()
             check(
                 recoveryPlane.readinessSnapshot.state == .needsAttention
                     && recoveryPlane.readinessSnapshot.notices == [
-                        "Battery could not start and was left off.",
-                        "Volume could not start and was left off.",
+                        "Saved settings need to be reset. Existing data was left unchanged.",
+                        "Battery could not start. Its enabled setting was kept.",
+                        "Volume could not start. Its enabled setting was kept.",
                     ],
-                "completed onboarding cannot hide unresolved provider failures"
-            )
-            await recoveryModel.setModuleEnabled(.battery, enabled: true)
-            check(
-                recoveryPlane.readinessSnapshot.notices == [
-                    "Battery could not start and was left off.",
-                    "Volume could not start and was left off.",
-                ]
-                    && recoveryModel.moduleFeedbackIsFailure(for: .battery)
-                    && recoveryModel.moduleFeedbackIsFailure(for: .volume)
-                    && recoveryModel.moduleFeedback[.volume]
-                        == "Volume could not start and remains off.",
-                "a failed Battery retry keeps both unresolved failures visible in Settings"
-            )
-            await recoveryModel.setModuleEnabled(.battery, enabled: false)
-            check(
-                recoveryPlane.readinessSnapshot.notices.count == 2
-                    && recoveryModel.moduleFeedbackIsFailure(for: .battery)
-                    && recoveryModel.moduleFeedbackIsFailure(for: .volume),
-                "an already-off Battery write cannot dismiss unresolved startup failures"
-            )
-            await recoveryModel.setModuleEnabled(.battery, enabled: true)
-            check(
-                recoveryPlane.readinessSnapshot.state == .needsAttention
-                    && recoveryPlane.readinessSnapshot.notices == [
-                        "Volume could not start and was left off.",
-                    ],
-                "successful Battery remediation clears only Battery's startup failure"
+                "onboarding completion cannot overwrite or hide protected recovery"
             )
             check(
-                recoveryModel.statusMessage?.contains("Volume could not start") == true
-                    && recoveryModel.statusMessage?.contains("Battery could not start") == false,
-                "partial remediation keeps the unresolved startup failure visible in Settings"
+                await recoveryOwner.currentSettings() == recoveredSettings,
+                "protected app-layer mutations leave the recovered settings snapshot unchanged"
             )
-            recoveryPresenter.refreshMenu()
-            let partiallyRemediatedCopy = recoveryPresenter.menu?.items.map(\.title).joined(separator: " ") ?? ""
+            await recoveryModel.resetToSafeDefaults()
             check(
-                !partiallyRemediatedCopy.contains("Safe defaults were used.")
-                    && !partiallyRemediatedCopy.contains("Battery could not start")
-                    && partiallyRemediatedCopy.contains("Volume could not start"),
-                "partial remediation keeps the exact unresolved notice in the menu"
-            )
-            await recoveryModel.setModuleEnabled(.volume, enabled: true)
-            check(
-                recoveryPlane.readinessSnapshot.state == .ready
-                    && recoveryPlane.readinessSnapshot.notices.isEmpty,
-                "every failed module must succeed before startup attention clears"
+                recoveryPlane.readinessSnapshot.state == .setupRequired
+                    && recoveryPlane.readinessSnapshot.notices.isEmpty
+                    && recoveryModel.recoveryReport == nil
+                    && recoveryModel.settings == .safeDefaults,
+                "only explicit Reset replaces recovery data and returns to safe first-run setup"
             )
         } else {
             for message in [
                 "recovery remediation fixture retains its contained Settings model",
-                "Login Item persistence clears only the recovered-file notice",
-                "unrelated Settings changes retain module failures",
-                "onboarding completion retains module failures",
-                "failed remediation retains every unresolved Settings row",
-                "already-off module intent cannot dismiss startup failure rows",
-                "one module remediation retains the other failure",
-                "partial remediation retains Settings failure copy",
-                "partial remediation refreshes bounded menu copy",
+                "Login Item changes retain protected recovery",
+                "unrelated Settings changes retain protected recovery",
+                "onboarding completion retains protected recovery",
+                "explicit Reset clears protected recovery",
             ] {
                 check(false, message)
             }
@@ -3358,7 +3326,7 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
 
 private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     private var settings: EryloSettings
-    private let report: SettingsLoadReport
+    private var report: SettingsLoadReport
     private let restoreResults: [PersistedModuleRestoreResult]
     private var moduleFailureQueues: [EryloModule: [TrustUpdateFailure]]
     private(set) var moduleMutationCount = 0
@@ -3391,6 +3359,13 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
         permissionPolicy: PermissionRequestPolicy
     ) -> TrustSettingsUpdateResult {
         _ = permissionPolicy
+        if report.requiresExplicitReset {
+            return TrustSettingsUpdateResult(
+                settings: settings,
+                outcome: .failed,
+                failure: .settingsResetRequired
+            )
+        }
         moduleMutationCount += 1
         if var failures = moduleFailureQueues[module], !failures.isEmpty {
             let failure = failures.removeFirst()
@@ -3406,6 +3381,13 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     }
 
     func apply(_ change: TrustSettingsChange) -> TrustSettingsUpdateResult {
+        if report.requiresExplicitReset {
+            return TrustSettingsUpdateResult(
+                settings: settings,
+                outcome: .failed,
+                failure: .settingsResetRequired
+            )
+        }
         switch change {
         case let .displays(displays):
             settings.displays = displays
@@ -3422,12 +3404,23 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     }
 
     func setLaunchAtLoginEnabled(_ enabled: Bool) -> TrustSettingsUpdateResult {
+        if report.requiresExplicitReset {
+            return TrustSettingsUpdateResult(
+                settings: settings,
+                outcome: .failed,
+                failure: .settingsResetRequired
+            )
+        }
         settings.launchAtLogin = enabled
         return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
     }
 
     func resetToSafeDefaults() -> TrustSettingsUpdateResult {
         settings = .safeDefaults
+        report = SettingsLoadReport(
+            disposition: .current,
+            storedSchemaVersion: EryloSettings.currentSchemaVersion
+        )
         return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
     }
 

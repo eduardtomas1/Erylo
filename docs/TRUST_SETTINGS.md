@@ -6,7 +6,7 @@ The trust-domain and SwiftUI settings targets are mounted by `EryloAppRuntime` i
 
 `EryloSettings` is a versioned `Codable` value stored as one bounded JSON blob. `SettingsRepository` owns serialization and commits its in-memory value only after the injected `AtomicSettingsStorage` replaces the complete blob. The system adapter uses one `UserDefaults` value; tests can inject failures without touching process preferences. The mounted application host disables automatic migration persistence while loading/browsing, so a legacy value is migrated in memory and is written only after an explicit settings action.
 
-The decoder rejects data above 64 KiB before JSON parsing. Stable display UUIDs are deduplicated, sorted, and capped at 32 before encode and after decode. Corrupt, oversized, unreadable, and unsupported versions return safe defaults with distinct load reports. Version 1 and 2 migrations discard unsafe session-scoped display IDs, preserve an intentional empty scope, and are rewritten only through one whole-value replacement.
+The decoder rejects data above 64 KiB before JSON parsing. Stable display UUIDs are deduplicated, sorted, and capped at 32 before encode and after decode. Corrupt, oversized, unreadable, and unsupported versions return temporary safe defaults with distinct load reports. Those recovery states are write-protected: ordinary edits, provider toggles, onboarding, and Login Item changes perform no side effect and cannot replace the opaque saved value. Settings presents a dedicated recovery screen, and only the user's confirmed Reset action may cross that boundary. A failed Reset preserves both the original bytes and recovery report. Version 1 and 2 migrations discard unsafe session-scoped display IDs, preserve an intentional empty scope, and are rewritten only through one whole-value replacement.
 
 Safe defaults are:
 
@@ -51,12 +51,16 @@ Opening or loading the settings view only reads settings and `SMAppService` stat
 The application control plane mounts only Battery and Volume through package-only
 lifecycle adapters backed by the one application `ActivityBroker`. Factory and
 source construction are inert. `startEnabledModules()` runs once at application
-startup with `.doNotRequest`, while opening/loading Settings remains read-only.
+startup with `.doNotRequest`, while opening/loading Settings remains read-only. A
+transient provider factory/start failure records failed health but preserves the
+saved enabled intent without a settings write, so a later retry can recover.
 Battery and Volume toggles are live; synchronous initial unavailability retains
 enabled intent with honest unavailable health, while disable and reset await full
 provider and retired-expiry cleanup. An explicit successful Volume enable reports
 **Volume is on — adjust it to see Erylo** beside that row; provider/start failures
-also stay row-local, while persisted startup restore produces no feedback banner.
+also stay row-local. A failed persisted startup restore keeps its Toggle On,
+explains that the preference was retained, and stays in needs-attention state
+until a successful retry or a deliberate Off action resolves it.
 Focus Timer is owned separately by `ApplicationRuntime` and starts only from a
 deliberate menu choice or the Settings timer action. Settings presents it without a dead
 module toggle. Calendar, media, File Hold, and local-integration rows are omitted
@@ -83,7 +87,7 @@ The schema has no message, path, URL, file, media, meeting, attendee, payload, t
 
 ## Contained UI
 
-`TrustSettingsView` and `TrustSettingsViewModel` live in `EryloSettingsUI`. The view uses a grouped native `Form`, semantic macOS colors, native toggles, pickers, buttons, confirmation, and save panels with explicit accessibility labels and hints. It presents only Battery and Volume as configurable modules, hides unsupported behavior controls, and removes roadmap and diagnostic-consent rows. Module enable guidance and failures render beside the row that caused them. No focus binding, application activation, custom keyboard interception, or permission work occurs during browsing. Display choices use `NSScreen.localizedName`, are keyed by stable UUID, deduplicated, and bounded; names are stripped of controls and capped before `ForEach` and VoiceOver see them. Preferred choices include only enabled, connected displays. A saved unavailable preference remains a visible, valid picker state with explicit fail-closed copy. Async results carry local sequence numbers so an older completion cannot overwrite newer UI intent.
+`TrustSettingsView` and `TrustSettingsViewModel` live in `EryloSettingsUI`. The view uses a grouped native `Form`, semantic macOS colors, native toggles, pickers, buttons, confirmation, and save panels with explicit accessibility labels and hints. It presents only Battery and Volume as configurable modules, hides unsupported behavior controls, and removes roadmap and diagnostic-consent rows. Module enable guidance and failures render beside the row that caused them. Each native Toggle exposes its On/Off state, row result, error, and per-module busy state through one dynamic VoiceOver value; row-local copy never erases the global failure. No focus binding, application activation, custom keyboard interception, or permission work occurs during browsing. Display choices use `NSScreen.localizedName`, are keyed by stable UUID, deduplicated, and bounded; names are stripped of controls and capped before `ForEach` and VoiceOver see them. Preferred choices include only enabled, connected displays. A saved unavailable preference remains a visible, valid picker state with explicit fail-closed copy. Async results carry local sequence numbers so an older completion cannot overwrite newer UI intent.
 
 `EryloAppRuntime` owns a native status item and exactly one reusable settings window. The compact menu exposes Show/Hide Erylo, one stateful Focus Timer submenu, Settings, Quit, and Check for Updates only when the signed-feed updater has safely started. Inapplicable Cancel and instructional shortcut rows are omitted. Menu and Settings actions route back through the runtime, repeated Quit requests collapse to one termination request, and shutdown removes the status item/window and terminally drains trust settings before the panel, broker, and updater are released.
 

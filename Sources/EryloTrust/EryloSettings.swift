@@ -248,6 +248,17 @@ public struct SettingsLoadReport: Equatable, Sendable {
         self.storedSchemaVersion = storedSchemaVersion
         self.migrationWasPersisted = migrationWasPersisted
     }
+
+    /// Unsafe fallbacks are temporary read-only views of saved settings. Only
+    /// the user's explicit Reset action may replace the opaque stored value.
+    public var requiresExplicitReset: Bool {
+        switch disposition {
+        case .corrupt, .unsupportedVersion, .oversized, .readFailure:
+            true
+        case .missing, .current, .migrated:
+            false
+        }
+    }
 }
 
 public struct SettingsDecodeResult: Equatable, Sendable {

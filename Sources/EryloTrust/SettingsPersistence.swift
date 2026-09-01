@@ -34,6 +34,7 @@ public enum SettingsPersistenceError: Error, Equatable, Sendable {
     case encodingFailed
     case storageReadFailed
     case storageWriteFailed
+    case settingsResetRequired(SettingsLoadDisposition)
 }
 
 public actor SettingsRepository {
@@ -95,6 +96,35 @@ public actor SettingsRepository {
 
     @discardableResult
     public func replace(with candidate: EryloSettings) throws(SettingsPersistenceError) -> EryloSettings {
+        try persist(candidate, intent: .ordinaryChange)
+    }
+
+    @discardableResult
+    public func update(
+        _ mutation: @Sendable (inout EryloSettings) -> Void
+    ) throws(SettingsPersistenceError) -> EryloSettings {
+        var candidate = settings
+        mutation(&candidate)
+        return try persist(candidate, intent: .ordinaryChange)
+    }
+
+    @discardableResult
+    public func resetToSafeDefaults() throws(SettingsPersistenceError) -> EryloSettings {
+        try persist(.safeDefaults, intent: .explicitReset)
+    }
+
+    private enum PersistenceIntent {
+        case ordinaryChange
+        case explicitReset
+    }
+
+    private func persist(
+        _ candidate: EryloSettings,
+        intent: PersistenceIntent
+    ) throws(SettingsPersistenceError) -> EryloSettings {
+        if case .ordinaryChange = intent, report.requiresExplicitReset {
+            throw .settingsResetRequired(report.disposition)
+        }
         let normalized = candidate.normalized()
         let data: Data
         do {
@@ -115,19 +145,5 @@ public actor SettingsRepository {
             storedSchemaVersion: EryloSettings.currentSchemaVersion
         )
         return normalized
-    }
-
-    @discardableResult
-    public func update(
-        _ mutation: @Sendable (inout EryloSettings) -> Void
-    ) throws(SettingsPersistenceError) -> EryloSettings {
-        var candidate = settings
-        mutation(&candidate)
-        return try replace(with: candidate)
-    }
-
-    @discardableResult
-    public func resetToSafeDefaults() throws(SettingsPersistenceError) -> EryloSettings {
-        try replace(with: .safeDefaults)
     }
 }

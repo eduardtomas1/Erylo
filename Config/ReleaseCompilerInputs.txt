@@ -50,4 +50,5 @@ Sources/EryloWindowing/PanelCoordinator.swift
 Sources/EryloWindowing/PanelHitTestView.swift
 Sources/EryloWindowing/PanelLifecycleEventSource.swift
 Sources/EryloWindowing/PanelPresenting.swift
+Sources/EryloWindowing/PassiveActivityAccessibility.swift
 Sources/EryloWindowing/SystemDisplayProvider.swift

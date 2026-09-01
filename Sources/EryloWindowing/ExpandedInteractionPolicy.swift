@@ -11,9 +11,12 @@ package enum DeliberatePanelFocusPolicy {
     package static func shouldRequestKey(
         from oldState: PanelPresentationState,
         to newState: PanelPresentationState,
-        isWindowPresented: Bool
+        isWindowPresented: Bool,
+        hasExplicitControls: Bool = false
     ) -> Bool {
-        isWindowPresented && oldState != .expanded && newState == .expanded
+        guard isWindowPresented, oldState != newState else { return false }
+        if newState == .expanded { return true }
+        return hasExplicitControls && (newState == .compact || newState == .peek)
     }
 }
 
@@ -24,23 +27,28 @@ package struct ExpandedInteractionPolicy: Equatable, Sendable {
     package let state: PanelPresentationState
     package let isWindowPresented: Bool
     package let hitRegion: HitRegion
+    package let hasExplicitControls: Bool
 
     package init(
         state: PanelPresentationState,
         isWindowPresented: Bool,
-        hitRegion: HitRegion
+        hitRegion: HitRegion,
+        hasExplicitControls: Bool = false
     ) {
         self.state = state
         self.isWindowPresented = isWindowPresented
         self.hitRegion = hitRegion
+        self.hasExplicitControls = hasExplicitControls
     }
 
     package var allowsKeyInteraction: Bool {
-        isWindowPresented && state == .expanded
+        guard isWindowPresented else { return false }
+        return state == .expanded
+            || (hasExplicitControls && (state == .compact || state == .peek))
     }
 
     package var requiresMouseDownMonitoring: Bool {
-        allowsKeyInteraction
+        isWindowPresented && state == .expanded
     }
 
     package func mouseDownDecision(at localPoint: CGPoint) -> ExpandedMouseDownDecision {
@@ -49,7 +57,7 @@ package struct ExpandedInteractionPolicy: Equatable, Sendable {
     }
 
     package func shouldHandleEscape(panelIsKey: Bool) -> Bool {
-        allowsKeyInteraction && panelIsKey
+        isWindowPresented && state == .expanded && panelIsKey
     }
 }
 

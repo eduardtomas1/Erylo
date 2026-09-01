@@ -25,6 +25,7 @@ private final class TrustHarness {
     func run() async {
         await verifySafeDefaultsAndCompatibility()
         await verifyMigrationCorruptionAndBounds()
+        await verifySettingsRecoveryWriteProtection()
         await verifyAtomicPersistence()
         await verifyNoWorkWhileBrowsingOrDisabled()
         await verifyOnboardingCommandAdmission()
@@ -52,6 +53,111 @@ private final class TrustHarness {
                 fputs("Settings visual QA rendering failed: \(error)\n", stderr)
             }
         }
+    }
+
+    private func verifySettingsRecoveryWriteProtection() async {
+        let recoveryCases: [(Data, Bool, SettingsLoadDisposition)] = [
+            (Data("not-json".utf8), false, .corrupt),
+            (Data("{\"schemaVersion\":999}".utf8), false, .unsupportedVersion),
+            (
+                Data(repeating: 0x20, count: SettingsLimits.maximumEncodedBytes + 1),
+                false,
+                .oversized
+            ),
+            (Data("unreadable".utf8), true, .readFailure),
+        ]
+
+        for (rawValue, failsRead, disposition) in recoveryCases {
+            let storage = TestAtomicSettingsStorage(
+                initialData: rawValue,
+                failsReads: failsRead
+            )
+            let repository = SettingsRepository(storage: storage)
+            do {
+                _ = try await repository.update { $0.onboardingCompleted = true }
+                check(false, "\(disposition.rawValue) fallback rejects ordinary writes")
+            } catch let error {
+                check(
+                    error == .settingsResetRequired(disposition),
+                    "\(disposition.rawValue) fallback reports explicit reset requirement"
+                )
+            }
+            check(
+                storage.replacementAttemptCount == 0 && storage.currentData == rawValue,
+                "\(disposition.rawValue) fallback preserves the exact opaque saved value"
+            )
+            check(
+                await repository.loadReport().disposition == disposition,
+                "\(disposition.rawValue) recovery report survives a rejected edit"
+            )
+
+            storage.failNextReplacement()
+            do {
+                _ = try await repository.resetToSafeDefaults()
+                check(false, "failed \(disposition.rawValue) reset reports storage failure")
+            } catch let error {
+                check(error == .storageWriteFailed, "failed reset retains its typed write failure")
+            }
+            let failedResetDisposition = await repository.loadReport().disposition
+            check(
+                storage.currentData == rawValue
+                    && failedResetDisposition == disposition,
+                "failed \(disposition.rawValue) reset leaves bytes and recovery state unchanged"
+            )
+
+            do {
+                _ = try await repository.resetToSafeDefaults()
+                _ = try await repository.update { $0.onboardingCompleted = true }
+            } catch {
+                check(false, "successful \(disposition.rawValue) reset reopens ordinary persistence")
+            }
+            let recoveredDisposition = await repository.loadReport().disposition
+            check(
+                recoveredDisposition == .current
+                    && SettingsCodec().decode(storage.currentData).settings.onboardingCompleted,
+                "explicit \(disposition.rawValue) reset is the first safe write boundary"
+            )
+        }
+
+        let guardedStorage = TestAtomicSettingsStorage(initialData: Data("not-json".utf8))
+        let guardedProvider = TestLifecycleProvider()
+        let guardedFixture = makeFixture(storage: guardedStorage, provider: guardedProvider)
+        let moduleResult = await guardedFixture.coordinator.setModuleEnabled(.battery, enabled: true)
+        let loginResult = await guardedFixture.coordinator.setLaunchAtLoginEnabled(true)
+        let onboardingResult = await guardedFixture.coordinator.apply(.onboardingCompleted(true))
+        let guardedFactoryMakeCount = await guardedFixture.factory.makeCount
+        check(
+            moduleResult.failure == .settingsResetRequired
+                && loginResult.failure == .settingsResetRequired
+                && onboardingResult.failure == .settingsResetRequired,
+            "recovery blocks every ordinary trust mutation with one explicit failure"
+        )
+        check(
+            guardedFactoryMakeCount == 0
+                && guardedFixture.launchController.changeRequests.isEmpty
+                && guardedStorage.replacementAttemptCount == 0,
+            "recovery preflight blocks provider, Login Item, and persistence side effects"
+        )
+        _ = await guardedFixture.coordinator.stopAll()
+
+        let rollbackStorage = TestAtomicSettingsStorage(
+            initialData: Data("not-json".utf8)
+        )
+        let rollbackFixture = makeFixture(
+            storage: rollbackStorage,
+            provider: TestLifecycleProvider()
+        )
+        rollbackFixture.launchController.seedEnabledForTesting()
+        rollbackStorage.failNextReplacement()
+        let failedReset = await rollbackFixture.coordinator.resetToSafeDefaults()
+        check(
+            failedReset.outcome == .rolledBack
+                && failedReset.failure == .persistenceFailed
+                && rollbackFixture.launchController.isEnabled
+                && rollbackFixture.launchController.changeRequests == [false, true],
+            "failed recovery Reset restores the actual preflight Login Item state, not fallback settings"
+        )
+        _ = await rollbackFixture.coordinator.stopAll()
     }
 
     private func verifySafeDefaultsAndCompatibility() async {
@@ -510,9 +616,20 @@ private final class TrustHarness {
             let fixture = makeFixture(storage: storage, provider: provider)
             let results = await fixture.coordinator.startEnabledModules()
             check(results.first?.failure == .providerStartFailed, "persisted start failure is surfaced")
-            check(!(await fixture.repository.current().modules.battery), "persisted start failure converges intent to off")
+            check(await fixture.repository.current().modules.battery, "persisted start failure preserves enabled intent")
+            check(storage.successfulReplacementCount == 0, "persisted start failure performs no preference write")
             check(await provider.stopCount == 1, "persisted start failure awaits provider cleanup")
             check(await fixture.coordinator.activeModules().isEmpty, "persisted start failure retains no lifecycle ownership")
+            let retry = await fixture.coordinator.startEnabledModules()
+            let activeAfterRetry = await fixture.coordinator.activeModules()
+            let settingsAfterRetry = await fixture.repository.current()
+            check(
+                retry.first?.failure == nil
+                    && activeAfterRetry == [.battery]
+                    && settingsAfterRetry.modules.battery,
+                "persisted intent retries successfully after a transient startup failure"
+            )
+            _ = await fixture.coordinator.stopAll()
         } catch {
             check(false, "persisted failure fixture encodes valid settings: \(error)")
         }
@@ -566,9 +683,14 @@ private final class TrustHarness {
             )
             check(
                 model.moduleFeedbackIsFailure(for: .volume)
-                    && model.statusMessage == nil
+                    && model.statusMessage == "The module could not start and remains off."
                     && !model.settings.modules.volume,
                 "row-local Volume failure remains honest and rolls the toggle back"
+            )
+            check(
+                model.moduleAccessibilityValue(for: .volume)
+                    == "Off. Error. Volume could not start and remains off.",
+                "failed module Toggle exposes state and recovery through one VoiceOver value"
             )
             await model.resetToSafeDefaults()
             check(
@@ -1507,14 +1629,84 @@ private func renderSettingsVisualQA<Content: View>(
     }
     representation.size = size
     hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+    try validateNativeSettingsPixels(
+        representation,
+        colorScheme: colorScheme,
+        filename: destination.lastPathComponent
+    )
     guard let png = representation.representation(using: .png, properties: [:]) else {
         throw NativeSettingsVisualQAError.encodingFailed(destination.lastPathComponent)
     }
     try png.write(to: destination, options: .atomic)
 }
 
+@MainActor
+private func validateNativeSettingsPixels(
+    _ representation: NSBitmapImageRep,
+    colorScheme: ColorScheme,
+    filename: String
+) throws {
+    let sampleStride = 3
+    var semanticPixelCount = 0
+    var minimumLuminance: CGFloat = 1
+    var maximumLuminance: CGFloat = 0
+    var minimumX = representation.pixelsWide
+    var minimumY = representation.pixelsHigh
+    var maximumX = 0
+    var maximumY = 0
+
+    for y in stride(from: 0, to: representation.pixelsHigh, by: sampleStride) {
+        for x in stride(from: 0, to: representation.pixelsWide, by: sampleStride) {
+            guard let color = representation.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+                continue
+            }
+            let luminance = color.redComponent * 0.2126
+                + color.greenComponent * 0.7152
+                + color.blueComponent * 0.0722
+            minimumLuminance = min(minimumLuminance, luminance)
+            maximumLuminance = max(maximumLuminance, luminance)
+
+            let isSemanticPixel = switch colorScheme {
+            case .dark:
+                luminance > 0.58
+            default:
+                luminance < 0.42
+            }
+            guard isSemanticPixel else { continue }
+            semanticPixelCount += 1
+            minimumX = min(minimumX, x)
+            minimumY = min(minimumY, y)
+            maximumX = max(maximumX, x)
+            maximumY = max(maximumY, y)
+        }
+    }
+
+    guard maximumLuminance - minimumLuminance >= 0.25 else {
+        throw NativeSettingsVisualQAError.missingContrast(filename)
+    }
+    guard semanticPixelCount >= 120 else {
+        throw NativeSettingsVisualQAError.missingSemanticContent(
+            filename,
+            observed: semanticPixelCount
+        )
+    }
+    let semanticWidth = maximumX - minimumX
+    let semanticHeight = maximumY - minimumY
+    guard CGFloat(semanticWidth) >= CGFloat(representation.pixelsWide) * 0.25,
+          CGFloat(semanticHeight) >= CGFloat(representation.pixelsHigh) * 0.20 else {
+        throw NativeSettingsVisualQAError.implausiblyClippedContent(
+            filename,
+            width: semanticWidth,
+            height: semanticHeight
+        )
+    }
+}
+
 private enum NativeSettingsVisualQAError: Error {
     case encodingFailed(String)
+    case missingContrast(String)
+    case missingSemanticContent(String, observed: Int)
+    case implausiblyClippedContent(String, width: Int, height: Int)
 }
 
 private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
@@ -1536,13 +1728,22 @@ private final class TestAtomicSettingsStorage: AtomicSettingsStorage, @unchecked
     private var failNext = false
     private var attempts = 0
     private var successes = 0
+    private let failsReads: Bool
 
-    init(initialData: Data? = nil) { data = initialData }
+    init(initialData: Data? = nil, failsReads: Bool = false) {
+        data = initialData
+        self.failsReads = failsReads
+    }
     var currentData: Data? { lock.withLock { data } }
     var replacementAttemptCount: Int { lock.withLock { attempts } }
     var successfulReplacementCount: Int { lock.withLock { successes } }
     func failNextReplacement() { lock.withLock { failNext = true } }
-    func data(forKey key: String) throws -> Data? { lock.withLock { data } }
+    func data(forKey key: String) throws -> Data? {
+        try lock.withLock {
+            if failsReads { throw TestFailure.requested }
+            return data
+        }
+    }
     func replace(_ data: Data, forKey key: String) throws {
         try lock.withLock {
             attempts += 1
@@ -1764,6 +1965,11 @@ private final class TestLaunchAtLoginController: LaunchAtLoginControlling {
     var failNextChange = false
     private(set) var isEnabled = false
     private(set) var changeRequests: [Bool] = []
+
+    func seedEnabledForTesting() {
+        isEnabled = true
+    }
+
     func snapshot() -> LaunchAtLoginSnapshot {
         guard capability == .available else { return .unavailable }
         return LaunchAtLoginSnapshot(

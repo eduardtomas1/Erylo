@@ -82,6 +82,7 @@ public final class PanelCoordinator {
     private let displayProvider: any EnabledDisplayProviding
     private let panelFactory: ActivityPanelPresentationFactory
     private let activityModel: SurfaceActivityModel
+    private let accessibilityAnnouncer: any PanelAccessibilityAnnouncing
     private let ownedResources: PanelCoordinatorOwnedResources
     /// Enforces the product invariant directly at the platform boundary.
     private var panels: [CGDirectDisplayID: any PanelPresenting] {
@@ -109,6 +110,7 @@ public final class PanelCoordinator {
     private var lastReportedActivityVisibility = false
     private var focusTimerStartHandler: (@MainActor @Sendable (Int) -> Bool)?
     private var primaryShortcutAdmissionHandler: (@MainActor @Sendable () -> Bool)?
+    private var passiveAnnouncementPolicy = PassiveActivityAnnouncementPolicy()
 
     /// Preserves the original coordinator entry point with a stopped, zero-work activity model.
     public convenience init(
@@ -179,16 +181,53 @@ public final class PanelCoordinator {
         )
     }
 
-    public init(
+    public convenience init(
         displayProvider: any EnabledDisplayProviding,
         policy: DisplayPolicy,
         lifecycleEventSource: any PanelLifecycleEventSourcing,
         activityModel: SurfaceActivityModel,
         panelFactory: @escaping ActivityPanelPresentationFactory
     ) {
+        self.init(
+            displayProvider: displayProvider,
+            policy: policy,
+            lifecycleEventSource: lifecycleEventSource,
+            activityModel: activityModel,
+            resolvedAccessibilityAnnouncer: SystemPanelAccessibilityAnnouncer(),
+            panelFactory: panelFactory
+        )
+    }
+
+    package convenience init(
+        displayProvider: any EnabledDisplayProviding,
+        policy: DisplayPolicy,
+        lifecycleEventSource: any PanelLifecycleEventSourcing,
+        activityModel: SurfaceActivityModel,
+        accessibilityAnnouncer: any PanelAccessibilityAnnouncing,
+        panelFactory: @escaping ActivityPanelPresentationFactory
+    ) {
+        self.init(
+            displayProvider: displayProvider,
+            policy: policy,
+            lifecycleEventSource: lifecycleEventSource,
+            activityModel: activityModel,
+            resolvedAccessibilityAnnouncer: accessibilityAnnouncer,
+            panelFactory: panelFactory
+        )
+    }
+
+    private init(
+        displayProvider: any EnabledDisplayProviding,
+        policy: DisplayPolicy,
+        lifecycleEventSource: any PanelLifecycleEventSourcing,
+        activityModel: SurfaceActivityModel,
+        resolvedAccessibilityAnnouncer: any PanelAccessibilityAnnouncing,
+        panelFactory: @escaping ActivityPanelPresentationFactory
+    ) {
         self.displayProvider = displayProvider
         self.policy = policy
         self.activityModel = activityModel
+        self.accessibilityAnnouncer = resolvedAccessibilityAnnouncer
         self.panelFactory = panelFactory
         ownedResources = PanelCoordinatorOwnedResources(
             lifecycleEventSource: lifecycleEventSource,
@@ -263,6 +302,7 @@ public final class PanelCoordinator {
         activityVisibilityHandler = nil
         focusTimerStartHandler = nil
         primaryShortcutAdmissionHandler = nil
+        passiveAnnouncementPolicy.reset()
         finishTerminalCleanup()
     }
 
@@ -490,10 +530,20 @@ public final class PanelCoordinator {
         }
         if displaySnapshots.isEmpty {
             reconcileDisplays()
+        } else {
+            displaySnapshots.values.forEach { _ = ensurePanel(snapshot: $0) }
+            presentDemandedPanels()
+        }
+        announcePassiveActivityIfPresented()
+    }
+
+    private func announcePassiveActivityIfPresented() {
+        guard !presentedPanelIDs.isEmpty else { return }
+        let item = activityModel.current.map(ActivitySurfaceItem.init)
+        guard let announcement = passiveAnnouncementPolicy.announcement(for: item) else {
             return
         }
-        displaySnapshots.values.forEach { _ = ensurePanel(snapshot: $0) }
-        presentDemandedPanels()
+        accessibilityAnnouncer.announce(announcement)
     }
 
     private func ensurePanel(
@@ -593,6 +643,11 @@ public final class PanelCoordinator {
         guard presentedPanelIDs.insert(displayID).inserted else { return }
         lifecycleEventSource.setPointerMonitoringEnabled(true)
         panel.show()
+        // Panel and model observer order is intentionally unspecified. Announce
+        // again at the physical presentation boundary so a passive cue cannot
+        // be missed when its demand callback settles after `activityDidChange`.
+        // The semantic policy makes this route idempotent across displays.
+        announcePassiveActivityIfPresented()
         updatePointer(NSEvent.mouseLocation, forceAll: true)
     }
 

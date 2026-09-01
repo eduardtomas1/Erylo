@@ -112,10 +112,13 @@ Do not force every activity through a symbol-title-detail-progress-card template
 - Controls revealed by a growing surface keep their layout space but remain
   invisible, inert, and absent from accessibility until the exact AppKit hit
   region settles. Reduce Motion settles that region immediately.
-- Hover never activates the app. Compact and Peek are never key eligible.
-  Pointer-driven expansion stays nonactivating. A deliberate global-shortcut
-  expansion makes the already Expanded panel key so keyboard users can reach
-  its controls.
+- Hover and automatic HUD arrival never activate the app. Control-free Compact
+  and Peek remain non-key. Compact/Peek with a real launcher or acknowledgement
+  action are key-eligible only after a deliberate shortcut or direct control
+  interaction; automatic completion never requests focus. Pointer-driven
+  expansion stays nonactivating. A deliberate `Control-Command-E` route waits
+  for geometry and hit testing to settle before making a control-bearing panel
+  key.
 - Expanded alone owns paired local/global mouse-down monitors. A click outside
   its current exact AppKit hit region collapses it; inside clicks pass through
   unchanged to the intended action. The monitors are removed on every collapse,
@@ -145,8 +148,9 @@ Do not force every activity through a symbol-title-detail-progress-card template
 - Use native macOS sections, controls, materials, and window behavior.
 - Show only production capabilities. Roadmap items belong in documentation.
 - First run is a focused welcome surface, not the full settings form. It explains
-  the three shipping utility categories and asks only to continue; it never
-  starts work as the price of completing setup.
+  the three shipping promises and offers one useful, permission-free primary
+  action: start a 25-minute Focus Timer. A secondary Continue to Settings path
+  must remain equally clear; completing setup never requires starting work.
 - Focus Timer presets live in one native submenu. Idle menus omit Cancel and
   active menus put remaining time in the submenu title. Instructional shortcut
   reminders do not occupy disabled menu rows.

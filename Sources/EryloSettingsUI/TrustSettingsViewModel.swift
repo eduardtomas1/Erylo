@@ -78,8 +78,10 @@ public final class TrustSettingsViewModel {
     public private(set) var launchAtLogin: LaunchAtLoginSnapshot
     public private(set) var statusMessage: String?
     public private(set) var onboardingActionFailure: String?
+    public private(set) var recoveryReport: SettingsLoadReport?
     package private(set) var moduleFeedback: [EryloModule: String] = [:]
     public private(set) var isWorking = false
+    public private(set) var workingModules: Set<EryloModule> = []
     public private(set) var displayChoices: [DisplayChoice]
     public let availableModules: Set<EryloModule>
     public let supportsMotionPreference: Bool
@@ -119,6 +121,7 @@ public final class TrustSettingsViewModel {
         coordinator: any TrustSettingsCoordinating,
         diagnosticsExporter: DiagnosticsExporter,
         initialSettings: EryloSettings = .safeDefaults,
+        initialLoadReport: SettingsLoadReport? = nil,
         displayChoices: [DisplayChoice] = [],
         availableModules: Set<EryloModule> = Set(EryloModule.allCases),
         supportsMotionPreference: Bool = true,
@@ -132,6 +135,9 @@ public final class TrustSettingsViewModel {
         self.supportsFullscreenPreference = supportsFullscreenPreference
         self.settingsDidChange = settingsDidChange
         settings = initialSettings
+        recoveryReport = initialLoadReport?.requiresExplicitReset == true
+            ? initialLoadReport
+            : nil
         launchAtLogin = .unavailable
         onboardingActionFailure = nil
         self.displayChoices = Self.normalizedDisplayChoices(displayChoices)
@@ -165,6 +171,11 @@ public final class TrustSettingsViewModel {
             return
         }
         let sequence = beginOperation()
+        workingModules.insert(module)
+        defer {
+            workingModules.remove(module)
+            endOperation()
+        }
         let result = await coordinator.setModuleEnabled(
             module,
             enabled: enabled,
@@ -180,12 +191,7 @@ public final class TrustSettingsViewModel {
                 requestedEnabled: enabled,
                 result: result
             )
-            if result.failure != nil {
-                // Module failures already have more specific row-local copy.
-                statusMessage = nil
-            }
         }
-        endOperation()
     }
 
     public func isModuleAvailable(_ module: EryloModule) -> Bool {
@@ -194,6 +200,21 @@ public final class TrustSettingsViewModel {
 
     package func moduleFeedbackIsFailure(for module: EryloModule) -> Bool {
         modulesWithFailureFeedback.contains(module)
+    }
+
+    public func moduleAccessibilityValue(for module: EryloModule) -> String {
+        var components = [settings.modules[module] ? "On" : "Off"]
+        if workingModules.contains(module) {
+            components.append("Applying change")
+        }
+        if let feedback = moduleFeedback[module] {
+            if moduleFeedbackIsFailure(for: module) {
+                components.append("Error")
+            }
+            components.append(feedback)
+        }
+        let value = components.joined(separator: ". ")
+        return value.hasSuffix(".") ? value : value + "."
     }
 
     /// Package-only startup reconciliation after the application restores enabled
@@ -212,10 +233,7 @@ public final class TrustSettingsViewModel {
             modulesWithFailureFeedback.remove(module)
         }
         for module in startupFailureModules {
-            moduleFeedback[module] = Self.moduleFailureMessage(
-                for: module,
-                failure: .providerStartFailed
-            )
+            moduleFeedback[module] = "\(ModuleCopy.title(for: module)) could not start. Its enabled setting was kept."
             modulesWithFailureFeedback.insert(module)
         }
         startupFailureFeedbackModules = startupFailureModules
@@ -352,6 +370,7 @@ public final class TrustSettingsViewModel {
             moduleFeedback.removeAll(keepingCapacity: true)
             modulesWithFailureFeedback.removeAll(keepingCapacity: true)
             if result.outcome == .applied {
+                recoveryReport = nil
                 statusMessage = "Settings reset. Battery and Volume are off. Focus Timer was not changed."
             }
         }
@@ -440,6 +459,8 @@ public final class TrustSettingsViewModel {
         switch failure {
         case .persistenceFailed:
             "Setup couldn’t be saved. Try again."
+        case .settingsResetRequired:
+            "Saved settings must be reset before setup can continue."
         case .operationCancelled, .operationSuperseded:
             "Setup wasn’t completed. Try again."
         case .queueCapacityExceeded:
@@ -489,7 +510,9 @@ public final class TrustSettingsViewModel {
             return
         }
 
-        if !requestedEnabled, startupFailureFeedbackModules.contains(module) {
+        if !requestedEnabled,
+           startupFailureFeedbackModules.contains(module),
+           (result.failure != nil || result.settings.modules[module]) {
             return
         }
         modulesWithFailureFeedback.remove(module)
@@ -520,6 +543,8 @@ public final class TrustSettingsViewModel {
             "\(title) could not start and remains off."
         case .persistenceFailed:
             "\(title) could not be saved and was rolled back."
+        case .settingsResetRequired:
+            "Saved settings must be reset before \(title) can change."
         case .rollbackFailed:
             "\(title) failed to start and cleanup needs attention. Check diagnostics."
         case .operationCancelled:
@@ -556,6 +581,8 @@ public final class TrustSettingsViewModel {
             statusMessage = "The module could not start and remains off."
         case .persistenceFailed:
             statusMessage = "The change could not be saved and was rolled back."
+        case .settingsResetRequired:
+            statusMessage = "Saved settings must be reset before changes can be saved."
         case .rollbackFailed:
             statusMessage = "The change failed and cleanup needs attention. Check diagnostics."
         case .launchAtLoginFailed:

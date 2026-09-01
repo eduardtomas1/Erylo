@@ -55,8 +55,13 @@ public struct PanelSurfaceView: View {
             0
         )
         let acceptsBackgroundTap = model.acceptsBackgroundTap
-        let handoffRevision = model.activityModel.handoff?.snapshotVersion
-        let activityIdentity = model.activityModel.current?.activity.identity
+        let presentationTransitionKey = SurfacePresentationTransitionKey(content: content)
+        let currentSnapshotVersion = model.activityModel.snapshotVersion
+        let currentActivityIdentity = model.activityModel.current?.activity.identity
+        let isIdentityHandoff = model.activityModel.handoff.map { handoff in
+            handoff.snapshotVersion == currentSnapshotVersion
+                && handoff.to == currentActivityIdentity
+        } ?? false
 
         return ZStack(alignment: .top) {
             if model.isWindowPresented, model.renderedState != .dropTarget {
@@ -69,16 +74,18 @@ public struct PanelSurfaceView: View {
                 if layout.attachment == .notchIntegrated,
                    model.renderedState == .compact,
                    !content.showsFocusTimerLauncher {
-                    notchCompactContent(
-                        content,
-                        temporalSnapshot: temporalSnapshot,
-                        surfaceWidth: layout.surfaceFrame.width,
-                        surfaceHeight: layout.surfaceFrame.height,
-                        occlusionWidth: model.displayGeometry.topEdgeOcclusion?.frame.width ?? 0
-                    )
-                    .id(activityIdentity)
-                    .transition(.opacity)
-                    .animation(handoffAnimation, value: handoffRevision)
+                    transitioningContent(
+                        key: presentationTransitionKey,
+                        isIdentityHandoff: isIdentityHandoff
+                    ) {
+                        notchCompactContent(
+                            content,
+                            temporalSnapshot: temporalSnapshot,
+                            surfaceWidth: layout.surfaceFrame.width,
+                            surfaceHeight: layout.surfaceFrame.height,
+                            occlusionWidth: model.displayGeometry.topEdgeOcclusion?.frame.width ?? 0
+                        )
+                    }
                     .opacity(
                         model.acceptsPointerInteraction
                             ? (model.isPointerInside ? 1 : 0.9)
@@ -95,10 +102,12 @@ public struct PanelSurfaceView: View {
                         Color.clear
                             .frame(height: layout.surfaceContentTopInset)
                             .accessibilityHidden(true)
-                        surfaceContent(content, temporalSnapshot: temporalSnapshot)
-                            .id(activityIdentity)
-                            .transition(.opacity)
-                            .animation(handoffAnimation, value: handoffRevision)
+                        transitioningContent(
+                            key: presentationTransitionKey,
+                            isIdentityHandoff: isIdentityHandoff
+                        ) {
+                            surfaceContent(content, temporalSnapshot: temporalSnapshot)
+                        }
                             .frame(
                                 width: layout.surfaceFrame.width,
                                 height: contentHeight
@@ -386,6 +395,13 @@ public struct PanelSurfaceView: View {
             .background(
                 Capsule(style: .continuous)
                     .fill(EryloPalette.cloud.opacity(0.07))
+            )
+            .opacity(model.isHitRegionSettled ? 1 : 0)
+            .allowsHitTesting(model.isHitRegionSettled)
+            .accessibilityHidden(!model.isHitRegionSettled)
+            .animation(
+                model.motionStyle == .reduced ? nil : .easeOut(duration: 0.10),
+                value: model.isHitRegionSettled
             )
         }
         .padding(.horizontal, 16)
@@ -860,7 +876,7 @@ public struct PanelSurfaceView: View {
     private func timerActionArea(_ content: ActivitySurfaceContent) -> some View {
         VStack(alignment: .trailing, spacing: 5) {
             if let action = content.action {
-                Button {
+                Button(role: .cancel) {
                     model.activityModel.dispatch(action)
                 } label: {
                     Label(action.label, systemImage: "xmark")
@@ -1102,7 +1118,10 @@ public struct PanelSurfaceView: View {
     private func actionColor(_ action: SurfaceActivityAction) -> Color {
         switch action.intent {
         case .cancel, .dismiss:
-            EryloPalette.coral
+            // Cancel and dismiss are routine, reversible session controls. Keep
+            // them visually secondary; Coral remains reserved for a real
+            // actionable failure or an activity's own reviewed accent.
+            .secondary
         case .pause, .resume, .openSource, .togglePlayback:
             EryloPalette.sky
         }
@@ -1130,9 +1149,34 @@ public struct PanelSurfaceView: View {
     }
 
     private var handoffAnimation: Animation? {
-        model.motionStyle == .reduced
+        reduceMotion || model.motionStyle == .reduced
             ? nil
-            : .easeInOut(duration: 0.14)
+            : .easeOut(duration: 0.16)
+    }
+
+    /// Keeps true activity handoffs inside one bounded transition host. Same-
+    /// identity revisions retain one subtree so their matched-geometry sources
+    /// remain unique and numeric/content transitions can update in place.
+    private func transitioningContent<Content: View>(
+        key: SurfacePresentationTransitionKey,
+        isIdentityHandoff: Bool,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ZStack {
+            content()
+                .id(key)
+                .transition(handoffTransition(isIdentityHandoff: isIdentityHandoff))
+        }
+        .animation(handoffAnimation, value: key)
+    }
+
+    private func handoffTransition(isIdentityHandoff: Bool) -> AnyTransition {
+        guard !reduceMotion, model.motionStyle != .reduced else { return .identity }
+        guard isIdentityHandoff else { return .opacity }
+        return .asymmetric(
+            insertion: .opacity.combined(with: .scale(scale: 0.985, anchor: .center)),
+            removal: .opacity
+        )
     }
 
 }
@@ -1216,6 +1260,33 @@ private struct SignalContinuityID: Hashable {
 
     let identity: ActivityIdentity
     let element: Element
+}
+
+/// The view identity is deliberately presentation-based rather than geometry-
+/// based. Expanding one activity preserves matched geometry, while broker
+/// true activity handoffs receive one short content transition. Revisions keep
+/// one identity so SwiftUI never hosts duplicate matched-geometry sources.
+private enum SurfacePresentationTransitionKey: Hashable {
+    case activity(ActivityIdentity)
+    case focusTimerLauncher
+    case empty
+    case degraded
+    case hidden
+
+    init(content: ActivitySurfaceContent) {
+        switch content.primary {
+        case let .activity(item):
+            self = .activity(item.identity)
+        case .empty where content.showsFocusTimerLauncher:
+            self = .focusTimerLauncher
+        case .empty:
+            self = .empty
+        case .degraded:
+            self = .degraded
+        case .hidden, .dropTarget:
+            self = .hidden
+        }
+    }
 }
 
 /// The root Timeline projection owns timestamp-backed timer status semantics.

@@ -2726,6 +2726,40 @@ private struct SurfaceHarness {
                 "completion peek exposes one real Done dismiss action"
             )
             check(
+                completion.content.hasExplicitControls,
+                "completion Peek reports its real Done control to native focus policy"
+            )
+
+            let compactTimerWithExpandedAction = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewScenario(
+                    name: "Compact timer with Expanded-only action",
+                    state: .compact,
+                    current: ActivitySurfacePreviewCatalog.timer.current
+                ),
+                displayGeometry: display,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                compactTimerWithExpandedAction.content.action == nil
+                    && !compactTimerWithExpandedAction.content.hasExplicitControls,
+                "Compact timer withholds its Expanded-only Cancel action and keyboard focus"
+            )
+
+            let compactCompletion = try ActivitySurfacePreviewCatalog.makeModel(
+                scenario: ActivitySurfacePreviewScenario(
+                    name: "Compact retained completion",
+                    state: .compact,
+                    current: ActivitySurfacePreviewCatalog.timerCompletion.current
+                ),
+                displayGeometry: display,
+                scheduler: ManualOneShotScheduler()
+            )
+            check(
+                compactCompletion.content.action?.label == "Done"
+                    && compactCompletion.content.hasExplicitControls,
+                "retained Compact completion reports its rendered Done control"
+            )
+            check(
                 completion.accessibilitySurfaceAction == .dismiss
                     && completion.accessibilitySurfaceAction?.label
                         == SurfaceStrings.dismissCompletionAction
@@ -2977,6 +3011,10 @@ private struct SurfaceHarness {
         }
         check(model.showsFocusTimerLauncher, "idle deliberate compact state exposes the Focus Timer launcher")
         check(
+            model.content.hasExplicitControls,
+            "idle launcher reports explicit controls to native focus policy"
+        )
+        check(
             model.layout.surfaceFrame.size == PanelMetrics.feasibility.timerLauncherSize,
             "notch-native launcher has one bounded compact geometry"
         )
@@ -3084,6 +3122,7 @@ private struct SurfaceHarness {
                 check(
                     !model.acceptsPointerInteraction
                         && !model.acceptsBackgroundTap
+                        && !model.content.hasExplicitControls
                         && !disposition.acceptsMouseEvents
                         && !disposition.isInsideTargetSurface,
                     "\(scenario.name) remains click-through across its visible surface"
@@ -4448,6 +4487,11 @@ private func writeNativeVisualQA(to directory: URL) throws {
         state: .compact,
         current: ActivitySurfacePreviewCatalog.volumeOutput.current
     )
+    let genericPeek = ActivitySurfacePreviewScenario(
+        name: "Generic Peek visual QA",
+        state: .peek,
+        current: ActivitySurfacePreviewCatalog.generic.current
+    )
     let scenarios: [NativeVisualQAFixture] = [
         NativeVisualQAFixture(
             filename: "erylo-timer-launcher.png",
@@ -4529,7 +4573,7 @@ private func writeNativeVisualQA(to directory: URL) throws {
         ),
         NativeVisualQAFixture(
             filename: "erylo-generic-peek-notched.png",
-            scenario: { ActivitySurfacePreviewCatalog.generic },
+            scenario: { genericPeek },
             geometry: notchedGeometry,
             desktop: .dark
         ),
@@ -4585,12 +4629,162 @@ private func writeNativeVisualQA(to directory: URL) throws {
         }
         representation.size = renderedSize
         hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+        try validateNativeSurfacePixels(
+            representation,
+            expectedSurfaceSize: model.layout.surfaceFrame.size,
+            filename: fixture.filename
+        )
         guard let png = representation.representation(using: .png, properties: [:]) else {
             throw VisualQARenderingError.encodingFailed(fixture.filename)
         }
         try png.write(
             to: directory.appendingPathComponent(fixture.filename),
             options: .atomic
+        )
+    }
+}
+
+@MainActor
+private func validateNativeSurfacePixels(
+    _ representation: NSBitmapImageRep,
+    expectedSurfaceSize: CGSize,
+    filename: String
+) throws {
+    let sampleStride = 2
+    // The dark notchless material can differ from the flat QA backdrop by only
+    // about 0.016 per channel after the guaranteed ink overlay. Stay below that
+    // bound while remaining safely above a byte of flat-color quantization.
+    let backdropDelta: CGFloat = 0.009
+    guard let backdrop = deviceRGBSample(representation, x: 0, y: 0) else {
+        throw VisualQARenderingError.unreadablePixels(filename)
+    }
+
+    var changedCount = 0
+    var minimumX = representation.pixelsWide
+    var minimumY = representation.pixelsHigh
+    var maximumX = 0
+    var maximumY = 0
+    for y in stride(from: 0, to: representation.pixelsHigh, by: sampleStride) {
+        for x in stride(from: 0, to: representation.pixelsWide, by: sampleStride) {
+            guard let sample = deviceRGBSample(representation, x: x, y: y) else {
+                continue
+            }
+            guard sample.maximumComponentDelta(from: backdrop) > backdropDelta else {
+                continue
+            }
+            changedCount += 1
+            minimumX = min(minimumX, x)
+            minimumY = min(minimumY, y)
+            maximumX = max(maximumX, x)
+            maximumY = max(maximumY, y)
+        }
+    }
+
+    let pixelsPerPoint = CGFloat(representation.pixelsWide) / representation.size.width
+    let samplesPerPoint = pixelsPerPoint / CGFloat(sampleStride)
+    let expectedChangedCount = Int(
+        (
+            expectedSurfaceSize.width
+                * expectedSurfaceSize.height
+                * samplesPerPoint
+                * samplesPerPoint
+        ).rounded(.down)
+    )
+    let minimumChangedCount = max(Int(Double(expectedChangedCount) * 0.52), 120)
+    // Notchless pills include a bounded native shadow outside the silhouette.
+    // Coverage plus the independent width/height bounds below reject blank,
+    // materially clipped, and accidental full-host surfaces.
+    let maximumChangedCount = max(Int(Double(expectedChangedCount) * 1.75), 240)
+    guard changedCount >= minimumChangedCount,
+          changedCount <= maximumChangedCount else {
+        throw VisualQARenderingError.implausibleSurfaceCoverage(
+            filename,
+            changed: changedCount,
+            expected: expectedChangedCount
+        )
+    }
+
+    let observedWidth = maximumX - minimumX + sampleStride
+    let observedHeight = maximumY - minimumY + sampleStride
+    let expectedPixelWidth = expectedSurfaceSize.width * pixelsPerPoint
+    let expectedPixelHeight = expectedSurfaceSize.height * pixelsPerPoint
+    guard CGFloat(observedWidth) >= expectedPixelWidth * 0.60,
+          CGFloat(observedHeight) >= expectedPixelHeight * 0.60,
+          CGFloat(observedWidth) <= expectedPixelWidth * 1.25 else {
+        throw VisualQARenderingError.implausibleSurfaceBounds(
+            filename,
+            width: observedWidth,
+            height: observedHeight
+        )
+    }
+
+    let interiorInset = max(Int((pixelsPerPoint * 4).rounded(.up)), sampleStride)
+    guard maximumX - minimumX > interiorInset * 2,
+          maximumY - minimumY > interiorInset * 2 else {
+        throw VisualQARenderingError.missingSurfaceInterior(filename)
+    }
+    var visibleContentCount = 0
+    for y in stride(
+        from: minimumY + interiorInset,
+        through: maximumY - interiorInset,
+        by: sampleStride
+    ) {
+        for x in stride(
+            from: minimumX + interiorInset,
+            through: maximumX - interiorInset,
+            by: sampleStride
+        ) {
+            guard let sample = deviceRGBSample(representation, x: x, y: y) else {
+                continue
+            }
+            if sample.luminance > 0.35,
+               sample.maximumComponentDelta(from: backdrop) > backdropDelta {
+                visibleContentCount += 1
+            }
+        }
+    }
+    let minimumVisibleContentCount = max(
+        Int(Double(expectedChangedCount) * 0.0005),
+        20
+    )
+    guard visibleContentCount >= minimumVisibleContentCount else {
+        throw VisualQARenderingError.missingVisibleContent(
+            filename,
+            observed: visibleContentCount,
+            minimum: minimumVisibleContentCount
+        )
+    }
+}
+
+@MainActor
+private func deviceRGBSample(
+    _ representation: NSBitmapImageRep,
+    x: Int,
+    y: Int
+) -> DeviceRGBSample? {
+    guard let color = representation.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+        return nil
+    }
+    return DeviceRGBSample(
+        red: color.redComponent,
+        green: color.greenComponent,
+        blue: color.blueComponent
+    )
+}
+
+private struct DeviceRGBSample {
+    let red: CGFloat
+    let green: CGFloat
+    let blue: CGFloat
+
+    var luminance: CGFloat {
+        red * 0.2126 + green * 0.7152 + blue * 0.0722
+    }
+
+    func maximumComponentDelta(from other: DeviceRGBSample) -> CGFloat {
+        max(
+            max(abs(red - other.red), abs(green - other.green)),
+            abs(blue - other.blue)
         )
     }
 }
@@ -4626,4 +4820,9 @@ private enum NativeVisualQADesktop: CaseIterable, Hashable {
 private enum VisualQARenderingError: Error {
     case encodingFailed(String)
     case incompleteDesktopContexts
+    case unreadablePixels(String)
+    case implausibleSurfaceCoverage(String, changed: Int, expected: Int)
+    case implausibleSurfaceBounds(String, width: Int, height: Int)
+    case missingSurfaceInterior(String)
+    case missingVisibleContent(String, observed: Int, minimum: Int)
 }

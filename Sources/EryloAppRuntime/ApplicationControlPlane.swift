@@ -422,7 +422,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
     private var controlsInstalled = false
     private var isRestoring = false
     private var hasRestored = false
-    private var unsafeFallbackNeedsPersistence = false
+    private var settingsRecoveryRequiresReset = false
     private var unresolvedRestoreFailures: Set<EryloModule> = []
     private var isShutDown = false
     private var shutdownTask: Task<Void, Never>?
@@ -487,6 +487,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             coordinator: settingsOwner,
             diagnosticsExporter: diagnosticsExporter,
             initialSettings: settings,
+            initialLoadReport: loadReport,
             displayChoices: makeDisplayChoices(),
             availableModules: availableModules,
             supportsMotionPreference: false,
@@ -527,16 +528,16 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
     private func handleSuccessfulSettingsChange(_ change: TrustSettingsSuccessfulChange) {
         guard controlsInstalled, hasRestored, !isRestoring, !isShutDown else { return }
 
-        unsafeFallbackNeedsPersistence = false
-        preparedLoadReport = nil
         switch change.kind {
         case .persistedSettings:
             break
         case let .module(module, enabled):
-            if enabled, change.settings.modules[module] {
+            if change.settings.modules[module] == enabled {
                 unresolvedRestoreFailures.remove(module)
             }
         case .resetToSafeDefaults:
+            settingsRecoveryRequiresReset = false
+            preparedLoadReport = nil
             unresolvedRestoreFailures.removeAll(keepingCapacity: true)
         }
         let notices = currentRecoveryNotices()
@@ -565,7 +566,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
         let settledSettings = await settingsOwner.currentSettings()
         guard !isShutDown, !Task.isCancelled, let viewModel else { return false }
         preparedSettings = settledSettings
-        unsafeFallbackNeedsPersistence = preparedLoadReport?.usedUnsafeFallback == true
+        settingsRecoveryRequiresReset = preparedLoadReport?.requiresExplicitReset == true
         unresolvedRestoreFailures = Set(
             restoreResults.compactMap { result in
                 result.failure == nil ? nil : result.module
@@ -617,7 +618,7 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
             viewModel = nil
             preparedSettings = nil
             preparedLoadReport = nil
-            unsafeFallbackNeedsPersistence = false
+            settingsRecoveryRequiresReset = false
             unresolvedRestoreFailures.removeAll(keepingCapacity: false)
             shutdownTask = nil
         }
@@ -630,35 +631,24 @@ package final class ApplicationControlPlane: ApplicationControlPlaneOwning {
         loadReport: SettingsLoadReport?
     ) -> [String] {
         var notices: [String] = []
-        if let loadReport, loadReport.usedUnsafeFallback {
-            notices.append("Safe defaults were used.")
+        if let loadReport, loadReport.requiresExplicitReset {
+            notices.append("Saved settings need to be reset. Existing data was left unchanged.")
         }
         for result in results where result.failure != nil {
-            notices.append("\(result.module.userFacingName) could not start and was left off.")
+            notices.append("\(result.module.userFacingName) could not start. Its enabled setting was kept.")
         }
         return Array(notices.prefix(ApplicationReadinessSnapshot.maximumNotices))
     }
 
     private func currentRecoveryNotices() -> [String] {
         var notices: [String] = []
-        if unsafeFallbackNeedsPersistence {
-            notices.append("Safe defaults were used.")
+        if settingsRecoveryRequiresReset {
+            notices.append("Saved settings need to be reset. Existing data was left unchanged.")
         }
         for module in EryloModule.allCases where unresolvedRestoreFailures.contains(module) {
-            notices.append("\(module.userFacingName) could not start and was left off.")
+            notices.append("\(module.userFacingName) could not start. Its enabled setting was kept.")
         }
         return Array(notices.prefix(ApplicationReadinessSnapshot.maximumNotices))
-    }
-}
-
-private extension SettingsLoadReport {
-    var usedUnsafeFallback: Bool {
-        switch disposition {
-        case .corrupt, .unsupportedVersion, .oversized, .readFailure:
-            true
-        case .missing, .current, .migrated:
-            false
-        }
     }
 }
 

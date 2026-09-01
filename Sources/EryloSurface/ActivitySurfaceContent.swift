@@ -386,6 +386,33 @@ public struct ActivitySurfaceContent: Equatable, Sendable {
     public let showsFocusTimerLauncher: Bool
     package let interactionRole: ActivitySurfaceInteractionRole
 
+    /// Child controls may make a nonactivating panel key only after a deliberate
+    /// user action. Passive HUD content never earns keyboard eligibility.
+    package var hasExplicitControls: Bool {
+        switch state {
+        case .compact:
+            // Activity actions are deliberately withheld until Expanded. The
+            // idle timer launcher and a retained completion acknowledgement's
+            // Done button are the only real Compact controls.
+            if showsFocusTimerLauncher { return true }
+            if case let .activity(item) = primary {
+                return item.composition == .timerCompletion && action != nil
+            }
+            return false
+        case .peek:
+            // Today only the completion acknowledgement renders its Done
+            // action in Peek. Other activity actions remain Expanded-only.
+            if case let .activity(item) = primary {
+                return item.composition == .timerCompletion && action != nil
+            }
+            return false
+        case .expanded:
+            action != nil
+        case .hidden, .dropTarget:
+            false
+        }
+    }
+
     public init(
         state: PanelPresentationState,
         phase: SurfaceActivityPhase,

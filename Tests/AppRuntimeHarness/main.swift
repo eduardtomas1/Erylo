@@ -547,7 +547,7 @@ private struct AppRuntimeHarness {
         check(presenter.statusItemCount == 0 && presenter.settingsWindowCount == 0, "control-plane preparation creates no menu or window resource")
 
         var routedCommands: [ApplicationControlCommand] = []
-        var commandAdmission = false
+        let commandAdmission = CommandAdmissionProbe()
         var appliedPolicies: [DisplayPolicy] = []
         let menuContextProbe = FocusTimerMenuContextProbe()
         let runtimeSnapshot = RuntimeControlSnapshotProbe(focusTimer: menuContextProbe)
@@ -555,7 +555,7 @@ private struct AppRuntimeHarness {
             runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
             commandHandler: {
                 routedCommands.append($0)
-                return commandAdmission
+                return commandAdmission.isAdmitted
             },
             displayPolicyHandler: { appliedPolicies.append($0) }
         ), "early control installation succeeds after inert preparation")
@@ -563,7 +563,7 @@ private struct AppRuntimeHarness {
             runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
             commandHandler: {
                 routedCommands.append($0)
-                return commandAdmission
+                return commandAdmission.isAdmitted
             },
             displayPolicyHandler: { appliedPolicies.append($0) }
         ), "repeated early control installation is rejected")
@@ -650,7 +650,7 @@ private struct AppRuntimeHarness {
                     && model.onboardingActionFailure?.contains("could not start") == true,
                 "rejected optional setup command keeps setup visible with inline failure"
             )
-            commandAdmission = true
+            commandAdmission.isAdmitted = true
             let acceptedStart = await model.startFocusTimerAndCompleteOnboarding {
                 presenter.commandHandler?(.startFocusTimer25) == true
             }
@@ -3186,6 +3186,11 @@ private final class RecordingStartupMeasurer: ApplicationStartupMeasuring {
 @MainActor
 private final class Counter {
     var value = 0
+}
+
+@MainActor
+private final class CommandAdmissionProbe {
+    var isAdmitted = false
 }
 
 @MainActor

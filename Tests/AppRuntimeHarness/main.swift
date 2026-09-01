@@ -708,7 +708,7 @@ private struct AppRuntimeHarness {
         check(
             ApplicationControlCopy.statusItemLabel == "Erylo controls"
                 && ApplicationControlCopy.statusItemHint.contains("Focus Timer")
-                && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("top edge")
+                && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("top of your display")
                 && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("visible only")
                 && !TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("hover")
                 && TrustAccessibilityCopy.onboardingControlExplanation.contains("Focus Timer")
@@ -2602,6 +2602,10 @@ private struct AppRuntimeHarness {
             await completionBroker.shutdown()
             return
         }
+        check(
+            await waitUntil { await clock.pendingDeadlines == [completionDeadline] },
+            "persistent natural completion owns its single expiry boundary before advancement"
+        )
         await clock.advance(to: completionDeadline)
         check(
             await waitUntil {

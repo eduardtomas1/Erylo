@@ -1,6 +1,18 @@
 import AppKit
 import Carbon.HIToolbox
 import CoreGraphics
+import OSLog
+
+package enum PrimaryShortcutRegistrationStage: String, Equatable, Sendable {
+    case eventHandler = "event-handler"
+    case hotKey = "hot-key"
+}
+
+package enum PrimaryShortcutRegistrationState: Equatable, Sendable {
+    case inactive
+    case registered
+    case failed(stage: PrimaryShortcutRegistrationStage, status: OSStatus)
+}
 
 public enum PanelLifecycleEvent: Equatable, Sendable {
     case displayConfigurationChanged
@@ -187,6 +199,10 @@ package final class PanelLifecycleEventSourceWorkProbe {
         resources.pointerDeliveryWorkState
     }
 
+    package var primaryShortcutRegistrationState: PrimaryShortcutRegistrationState {
+        resources.primaryShortcutRegistrationState
+    }
+
     package var hasWork: Bool {
         isRunning || observerCount > 0 || monitorCount > 0
             || hotKeyResourceCount > 0 || handlerCount > 0 || callbackLeaseCount > 0
@@ -244,6 +260,11 @@ public final class SystemPanelLifecycleEventSource: PanelLifecycleEventSourcing 
 
 @MainActor
 private final class SystemPanelLifecycleResources {
+    private static let logger = Logger(
+        subsystem: "com.erylo.app",
+        category: "PrimaryShortcut"
+    )
+
     fileprivate var isRunning = false
     fileprivate var applicationObservers: [NSObjectProtocol] = []
     fileprivate var workspaceObservers: [NSObjectProtocol] = []
@@ -252,6 +273,7 @@ private final class SystemPanelLifecycleResources {
     fileprivate var hotKey: EventHotKeyRef?
     fileprivate var hotKeyEventHandler: EventHandlerRef?
     fileprivate var hotKeyContextReference: Unmanaged<SystemPanelHotKeyContext>?
+    fileprivate var primaryShortcutRegistrationState: PrimaryShortcutRegistrationState = .inactive
     private var handler: (@MainActor @Sendable (PanelLifecycleEvent) -> Void)?
     private var activeLease: UUID?
     private let pointerDeliveryScheduler: PanelLifecycleEventDeliveryScheduler
@@ -320,16 +342,8 @@ private final class SystemPanelLifecycleResources {
         workspaceObservers.removeAll()
 
         removePointerMonitors()
-        if let hotKey {
-            UnregisterEventHotKey(hotKey)
-            self.hotKey = nil
-        }
-        if let hotKeyEventHandler {
-            RemoveEventHandler(hotKeyEventHandler)
-            self.hotKeyEventHandler = nil
-        }
-        hotKeyContextReference?.release()
-        hotKeyContextReference = nil
+        removePrimaryShortcutResources()
+        primaryShortcutRegistrationState = .inactive
 
         handler = nil
     }
@@ -440,30 +454,49 @@ private final class SystemPanelLifecycleResources {
             &hotKeyEventHandler
         )
         guard installStatus == noErr else {
-            hotKeyContextReference?.release()
-            hotKeyContextReference = nil
+            recordPrimaryShortcutFailure(stage: .eventHandler, status: installStatus)
             return
         }
 
         var registeredHotKey: EventHotKeyRef?
         let registrationStatus = RegisterEventHotKey(
             UInt32(kVK_ANSI_E),
-            UInt32(cmdKey | optionKey | controlKey),
+            UInt32(cmdKey | controlKey),
             EventHotKeyID(signature: 0x4552_594C, id: 1),
             GetApplicationEventTarget(),
             0,
             &registeredHotKey
         )
+        hotKey = registeredHotKey
         guard registrationStatus == noErr else {
-            if let hotKeyEventHandler {
-                RemoveEventHandler(hotKeyEventHandler)
-                self.hotKeyEventHandler = nil
-            }
-            hotKeyContextReference?.release()
-            hotKeyContextReference = nil
+            recordPrimaryShortcutFailure(stage: .hotKey, status: registrationStatus)
             return
         }
-        hotKey = registeredHotKey
+        primaryShortcutRegistrationState = .registered
+    }
+
+    private func recordPrimaryShortcutFailure(
+        stage: PrimaryShortcutRegistrationStage,
+        status: OSStatus
+    ) {
+        removePrimaryShortcutResources()
+        primaryShortcutRegistrationState = .failed(stage: stage, status: status)
+        Self.logger.error(
+            "Primary shortcut registration failed at \(stage.rawValue, privacy: .public), status \(status, privacy: .public)"
+        )
+    }
+
+    private func removePrimaryShortcutResources() {
+        if let hotKey {
+            UnregisterEventHotKey(hotKey)
+            self.hotKey = nil
+        }
+        if let hotKeyEventHandler {
+            RemoveEventHandler(hotKeyEventHandler)
+            self.hotKeyEventHandler = nil
+        }
+        hotKeyContextReference?.release()
+        hotKeyContextReference = nil
     }
 
     fileprivate func emit(_ event: PanelLifecycleEvent, lease: UUID) {

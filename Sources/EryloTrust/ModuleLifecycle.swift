@@ -51,6 +51,7 @@ public enum TrustUpdateFailure: String, Error, Equatable, Sendable {
     case persistenceFailed = "persistence-failed"
     case rollbackFailed = "rollback-failed"
     case launchAtLoginFailed = "launch-at-login-failed"
+    case settingsResetRequired = "settings-reset-required"
     case operationCancelled = "operation-cancelled"
     case operationSuperseded = "operation-superseded"
     case queueCapacityExceeded = "queue-capacity-exceeded"
@@ -126,6 +127,11 @@ public protocol TrustSettingsCoordinating: Sendable {
 }
 
 public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
+    private enum EnableFailureIntent {
+        case preservePersistedIntent
+        case rollBackToDisabled
+    }
+
     private let repository: SettingsRepository
     private let providerFactory: any ModuleProviderFactory
     private let permissionRequester: any ModulePermissionRequesting
@@ -205,7 +211,8 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
                 await performSetModuleEnabled(
                     module,
                     enabled: true,
-                    permissionPolicy: .doNotRequest
+                    permissionPolicy: .doNotRequest,
+                    failureIntent: .preservePersistedIntent
                 )
             )
         }
@@ -244,7 +251,8 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
             let update = await performSetModuleEnabled(
                     module,
                     enabled: true,
-                    permissionPolicy: .doNotRequest
+                    permissionPolicy: .doNotRequest,
+                    failureIntent: .preservePersistedIntent
                 )
             results.append(PersistedModuleRestoreResult(module: module, update: update))
         }
@@ -271,10 +279,15 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
             await gate.release()
             return await cancelledResult()
         }
+        if let recoveryResult = await settingsResetRequiredResult() {
+            await gate.release()
+            return recoveryResult
+        }
         let result = await performSetModuleEnabled(
             module,
             enabled: enabled,
-            permissionPolicy: permissionPolicy
+            permissionPolicy: permissionPolicy,
+            failureIntent: .rollBackToDisabled
         )
         await gate.release()
         return result
@@ -299,6 +312,10 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
                 outcome: .failed,
                 failure: .operationCancelled
             )
+        }
+        if let recoveryResult = await settingsResetRequiredResult(settings: previous) {
+            await gate.release()
+            return recoveryResult
         }
         let candidate: EryloSettings
         do {
@@ -353,6 +370,10 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
                 outcome: .failed,
                 failure: .operationCancelled
             )
+        }
+        if let recoveryResult = await settingsResetRequiredResult(settings: previous) {
+            await gate.release()
+            return recoveryResult
         }
         let initialSnapshot = await launchAtLoginController.snapshot()
         if previous.launchAtLogin == enabled,
@@ -467,6 +488,11 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
         }
 
         let initialLaunchSnapshot = await launchAtLoginController.snapshot()
+        // During unsafe-settings recovery the persisted fallback is not an
+        // authority for external Login Item state. A failed Reset must restore
+        // what ServiceManagement actually reported before the transaction.
+        let launchRollbackEnabled = initialLaunchSnapshot.registrationState == .enabled
+            || initialLaunchSnapshot.registrationState == .requiresApproval
         let launchNeedsDisable = previous.launchAtLogin
             || initialLaunchSnapshot.registrationState == .enabled
             || initialLaunchSnapshot.registrationState == .requiresApproval
@@ -475,11 +501,11 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
             : initialLaunchSnapshot
         if Task.isCancelled {
             let launchRollback = launchNeedsDisable
-                ? await launchAtLoginController.setEnabled(previous.launchAtLogin)
+                ? await launchAtLoginController.setEnabled(launchRollbackEnabled)
                 : initialLaunchSnapshot
             let providersRestored = await restart(providers: previouslyActive)
             let launchRestored = !launchNeedsDisable || Self.launchChangeSucceeded(
-                    enabled: previous.launchAtLogin,
+                    enabled: launchRollbackEnabled,
                     snapshot: launchRollback
                 )
             await gate.release()
@@ -492,10 +518,10 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
         }
         guard !launchNeedsDisable
                 || Self.launchChangeSucceeded(enabled: false, snapshot: launchSnapshot) else {
-            let launchRollback = await launchAtLoginController.setEnabled(previous.launchAtLogin)
+            let launchRollback = await launchAtLoginController.setEnabled(launchRollbackEnabled)
             let providersRestored = await restart(providers: previouslyActive)
             let launchRestored = Self.launchChangeSucceeded(
-                enabled: previous.launchAtLogin,
+                enabled: launchRollbackEnabled,
                 snapshot: launchRollback
             )
             await events.record(
@@ -529,11 +555,11 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
             )
         } catch {
             let launchRollback = launchNeedsDisable
-                ? await launchAtLoginController.setEnabled(previous.launchAtLogin)
+                ? await launchAtLoginController.setEnabled(launchRollbackEnabled)
                 : initialLaunchSnapshot
             let providersRestored = await restart(providers: previouslyActive)
             let launchRestored = !launchNeedsDisable || Self.launchChangeSucceeded(
-                    enabled: previous.launchAtLogin,
+                    enabled: launchRollbackEnabled,
                     snapshot: launchRollback
                 )
             await events.record(
@@ -586,17 +612,23 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
     private func performSetModuleEnabled(
         _ module: EryloModule,
         enabled: Bool,
-        permissionPolicy: PermissionRequestPolicy
+        permissionPolicy: PermissionRequestPolicy,
+        failureIntent: EnableFailureIntent
     ) async -> TrustSettingsUpdateResult {
         if enabled {
-            return await enable(module, permissionPolicy: permissionPolicy)
+            return await enable(
+                module,
+                permissionPolicy: permissionPolicy,
+                failureIntent: failureIntent
+            )
         }
         return await disable(module)
     }
 
     private func enable(
         _ module: EryloModule,
-        permissionPolicy: PermissionRequestPolicy
+        permissionPolicy: PermissionRequestPolicy,
+        failureIntent: EnableFailureIntent
     ) async -> TrustSettingsUpdateResult {
         let previous = await repository.current()
         if Task.isCancelled {
@@ -624,7 +656,8 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
                     module,
                     previous: previous,
                     failure: .permissionDenied,
-                    providerFailure: .permissionDenied
+                    providerFailure: .permissionDenied,
+                    failureIntent: failureIntent
                 )
             }
             if Task.isCancelled {
@@ -640,7 +673,8 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
                 module,
                 previous: previous,
                 failure: .providerFactoryFailed,
-                providerFailure: .factoryFailed
+                providerFailure: .factoryFailed,
+                failureIntent: failureIntent
             )
         }
         if Task.isCancelled {
@@ -655,7 +689,8 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
                 module,
                 previous: previous,
                 failure: .providerStartFailed,
-                providerFailure: .startFailed
+                providerFailure: .startFailed,
+                failureIntent: failureIntent
             )
         }
         if Task.isCancelled {
@@ -792,11 +827,12 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
         _ module: EryloModule,
         previous: EryloSettings,
         failure: TrustUpdateFailure,
-        providerFailure: ProviderFailureCode
+        providerFailure: ProviderFailureCode,
+        failureIntent: EnableFailureIntent
     ) async -> TrustSettingsUpdateResult {
         var finalSettings = previous
         var finalFailure = failure
-        if previous.modules[module] {
+        if previous.modules[module], case .rollBackToDisabled = failureIntent {
             do {
                 finalSettings = try await repository.update { $0.modules[module] = false }
             } catch {
@@ -818,6 +854,24 @@ public actor TrustSettingsCoordinator: TrustSettingsCoordinating {
             settings: finalSettings,
             outcome: .failed,
             failure: finalFailure
+        )
+    }
+
+    private func settingsResetRequiredResult(
+        settings: EryloSettings? = nil
+    ) async -> TrustSettingsUpdateResult? {
+        let report = await repository.loadReport()
+        guard report.requiresExplicitReset else { return nil }
+        let currentSettings: EryloSettings
+        if let settings {
+            currentSettings = settings
+        } else {
+            currentSettings = await repository.current()
+        }
+        return TrustSettingsUpdateResult(
+            settings: currentSettings,
+            outcome: .failed,
+            failure: .settingsResetRequired
         )
     }
 

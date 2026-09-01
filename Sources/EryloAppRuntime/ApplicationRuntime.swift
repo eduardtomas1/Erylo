@@ -1,6 +1,8 @@
+import AppKit
 import EryloActivity
 import EryloGlance
 import EryloSurface
+import EryloTrust
 import EryloUpdates
 import EryloWindowing
 import Foundation
@@ -97,7 +99,13 @@ package final class ApplicationRuntime {
             ProductionCapabilities.mounts(.focusTimer),
             "Focus Timer must remain in the reviewed production capability set"
         )
-        let focusTimer = FocusTimerRuntimeService(broker: activityBroker)
+        let focusTimer = FocusTimerRuntimeService(
+            broker: activityBroker,
+            persistenceStorage: UserDefaultsSettingsStorage(),
+            completionNotifier: {
+                NSSound.beep()
+            }
+        )
         let activityModel: SurfaceActivityModel
         let panelCoordinator: PanelCoordinator
 
@@ -253,7 +261,7 @@ package final class ApplicationRuntime {
                    self?.runtimeControlSnapshot() ?? .starting
                },
                commandHandler: { [weak self] command in
-                   _ = self?.handle(command)
+                   self?.handle(command) == true
                },
                displayPolicyHandler: { [weak panelCoordinator] policy in
                    panelCoordinator?.update(policy: policy)

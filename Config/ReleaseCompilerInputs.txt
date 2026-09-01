@@ -34,6 +34,7 @@ Sources/EryloSurface/ActivitySurfaceContent.swift
 Sources/EryloSurface/ActivitySurfacePreview.swift
 Sources/EryloSurface/PanelSurfaceModel.swift
 Sources/EryloSurface/PanelSurfaceView.swift
+Sources/EryloSurface/PanelSurfaceVisualMetrics.swift
 Sources/EryloSurface/SurfaceActivityModel.swift
 Sources/EryloSurface/SurfaceStrings.swift
 Sources/EryloTrust/Diagnostics.swift
@@ -43,10 +44,12 @@ Sources/EryloTrust/ModuleLifecycle.swift
 Sources/EryloTrust/SettingsPersistence.swift
 Sources/EryloUpdates/UpdateConfiguration.swift
 Sources/EryloUpdates/UpdateRuntime.swift
+Sources/EryloWindowing/ExpandedInteractionPolicy.swift
 Sources/EryloWindowing/NonActivatingPanel.swift
 Sources/EryloWindowing/PanelController.swift
 Sources/EryloWindowing/PanelCoordinator.swift
 Sources/EryloWindowing/PanelHitTestView.swift
 Sources/EryloWindowing/PanelLifecycleEventSource.swift
 Sources/EryloWindowing/PanelPresenting.swift
+Sources/EryloWindowing/PassiveActivityAccessibility.swift
 Sources/EryloWindowing/SystemDisplayProvider.swift

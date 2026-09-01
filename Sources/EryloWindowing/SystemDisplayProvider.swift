@@ -5,6 +5,8 @@ import EryloIntegrations
 
 @MainActor
 public final class SystemDisplayProvider: EnabledDisplayProviding {
+    private static let maximumDisplayNameBytes = 80
+
     public init() {}
 
     public func enabledDisplays() -> [DisplaySnapshot] {
@@ -21,9 +23,14 @@ public final class SystemDisplayProvider: EnabledDisplayProviding {
                 forQuartzFrame: CGDisplayBounds(directDisplayID),
                 mainQuartzFrame: mainQuartzFrame
             )
-            let screen = screens.first { Self.framesMatch($0.frame, frame) }
+            guard let uuid = Self.displayUUID(for: directDisplayID) else {
+                return nil
+            }
+            let screen = Self.screen(for: directDisplayID, in: screens)
             return DisplaySnapshot(
                 identity: DisplayIdentity(rawValue: directDisplayID),
+                uuid: uuid,
+                localizedName: Self.boundedDisplayName(screen?.localizedName),
                 geometry: DisplayGeometry(
                     frame: frame,
                     visibleFrame: screen?.visibleFrame ?? frame,
@@ -49,6 +56,44 @@ public final class SystemDisplayProvider: EnabledDisplayProviding {
         return Array(displays.prefix(Int(count)))
     }
 
+    private static func displayUUID(for displayID: CGDirectDisplayID) -> DisplayUUID? {
+        guard let unmanagedUUID = CGDisplayCreateUUIDFromDisplayID(displayID) else { return nil }
+        // The Core Graphics function follows the Create Rule and hands Swift an
+        // owning Unmanaged reference on current SDKs.
+        let uuid = unmanagedUUID.takeRetainedValue()
+        let value = CFUUIDCreateString(nil, uuid) as String
+        return DisplayUUID(rawValue: value)
+    }
+
+    private static func screen(
+        for displayID: CGDirectDisplayID,
+        in screens: [NSScreen]
+    ) -> NSScreen? {
+        let screenNumberKey = NSDeviceDescriptionKey("NSScreenNumber")
+        return screens.first { screen in
+            guard let number = screen.deviceDescription[screenNumberKey] as? NSNumber else {
+                return false
+            }
+            return number.uint32Value == displayID
+        }
+    }
+
+    private static func boundedDisplayName(_ value: String?) -> String {
+        guard let value else { return "Display" }
+        var result = ""
+        var byteCount = 0
+        for scalar in value.unicodeScalars.prefix(maximumDisplayNameBytes * 2) {
+            guard !CharacterSet.controlCharacters.contains(scalar) else { continue }
+            let fragment = String(scalar)
+            let fragmentBytes = fragment.utf8.count
+            guard byteCount + fragmentBytes <= maximumDisplayNameBytes else { break }
+            result.unicodeScalars.append(scalar)
+            byteCount += fragmentBytes
+        }
+        let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "Display" : trimmed
+    }
+
     private static func appKitFrame(
         forQuartzFrame quartzFrame: CGRect,
         mainQuartzFrame: CGRect
@@ -59,14 +104,6 @@ public final class SystemDisplayProvider: EnabledDisplayProviding {
             width: quartzFrame.width,
             height: quartzFrame.height
         )
-    }
-
-    private static func framesMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        let tolerance: CGFloat = 0.5
-        return abs(lhs.minX - rhs.minX) <= tolerance
-            && abs(lhs.minY - rhs.minY) <= tolerance
-            && abs(lhs.width - rhs.width) <= tolerance
-            && abs(lhs.height - rhs.height) <= tolerance
     }
 
     private static func topEdgeOcclusion(for screen: NSScreen) -> TopEdgeOcclusion? {

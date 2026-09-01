@@ -82,6 +82,8 @@ ARGV.each_with_index do |argument, index|
   next if argument.start_with?("-")
   absolute = File.expand_path(argument)
   next unless argument.include?(File::SEPARATOR) || File.exist?(absolute)
+  abort("compiler Swift source input is outside the reviewed source root") \
+    if !absolute.start_with?(root_prefix) && argument.end_with?(".swift")
   next unless absolute.start_with?(root_prefix)
   relative = absolute.delete_prefix(root_prefix)
   abort("compiler input path is noncanonical") if relative.empty? || relative.split(File::SEPARATOR).any? { |part| part.empty? || part == "." || part == ".." }

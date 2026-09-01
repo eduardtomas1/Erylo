@@ -17,20 +17,22 @@ package struct TrustSettingsSuccessfulChange: Sendable {
 }
 
 public enum DisplayChoiceLimits {
-    public static let maximumChoices = SettingsLimits.maximumEnabledDisplayIDs
+    public static let maximumChoices = SettingsLimits.maximumEnabledDisplayUUIDs
     public static let maximumNameBytes = 80
     public static let maximumInjectedChoicesScanned = 256
 }
 
 public struct DisplayChoice: Identifiable, Equatable, Sendable {
-    public let identity: DisplayIdentity
+    public let identity: DisplayUUID
     public let name: String
+    public let isMain: Bool
 
-    public var id: DisplayIdentity { identity }
+    public var id: DisplayUUID { identity }
 
-    public init(identity: DisplayIdentity, name: String) {
+    public init(identity: DisplayUUID, name: String, isMain: Bool = false) {
         self.identity = identity
         self.name = Self.safeName(name)
+        self.isMain = isMain
     }
 
     private static func safeName(_ value: String) -> String {
@@ -75,8 +77,11 @@ public final class TrustSettingsViewModel {
     public private(set) var settings: EryloSettings
     public private(set) var launchAtLogin: LaunchAtLoginSnapshot
     public private(set) var statusMessage: String?
+    public private(set) var onboardingActionFailure: String?
+    public private(set) var recoveryReport: SettingsLoadReport?
     package private(set) var moduleFeedback: [EryloModule: String] = [:]
     public private(set) var isWorking = false
+    public private(set) var workingModules: Set<EryloModule> = []
     public private(set) var displayChoices: [DisplayChoice]
     public let availableModules: Set<EryloModule>
     public let supportsMotionPreference: Bool
@@ -116,6 +121,7 @@ public final class TrustSettingsViewModel {
         coordinator: any TrustSettingsCoordinating,
         diagnosticsExporter: DiagnosticsExporter,
         initialSettings: EryloSettings = .safeDefaults,
+        initialLoadReport: SettingsLoadReport? = nil,
         displayChoices: [DisplayChoice] = [],
         availableModules: Set<EryloModule> = Set(EryloModule.allCases),
         supportsMotionPreference: Bool = true,
@@ -129,7 +135,11 @@ public final class TrustSettingsViewModel {
         self.supportsFullscreenPreference = supportsFullscreenPreference
         self.settingsDidChange = settingsDidChange
         settings = initialSettings
+        recoveryReport = initialLoadReport?.requiresExplicitReset == true
+            ? initialLoadReport
+            : nil
         launchAtLogin = .unavailable
+        onboardingActionFailure = nil
         self.displayChoices = Self.normalizedDisplayChoices(displayChoices)
     }
 
@@ -161,6 +171,11 @@ public final class TrustSettingsViewModel {
             return
         }
         let sequence = beginOperation()
+        workingModules.insert(module)
+        defer {
+            workingModules.remove(module)
+            endOperation()
+        }
         let result = await coordinator.setModuleEnabled(
             module,
             enabled: enabled,
@@ -176,12 +191,7 @@ public final class TrustSettingsViewModel {
                 requestedEnabled: enabled,
                 result: result
             )
-            if result.failure != nil {
-                // Module failures already have more specific row-local copy.
-                statusMessage = nil
-            }
         }
-        endOperation()
     }
 
     public func isModuleAvailable(_ module: EryloModule) -> Bool {
@@ -190,6 +200,21 @@ public final class TrustSettingsViewModel {
 
     package func moduleFeedbackIsFailure(for module: EryloModule) -> Bool {
         modulesWithFailureFeedback.contains(module)
+    }
+
+    public func moduleAccessibilityValue(for module: EryloModule) -> String {
+        var components = [settings.modules[module] ? "On" : "Off"]
+        if workingModules.contains(module) {
+            components.append("Applying change")
+        }
+        if let feedback = moduleFeedback[module] {
+            if moduleFeedbackIsFailure(for: module) {
+                components.append("Error")
+            }
+            components.append(feedback)
+        }
+        let value = components.joined(separator: ". ")
+        return value.hasSuffix(".") ? value : value + "."
     }
 
     /// Package-only startup reconciliation after the application restores enabled
@@ -208,10 +233,7 @@ public final class TrustSettingsViewModel {
             modulesWithFailureFeedback.remove(module)
         }
         for module in startupFailureModules {
-            moduleFeedback[module] = Self.moduleFailureMessage(
-                for: module,
-                failure: .providerStartFailed
-            )
+            moduleFeedback[module] = "\(ModuleCopy.title(for: module)) could not start. Its enabled setting was kept."
             modulesWithFailureFeedback.insert(module)
         }
         startupFailureFeedbackModules = startupFailureModules
@@ -223,31 +245,55 @@ public final class TrustSettingsViewModel {
         await applySettingChange(.displays(displays))
     }
 
-    public func setDisplayEnabled(_ identity: DisplayIdentity, enabled: Bool) async {
+    public func setDisplayEnabled(_ identity: DisplayUUID, enabled: Bool) async {
         var displays = settings.displays
-        var enabledIDs = displays.enabledDisplayIDs
-            ?? displayChoices.map { $0.identity.rawValue }
+        guard displays.surfaceScope == .custom else { return }
+        var enabledUUIDs = displays.enabledDisplayUUIDs ?? []
         if enabled {
-            enabledIDs.append(identity.rawValue)
+            guard displayChoices.contains(where: { $0.identity == identity }) else { return }
+            enabledUUIDs.append(identity)
         } else {
-            enabledIDs.removeAll { $0 == identity.rawValue }
+            enabledUUIDs.removeAll { $0 == identity }
         }
         displays = DisplayPreferences(
             isEnabled: displays.isEnabled,
-            enabledDisplayIDs: enabledIDs,
-            selectedDisplayID: displays.selectedDisplayID
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: enabledUUIDs,
+            preferredDisplayUUID: displays.preferredDisplayUUID
         )
-        if displays.selectedDisplayID == identity.rawValue, !enabled {
-            displays.selectedDisplayID = nil
+        if displays.preferredDisplayUUID == identity, !enabled {
+            displays.preferredDisplayUUID = nil
         }
         await applySettingChange(.displays(displays))
     }
 
     public func setUseAllAvailableDisplays(_ useAll: Bool) async {
+        await setDisplayScope(useAll ? .allAvailable : .automatic)
+    }
+
+    public func setDisplayScope(_ scope: DisplaySurfaceScope) async {
         var displays = settings.displays
-        displays.enabledDisplayIDs = useAll
-            ? nil
-            : displayChoices.map { $0.identity.rawValue }
+        let previousScope = displays.surfaceScope
+        displays.surfaceScope = scope
+        switch scope {
+        case .automatic:
+            displays.enabledDisplayUUIDs = nil
+            displays.preferredDisplayUUID = nil
+        case .allAvailable:
+            displays.enabledDisplayUUIDs = nil
+            if let preferred = displays.preferredDisplayUUID,
+               !displayChoices.contains(where: { $0.identity == preferred }) {
+                displays.preferredDisplayUUID = nil
+            }
+        case .custom:
+            if previousScope != .custom {
+                displays.enabledDisplayUUIDs = automaticDisplayChoice.map { [$0.identity] } ?? []
+            }
+            if let preferred = displays.preferredDisplayUUID,
+               !(displays.enabledDisplayUUIDs?.contains(preferred) ?? false) {
+                displays.preferredDisplayUUID = nil
+            }
+        }
         await applySettingChange(.displays(displays))
     }
 
@@ -259,9 +305,14 @@ public final class TrustSettingsViewModel {
         displayChoices = Self.normalizedDisplayChoices(choices)
     }
 
-    public func selectDisplay(_ identity: DisplayIdentity?) async {
+    public func selectDisplay(_ identity: DisplayUUID?) async {
+        if let identity,
+           !preferredDisplayChoices.contains(where: { $0.identity == identity }) {
+            statusMessage = "Choose an enabled, connected display."
+            return
+        }
         var displays = settings.displays
-        displays.selectedDisplayID = identity?.rawValue
+        displays.preferredDisplayUUID = identity
         await applySettingChange(.displays(displays))
     }
 
@@ -293,7 +344,22 @@ public final class TrustSettingsViewModel {
     }
 
     public func completeOnboarding() async {
-        await applySettingChange(.onboardingCompleted(true))
+        _ = await persistOnboardingCompletion()
+    }
+
+    /// Optional admission-safe setup action retained for alternate clients.
+    /// A rejected runtime command leaves onboarding visible and performs no
+    /// settings mutation, so callers never report work that did not begin.
+    @discardableResult
+    public func startFocusTimerAndCompleteOnboarding(
+        using startFocusTimer: @MainActor () -> Bool
+    ) async -> Bool {
+        guard !isWorking else { return false }
+        guard startFocusTimer() else {
+            onboardingActionFailure = "Focus Timer could not start. Erylo is still setting up."
+            return false
+        }
+        return await persistOnboardingCompletion()
     }
 
     public func resetToSafeDefaults() async {
@@ -304,7 +370,8 @@ public final class TrustSettingsViewModel {
             moduleFeedback.removeAll(keepingCapacity: true)
             modulesWithFailureFeedback.removeAll(keepingCapacity: true)
             if result.outcome == .applied {
-                statusMessage = "Safe defaults restored. All activity modules are off."
+                recoveryReport = nil
+                statusMessage = "Settings reset. Battery and Volume are off. Focus Timer was not changed."
             }
         }
         endOperation()
@@ -330,8 +397,80 @@ public final class TrustSettingsViewModel {
         endOperation()
     }
 
-    public func isDisplayEnabled(_ identity: DisplayIdentity) -> Bool {
-        settings.displays.enabledDisplayIDs?.contains(identity.rawValue) ?? true
+    public var preferredDisplayChoices: [DisplayChoice] {
+        switch settings.displays.surfaceScope {
+        case .automatic:
+            automaticDisplayChoice.map { [$0] } ?? []
+        case .allAvailable:
+            displayChoices
+        case .custom:
+            displayChoices.filter {
+                settings.displays.enabledDisplayUUIDs?.contains($0.identity) == true
+            }
+        }
+    }
+
+    public var unavailablePreferredDisplayUUID: DisplayUUID? {
+        guard let preferred = settings.displays.preferredDisplayUUID,
+              !preferredDisplayChoices.contains(where: { $0.identity == preferred }) else {
+            return nil
+        }
+        return preferred
+    }
+
+    public func isDisplayEnabled(_ identity: DisplayUUID) -> Bool {
+        switch settings.displays.surfaceScope {
+        case .automatic:
+            automaticDisplayChoice?.identity == identity
+        case .allAvailable:
+            true
+        case .custom:
+            settings.displays.enabledDisplayUUIDs?.contains(identity) == true
+        }
+    }
+
+    private var automaticDisplayChoice: DisplayChoice? {
+        displayChoices.first(where: \.isMain)
+            ?? displayChoices.min { $0.identity < $1.identity }
+    }
+
+    private func persistOnboardingCompletion() async -> Bool {
+        guard !isWorking else { return false }
+        onboardingActionFailure = nil
+        let sequence = beginOperation()
+        defer { endOperation() }
+
+        let result = await coordinator.apply(.onboardingCompleted(true))
+        let didApply = apply(
+            result,
+            sequence: sequence,
+            successfulChangeKind: .persistedSettings
+        )
+        guard didApply else { return false }
+
+        let completed = result.failure == nil && result.settings.onboardingCompleted
+        if !completed {
+            onboardingActionFailure = Self.onboardingFailureMessage(for: result.failure)
+        }
+        return completed
+    }
+
+    private static func onboardingFailureMessage(for failure: TrustUpdateFailure?) -> String {
+        switch failure {
+        case .persistenceFailed:
+            "Setup couldn’t be saved. Try again."
+        case .settingsResetRequired:
+            "Saved settings must be reset before setup can continue."
+        case .operationCancelled, .operationSuperseded:
+            "Setup wasn’t completed. Try again."
+        case .queueCapacityExceeded:
+            "Setup is busy with another change. Try again."
+        case .coordinatorShutDown:
+            "Setup can’t finish while Erylo is shutting down."
+        case .permissionDenied, .providerFactoryFailed, .providerStartFailed,
+             .rollbackFailed, .launchAtLoginFailed, .none:
+            "Setup couldn’t be completed. Try again."
+        }
     }
 
     private func applySettingChange(_ change: TrustSettingsChange) async {
@@ -371,7 +510,9 @@ public final class TrustSettingsViewModel {
             return
         }
 
-        if !requestedEnabled, startupFailureFeedbackModules.contains(module) {
+        if !requestedEnabled,
+           startupFailureFeedbackModules.contains(module),
+           (result.failure != nil || result.settings.modules[module]) {
             return
         }
         modulesWithFailureFeedback.remove(module)
@@ -402,6 +543,8 @@ public final class TrustSettingsViewModel {
             "\(title) could not start and remains off."
         case .persistenceFailed:
             "\(title) could not be saved and was rolled back."
+        case .settingsResetRequired:
+            "Saved settings must be reset before \(title) can change."
         case .rollbackFailed:
             "\(title) failed to start and cleanup needs attention. Check diagnostics."
         case .operationCancelled:
@@ -438,6 +581,8 @@ public final class TrustSettingsViewModel {
             statusMessage = "The module could not start and remains off."
         case .persistenceFailed:
             statusMessage = "The change could not be saved and was rolled back."
+        case .settingsResetRequired:
+            statusMessage = "Saved settings must be reset before changes can be saved."
         case .rollbackFailed:
             statusMessage = "The change failed and cleanup needs attention. Check diagnostics."
         case .launchAtLoginFailed:
@@ -488,11 +633,17 @@ public final class TrustSettingsViewModel {
     }
 
     private static func normalizedDisplayChoices(_ choices: [DisplayChoice]) -> [DisplayChoice] {
-        var seen: Set<DisplayIdentity> = []
+        var seen: Set<DisplayUUID> = []
         var result: [DisplayChoice] = []
         for choice in choices.prefix(DisplayChoiceLimits.maximumInjectedChoicesScanned)
             where seen.insert(choice.identity).inserted {
-            result.append(DisplayChoice(identity: choice.identity, name: choice.name))
+            result.append(
+                DisplayChoice(
+                    identity: choice.identity,
+                    name: choice.name,
+                    isMain: choice.isMain
+                )
+            )
             if result.count == DisplayChoiceLimits.maximumChoices { break }
         }
         return result

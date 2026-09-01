@@ -179,6 +179,7 @@ public struct DiagnosticPlatformSnapshot: Codable, Equatable, Sendable {
 
 public struct DiagnosticSettingsSnapshot: Codable, Equatable, Sendable {
     public enum DisplayScope: String, Codable, Sendable {
+        case automatic
         case allAvailable = "all-available"
         case custom
     }
@@ -204,12 +205,16 @@ public struct DiagnosticSettingsSnapshot: Codable, Equatable, Sendable {
         schemaVersion = settings.schemaVersion
         enabledModules = settings.modules.enabledModules.sorted { $0.rawValue < $1.rawValue }
         displaySurfaceEnabled = settings.displays.isEnabled
-        displayScope = settings.displays.enabledDisplayIDs == nil ? .allAvailable : .custom
+        displayScope = switch settings.displays.surfaceScope {
+        case .automatic: .automatic
+        case .allAvailable: .allAvailable
+        case .custom: .custom
+        }
         customDisplayCount = min(
-            settings.displays.enabledDisplayIDs?.count ?? 0,
+            settings.displays.enabledDisplayUUIDs?.count ?? 0,
             DiagnosticsLimits.maximumProviders
         )
-        displaySelection = settings.displays.selectedDisplayID == nil ? .automatic : .explicit
+        displaySelection = settings.displays.preferredDisplayUUID == nil ? .automatic : .explicit
         motion = settings.motion
         fullscreenBehavior = settings.fullscreenBehavior
         launchAtLoginRequested = settings.launchAtLogin

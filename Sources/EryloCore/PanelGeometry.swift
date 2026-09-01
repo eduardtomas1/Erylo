@@ -10,6 +10,7 @@ public struct PanelMetrics: Equatable, Sendable {
     public let notchHorizontalPadding: CGFloat
     public let notchlessTopInset: CGFloat
     public let timerLauncherSize: CGSize
+    public let notchlessTimerLauncherSize: CGSize
 
     public init(
         maximumSize: CGSize,
@@ -19,7 +20,8 @@ public struct PanelMetrics: Equatable, Sendable {
         dropTargetSize: CGSize,
         notchHorizontalPadding: CGFloat,
         notchlessTopInset: CGFloat = 0,
-        timerLauncherSize: CGSize = CGSize(width: 316, height: 88)
+        timerLauncherSize: CGSize = CGSize(width: 316, height: 88),
+        notchlessTimerLauncherSize: CGSize = CGSize(width: 300, height: 44)
     ) {
         self.maximumSize = maximumSize
         self.compactSize = compactSize
@@ -29,6 +31,7 @@ public struct PanelMetrics: Equatable, Sendable {
         self.notchHorizontalPadding = notchHorizontalPadding
         self.notchlessTopInset = notchlessTopInset
         self.timerLauncherSize = timerLauncherSize
+        self.notchlessTimerLauncherSize = notchlessTimerLauncherSize
     }
 
     public static let feasibility = PanelMetrics(
@@ -39,7 +42,8 @@ public struct PanelMetrics: Equatable, Sendable {
         dropTargetSize: CGSize(width: 404, height: 180),
         notchHorizontalPadding: 30,
         notchlessTopInset: 8,
-        timerLauncherSize: CGSize(width: 316, height: 88)
+        timerLauncherSize: CGSize(width: 316, height: 88),
+        notchlessTimerLauncherSize: CGSize(width: 300, height: 44)
     )
 }
 
@@ -104,6 +108,16 @@ public enum HitRegion: Equatable, Sendable {
                 if !result.contains(component) {
                     result.append(component)
                 }
+            }
+            let sharedBounds = components
+                .dropFirst()
+                .reduce(components[0].rect) { bounds, component in
+                    bounds.intersection(component.rect)
+                }
+            guard !sharedBounds.isNull,
+                  sharedBounds.width > 0,
+                  sharedBounds.height > 0 else {
+                return .empty
             }
             return components.count == 1
                 ? .roundedRectangle(
@@ -183,34 +197,45 @@ public struct PanelLayout: Equatable, Sendable {
         state: PanelPresentationState,
         metrics: PanelMetrics = .feasibility,
         showsFocusTimerLauncher: Bool = false,
-        minimumNotchWingWidth: CGFloat = 0
+        minimumNotchWingWidth: CGFloat = 0,
+        minimumNotchBodyHeight: CGFloat = 0
     ) {
         let maximumSize = metrics.maximumSize
+        let resolvedAttachment: PanelAttachment = display.topEdgeOcclusion == nil
+            ? .notchlessPill
+            : .notchIntegrated
+        attachment = resolvedAttachment
+        let fixedFrameTopEdge = resolvedAttachment == .notchlessPill
+            ? display.visibleFrame.maxY
+            : display.frame.maxY
         fixedFrame = CGRect(
             x: display.frame.midX - maximumSize.width / 2,
-            y: display.frame.maxY - maximumSize.height,
+            y: fixedFrameTopEdge - maximumSize.height,
             width: maximumSize.width,
             height: maximumSize.height
         )
 
-        attachment = display.topEdgeOcclusion == nil ? .notchlessPill : .notchIntegrated
-        surfaceTopInset = attachment == .notchlessPill ? metrics.notchlessTopInset : 0
+        let resolvedSurfaceTopInset = resolvedAttachment == .notchlessPill
+            ? metrics.notchlessTopInset
+            : 0
+        surfaceTopInset = resolvedSurfaceTopInset
 
         let requestedSize = Self.requestedSurfaceSize(
             state: state,
             display: display,
             metrics: metrics,
             showsFocusTimerLauncher: showsFocusTimerLauncher,
-            minimumNotchWingWidth: minimumNotchWingWidth
+            minimumNotchWingWidth: minimumNotchWingWidth,
+            minimumNotchBodyHeight: minimumNotchBodyHeight
         )
-        let availableHeight = max(maximumSize.height - surfaceTopInset, 0)
+        let availableHeight = max(maximumSize.height - resolvedSurfaceTopInset, 0)
         let size = CGSize(
             width: min(max(requestedSize.width, 0), maximumSize.width),
             height: min(max(requestedSize.height, 0), availableHeight)
         )
         surfaceFrame = CGRect(
             x: (maximumSize.width - size.width) / 2,
-            y: maximumSize.height - surfaceTopInset - size.height,
+            y: maximumSize.height - resolvedSurfaceTopInset - size.height,
             width: size.width,
             height: size.height
         )
@@ -259,7 +284,7 @@ public struct PanelLayout: Equatable, Sendable {
             hoverAnchorRegion = .empty
         }
 
-        cornerRadius = switch (attachment, state, showsFocusTimerLauncher) {
+        cornerRadius = switch (resolvedAttachment, state, showsFocusTimerLauncher) {
         case (_, .hidden, _):
             0
         case (.notchlessPill, .compact, true):
@@ -276,9 +301,11 @@ public struct PanelLayout: Equatable, Sendable {
             min(23, size.height / 2)
         }
 
-        if state == .hidden {
+        if state == .hidden || state == .dropTarget {
+            // File Hold is not mounted. The compatibility state must stay inert
+            // and can never become an invisible AppKit click blocker.
             hitRegion = .empty
-        } else if attachment == .notchIntegrated {
+        } else if resolvedAttachment == .notchIntegrated {
             // The concave top corners are transparent. Accept clicks only in an
             // inscribed visible shelf; the global pointer monitor owns the wider
             // noninteractive hover envelope.
@@ -308,10 +335,13 @@ public struct PanelLayout: Equatable, Sendable {
         display: DisplayGeometry,
         metrics: PanelMetrics,
         showsFocusTimerLauncher: Bool,
-        minimumNotchWingWidth: CGFloat
+        minimumNotchWingWidth: CGFloat,
+        minimumNotchBodyHeight: CGFloat
     ) -> CGSize {
         var size = if state == .compact && showsFocusTimerLauncher {
-            metrics.timerLauncherSize
+            display.topEdgeOcclusion == nil
+                ? metrics.notchlessTimerLauncherSize
+                : metrics.timerLauncherSize
         } else {
             switch state {
         case .hidden:
@@ -333,7 +363,10 @@ public struct PanelLayout: Equatable, Sendable {
                 state == .compact ? minimumNotchWingWidth : 0
             )
             size.width = max(size.width, occlusion.frame.width + horizontalPadding * 2)
-            size.height = max(size.height, occlusion.frame.height)
+            size.height = max(
+                size.height,
+                occlusion.frame.height + max(minimumNotchBodyHeight, 0)
+            )
         }
         return size
     }

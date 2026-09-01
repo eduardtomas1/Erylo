@@ -1,3 +1,4 @@
+import AppKit
 import CoreGraphics
 import Darwin
 import EryloActivity
@@ -5,6 +6,7 @@ import EryloCore
 import EryloIntegrations
 import EryloSurface
 import EryloWindowing
+import Foundation
 
 @main
 @MainActor
@@ -14,10 +16,15 @@ enum FoundationHarnessMain {
         harness.verifyPanelStateMachine()
         harness.verifyPanelGeometry()
         harness.verifyDisplayPolicy()
+        harness.verifyExpandedInteractionPolicy()
+        harness.verifyNativeKeyRetirementContract()
+        harness.verifyPassiveActivityAnnouncementPolicy()
+        harness.verifyAutomaticWindowMorphStaging()
         harness.verifyHoverHysteresisAndMotionInterruption()
         await harness.verifyCoordinatorLifecycle()
+        await harness.verifyPassiveAnnouncementDelivery()
         await harness.verifyDemandDrivenPanelLifecycle()
-        await harness.verifyComposedDemandPreservation()
+        await harness.verifyComposedDemandContraction()
         await harness.verifyDisabledProvider()
         harness.finish()
     }
@@ -40,8 +47,8 @@ private struct FoundationHarness {
         check(hidden.send(.primaryAction) == .compact, "primary shortcut reveals a hidden surface")
 
         var hiddenDrop = PanelStateMachine()
-        check(hiddenDrop.send(.dragEntered) == .dropTarget, "delivered hidden drag entry reveals the honest drop target")
-        check(hiddenDrop.send(.dragExited) == .hidden, "hidden drag exit restores invisible rest")
+        check(hiddenDrop.send(.dragEntered) == .dropTarget, "dormant drop reducer records a hidden drag entry")
+        check(hiddenDrop.send(.dragExited) == .hidden, "dormant hidden drag exit restores invisible rest")
 
         var activityVisibility = PanelStateMachine()
         check(activityVisibility.updateActivityAvailability(true) == .compact, "first activity reveals compact state")
@@ -78,7 +85,10 @@ private struct FoundationHarness {
         }
         let fixedFrame = layouts[0].fixedFrame
         check(layouts.allSatisfy { $0.fixedFrame == fixedFrame }, "maximum frame is fixed across states")
-        check(fixedFrame.maxY == display.frame.maxY, "fixed frame is top-edge anchored")
+        check(
+            fixedFrame.maxY == display.visibleFrame.maxY,
+            "notchless fixed frame starts below the usable menu-bar edge"
+        )
 
         let hidden = PanelLayout(display: display, state: .hidden)
         check(!hidden.hitRegion.contains(hidden.surfaceFrame.center), "hidden state has no hit region")
@@ -90,6 +100,11 @@ private struct FoundationHarness {
         check(
             compact.surfaceFrame.maxY == compact.fixedFrame.height - compact.surfaceTopInset,
             "notchless pill inset is represented in AppKit-local geometry"
+        )
+        check(
+            compact.fixedFrame.minY + compact.surfaceFrame.maxY
+                == display.visibleFrame.maxY - compact.surfaceTopInset,
+            "notchless pill renders wholly below the visible-frame top edge"
         )
         check(
             compact.cornerRadius == compact.surfaceFrame.height / 2,
@@ -105,6 +120,27 @@ private struct FoundationHarness {
             "rounded-region boundary is interactive"
         )
 
+        let notchlessLauncher = PanelLayout(
+            display: display,
+            state: .compact,
+            showsFocusTimerLauncher: true
+        )
+        check(
+            notchlessLauncher.surfaceFrame.size
+                == PanelMetrics.feasibility.notchlessTimerLauncherSize,
+            "notchless Focus Timer launcher uses its compact control-bearing footprint"
+        )
+        check(
+            notchlessLauncher.surfaceFrame.size == CGSize(width: 300, height: 44)
+                && notchlessLauncher.surfaceTopInset == 8,
+            "notchless Focus Timer launcher stays one native control row below the menu bar"
+        )
+        check(
+            notchlessLauncher.cornerRadius == 19
+                && notchlessLauncher.hitRegion.contains(notchlessLauncher.surfaceFrame.center),
+            "notchless Focus Timer launcher keeps a bounded continuous pill hit region"
+        )
+
         let peek = PanelLayout(display: display, state: .peek)
         let expanded = PanelLayout(display: display, state: .expanded)
         let dropTarget = PanelLayout(display: display, state: .dropTarget)
@@ -112,12 +148,16 @@ private struct FoundationHarness {
         check(expanded.surfaceFrame.size == CGSize(width: 376, height: 164), "expanded geometry stays compact while preserving content breathing room")
         check(dropTarget.surfaceFrame.size == CGSize(width: 404, height: 180), "drop target remains a bounded extension of expanded geometry")
         check(
-            [peek, expanded, dropTarget].allSatisfy {
+            [peek, expanded].allSatisfy {
                 $0.attachment == .notchlessPill
                     && $0.surfaceTopInset == 8
                     && $0.hitRegion.contains($0.surfaceFrame.center)
             },
             "every visible notchless state keeps the inset rounded fallback interactive"
+        )
+        check(
+            dropTarget.hitRegion == .empty,
+            "unmounted File Hold compatibility state cannot intercept input"
         )
 
         let notchedDisplay = DisplayGeometry(
@@ -131,11 +171,62 @@ private struct FoundationHarness {
         let notched = PanelLayout(display: notchedDisplay, state: .compact)
         check(notched.attachment == .notchIntegrated, "top-edge occlusion selects notch integration")
         check(notched.surfaceTopInset == 0, "notch-integrated surface remains top-edge anchored")
-        check(notched.fixedFrame == compact.fixedFrame, "notch does not change the maximum frame")
+        check(
+            notched.fixedFrame.maxY == notchedDisplay.frame.maxY
+                && notched.fixedFrame.size == compact.fixedFrame.size
+                && notched.fixedFrame.midX == compact.fixedFrame.midX,
+            "notch integration keeps the fixed envelope attached to the physical display edge"
+        )
         check(notched.surfaceFrame.width == 280, "notch width and padding expand compact surface")
         check(notched.surfaceFrame.height == 74, "notch height expands compact surface")
         check(notched.topCornerRadius == 6, "compact notch shoulders use the smallest top curl")
         check(notched.surfaceContentTopInset == 0, "compact content remains in the notch wings")
+
+        let notchedLauncherDisplay = DisplayGeometry(
+            frame: display.frame,
+            visibleFrame: display.visibleFrame,
+            backingScaleFactor: display.backingScaleFactor,
+            topEdgeOcclusion: TopEdgeOcclusion(
+                frame: CGRect(x: 720, y: 906, width: 220, height: 44)
+            )
+        )
+        let notchedLauncher = PanelLayout(
+            display: notchedLauncherDisplay,
+            state: .compact,
+            showsFocusTimerLauncher: true
+        )
+        check(
+            notchedLauncher.surfaceFrame.size == PanelMetrics.feasibility.timerLauncherSize,
+            "notched Focus Timer launcher preserves its camera-safe 316 by 88 geometry"
+        )
+        check(
+            notchedLauncher.surfaceContentTopInset == 44
+                && notchedLauncher.surfaceFrame.height
+                    - notchedLauncher.surfaceContentTopInset == 44,
+            "notched Focus Timer launcher keeps one full control row below the physical occlusion"
+        )
+
+        let bodyReservedPeek = PanelLayout(
+            display: notchedDisplay,
+            state: .peek,
+            minimumNotchBodyHeight: 36
+        )
+        check(
+            bodyReservedPeek.surfaceFrame.height - bodyReservedPeek.surfaceContentTopInset == 36,
+            "notched Peek reserves its requested body height below the occlusion"
+        )
+
+        let maximumBodyRequest = PanelLayout(
+            display: notchedDisplay,
+            state: .expanded,
+            minimumNotchBodyHeight: 176
+        )
+        check(
+            maximumBodyRequest.surfaceFrame.height <= PanelMetrics.feasibility.maximumSize.height
+                && maximumBodyRequest.surfaceFrame.height
+                    - maximumBodyRequest.surfaceContentTopInset == 166,
+            "an oversized notched body request clamps to the maximum envelope without hiding the body calculation"
+        )
 
         let realisticNotchedDisplay = DisplayGeometry(
             frame: CGRect(x: 0, y: 0, width: 1_512, height: 982),
@@ -197,17 +288,33 @@ private struct FoundationHarness {
             mirrored,
         ])
         check(
-            defaultResolution.enabledDisplays.map(\.identity) == [external.identity, main.identity],
-            "safe display policy preserves order while removing mirrors and duplicates"
+            defaultResolution.enabledDisplays.map(\.identity) == [main.identity],
+            "safe display policy enables only the current main display"
         )
         check(
             defaultResolution.selectedDisplayIdentity == main.identity,
             "safe display policy selects the main display"
         )
+        check(!DisplayPolicy.safeDefault.allowsFullscreenAuxiliary, "safe policy excludes fullscreen Spaces")
+        check(
+            DisplayPolicy(allowsFullscreenAuxiliary: true).allowsFullscreenAuxiliary,
+            "fullscreen auxiliary participation requires an explicit policy"
+        )
+        check(
+            !PanelCollectionBehaviorPolicy.make(allowsFullscreenAuxiliary: false)
+                .contains(.fullScreenAuxiliary),
+            "native default collection behavior excludes fullscreen Spaces"
+        )
+        check(
+            PanelCollectionBehaviorPolicy.make(allowsFullscreenAuxiliary: true)
+                .contains(.fullScreenAuxiliary),
+            "native collection behavior adds fullscreen auxiliary only after opt-in"
+        )
 
         let selectedExternal = DisplayPolicy(
-            enabledDisplayIdentities: [external.identity],
-            selectedDisplayIdentity: external.identity
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [external.uuid],
+            preferredDisplayUUID: external.uuid
         ).resolve([main, external, mirrored])
         check(
             selectedExternal.enabledDisplays.map(\.identity) == [external.identity],
@@ -218,17 +325,438 @@ private struct FoundationHarness {
             "explicit selected display drives one-at-a-time interactions"
         )
 
+        let explicitlyEmpty = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [],
+            preferredDisplayUUID: external.uuid
+        ).resolve([main, external])
+        check(
+            explicitlyEmpty.enabledDisplays.isEmpty,
+            "explicitly empty display allowlist creates no panels"
+        )
+        check(
+            explicitlyEmpty.selectedDisplayIdentity == nil,
+            "explicitly empty display allowlist has no shortcut target"
+        )
+
         let missingSelection = DisplayPolicy(
-            selectedDisplayIdentity: DisplayIdentity(rawValue: 999)
+            surfaceScope: .allAvailable,
+            preferredDisplayUUID: makeDisplayUUID(999)
         ).resolve([external, main])
         check(
-            missingSelection.selectedDisplayIdentity == main.identity,
-            "missing selected display safely falls back to main"
+            missingSelection.enabledDisplays.count == 2
+                && missingSelection.selectedDisplayIdentity == nil,
+            "missing preferred display never targets a different available display"
+        )
+
+        let fallbackLeft = makeSnapshot(identity: 40)
+        let fallbackRight = makeSnapshot(identity: 20, originX: 1_440)
+        let firstFallback = DisplayPolicy.safeDefault.resolve([fallbackLeft, fallbackRight])
+        let reorderedFallback = DisplayPolicy.safeDefault.resolve([fallbackRight, fallbackLeft])
+        check(
+            firstFallback.selectedDisplayIdentity == fallbackRight.identity
+                && reorderedFallback.selectedDisplayIdentity == fallbackRight.identity,
+            "mainless fallback selection remains stable across provider reordering"
+        )
+
+        let staleAllowlist = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [makeDisplayUUID(999)],
+            preferredDisplayUUID: makeDisplayUUID(999)
+        ).resolve([external, main])
+        check(
+            staleAllowlist.enabledDisplays.isEmpty
+                && staleAllowlist.selectedDisplayIdentity == nil,
+            "stale custom display UUIDs remain unavailable instead of targeting main"
+        )
+
+        let staleMainlessAllowlist = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [makeDisplayUUID(999)]
+        ).resolve([fallbackLeft, fallbackRight])
+        check(
+            staleMainlessAllowlist.enabledDisplays.isEmpty
+                && staleMainlessAllowlist.selectedDisplayIdentity == nil,
+            "stale mainless custom scope never substitutes a different display"
+        )
+
+        let rebootedExternal = makeSnapshot(
+            identity: 220,
+            uuid: external.uuid,
+            originX: 1_440
+        )
+        let stablePreference = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [external.uuid],
+            preferredDisplayUUID: external.uuid
+        ).resolve([main, rebootedExternal])
+        check(
+            stablePreference.enabledDisplays.map(\.identity) == [rebootedExternal.identity]
+                && stablePreference.selectedDisplayIdentity == rebootedExternal.identity,
+            "stable UUID preference remaps to the display's new session identity"
+        )
+
+        let reusedSessionIdentity = makeSnapshot(
+            identity: external.identity.rawValue,
+            uuid: makeDisplayUUID(777),
+            originX: 1_440
+        )
+        let reusedIdentityResolution = DisplayPolicy(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [external.uuid],
+            preferredDisplayUUID: external.uuid
+        ).resolve([main, reusedSessionIdentity])
+        check(
+            reusedIdentityResolution.enabledDisplays.isEmpty
+                && reusedIdentityResolution.selectedDisplayIdentity == nil,
+            "reused Core Graphics ID with a different UUID never matches saved preference"
         )
 
         let disabled = DisplayPolicy(isEnabled: false).resolve([main, external])
         check(disabled.enabledDisplays.isEmpty, "disabled display policy creates no enabled surfaces")
         check(disabled.selectedDisplayIdentity == nil, "disabled display policy has no shortcut target")
+    }
+
+    mutating func verifyExpandedInteractionPolicy() {
+        let hitRegion = HitRegion.roundedRectangle(
+            CGRect(x: 20, y: 20, width: 200, height: 100),
+            cornerRadius: 20
+        )
+        for state in PanelPresentationState.allCases where state != .expanded {
+            let policy = ExpandedInteractionPolicy(
+                state: state,
+                isWindowPresented: true,
+                hitRegion: hitRegion
+            )
+            check(!policy.allowsKeyInteraction, "\(state.rawValue) cannot become key")
+            check(
+                !policy.requiresMouseDownMonitoring,
+                "\(state.rawValue) owns no outside-click monitors"
+            )
+            check(
+                policy.escapeDecision(panelIsKey: true) == .ignore,
+                "\(state.rawValue) ignores Escape dismissal"
+            )
+        }
+
+        for state in [PanelPresentationState.compact, .peek] {
+            let controlled = ExpandedInteractionPolicy(
+                state: state,
+                isWindowPresented: true,
+                hitRegion: hitRegion,
+                hasExplicitControls: true
+            )
+            check(
+                controlled.allowsKeyInteraction,
+                "control-bearing \(state.rawValue) is eligible for deliberate keyboard interaction"
+            )
+            check(
+                !controlled.requiresMouseDownMonitoring
+                    && controlled.escapeDecision(panelIsKey: true) == .retireKeyFocus,
+                "control-bearing \(state.rawValue) retires key focus without invoking its action"
+            )
+        }
+
+        let expanded = ExpandedInteractionPolicy(
+            state: .expanded,
+            isWindowPresented: true,
+            hitRegion: hitRegion
+        )
+        check(expanded.allowsKeyInteraction, "presented Expanded state permits key interaction")
+        check(
+            expanded.requiresMouseDownMonitoring,
+            "presented Expanded state demands paired outside-click monitors"
+        )
+        check(
+            expanded.mouseDownDecision(at: CGPoint(x: 120, y: 70)) == .keepOpen,
+            "clicks inside the current native hit region preserve Expanded actions"
+        )
+        check(
+            expanded.mouseDownDecision(at: CGPoint(x: 20, y: 20)) == .dismiss,
+            "transparent rounded corners dismiss as outside clicks"
+        )
+        check(
+            expanded.mouseDownDecision(at: CGPoint(x: 240, y: 70)) == .dismiss,
+            "clicks beyond the current native hit region dismiss Expanded"
+        )
+        check(
+            expanded.escapeDecision(panelIsKey: true) == .dismissPresentation,
+            "Escape dismisses when Expanded owns key interaction"
+        )
+        check(
+            expanded.escapeDecision(panelIsKey: false) == .ignore,
+            "Escape does not act when another window owns key interaction"
+        )
+        check(
+            DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: .compact,
+                to: .expanded,
+                isWindowPresented: true
+            ),
+            "shortcut expansion deliberately transfers keyboard focus"
+        )
+        check(
+            DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: .hidden,
+                to: .compact,
+                isWindowPresented: true,
+                hasExplicitControls: true
+            ),
+            "shortcut reveal deliberately focuses a control-bearing compact launcher"
+        )
+        check(
+            !DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: .compact,
+                to: .expanded,
+                isWindowPresented: false
+            )
+                && !DeliberatePanelFocusPolicy.shouldRequestKey(
+                    from: .expanded,
+                    to: .compact,
+                    isWindowPresented: true
+                ),
+            "ordered-out or contracting surfaces never request key focus"
+        )
+
+        let orderedOut = ExpandedInteractionPolicy(
+            state: .expanded,
+            isWindowPresented: false,
+            hitRegion: hitRegion
+        )
+        check(!orderedOut.allowsKeyInteraction, "ordered-out Expanded state cannot become key")
+        check(
+            !orderedOut.requiresMouseDownMonitoring,
+            "ordered-out Expanded state owns no outside-click monitors"
+        )
+
+        var leasePolicy = ExpandedInteractionLeasePolicy()
+        check(!leasePolicy.admits(0), "inactive dismissal lease rejects callbacks")
+        let firstLease = leasePolicy.activate()
+        check(leasePolicy.admits(firstLease), "active dismissal lease admits its callback")
+        leasePolicy.retire()
+        check(!leasePolicy.admits(firstLease), "retired dismissal lease rejects queued callbacks")
+        let secondLease = leasePolicy.activate()
+        check(
+            secondLease != firstLease && leasePolicy.admits(secondLease),
+            "reinstalled monitors own a fresh dismissal lease"
+        )
+        check(
+            !leasePolicy.admits(firstLease),
+            "stale monitor callbacks cannot dismiss a later Expanded session"
+        )
+    }
+
+    mutating func verifyNativeKeyRetirementContract() {
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: true,
+                panelIsKey: true,
+                isWindowPresented: true,
+                wantsSurfacePresentation: true
+            ) == .none,
+            "a still-eligible key panel keeps its current AppKit ownership"
+        )
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: false,
+                panelIsKey: true,
+                isWindowPresented: true,
+                wantsSurfacePresentation: true
+            ) == .orderOutAndRestore,
+            "a contracting key panel uses AppKit ordering while preserving its visible surface"
+        )
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: false,
+                panelIsKey: true,
+                isWindowPresented: true,
+                wantsSurfacePresentation: false
+            ) == .orderOut,
+            "a hidden key panel orders out without restoring stale presentation"
+        )
+        check(
+            PanelKeyRetirementPolicy.action(
+                allowsKeyInteraction: false,
+                panelIsKey: false,
+                isWindowPresented: true,
+                wantsSurfacePresentation: true
+            ) == .none,
+            "a non-key panel performs no unnecessary ordering cycle"
+        )
+
+        let repository = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let windowingDirectory = repository.appendingPathComponent("Sources/EryloWindowing")
+        let directResignPattern = try? NSRegularExpression(
+            pattern: #"\bresignKey\s*\("#
+        )
+        let windowingSources = (try? FileManager.default.contentsOfDirectory(
+            at: windowingDirectory,
+            includingPropertiesForKeys: nil
+        )) ?? []
+        let containsDirectResign = windowingSources
+            .filter { $0.pathExtension == "swift" }
+            .contains { sourceURL in
+                guard let source = try? String(contentsOf: sourceURL, encoding: .utf8),
+                      let directResignPattern else {
+                    return true
+                }
+                return directResignPattern.firstMatch(
+                    in: source,
+                    range: NSRange(source.startIndex..., in: source)
+                ) != nil
+            }
+        check(
+            !windowingSources.isEmpty && directResignPattern != nil && !containsDirectResign,
+            "windowing sources never invoke AppKit's key-resignation notification hook directly"
+        )
+    }
+
+    mutating func verifyPassiveActivityAnnouncementPolicy() {
+        do {
+            var policy = PassiveActivityAnnouncementPolicy()
+            let battery50 = try makeSurfaceItem(
+                identifier: "battery-status",
+                kind: .battery,
+                progress: 0.50,
+                revision: 1
+            )
+            let battery50Revision = try makeSurfaceItem(
+                identifier: "battery-status",
+                kind: .battery,
+                progress: 0.50,
+                revision: 2
+            )
+            let battery60 = try makeSurfaceItem(
+                identifier: "battery-status",
+                kind: .battery,
+                progress: 0.60,
+                revision: 3
+            )
+            check(
+                policy.announcement(for: battery50) == "Battery, 50 percent",
+                "first passive Battery value earns one semantic announcement"
+            )
+            check(
+                policy.announcement(for: battery50) == nil
+                    && policy.announcement(for: battery50Revision) == nil,
+                "observer churn and an equivalent revision do not repeat an announcement"
+            )
+            check(
+                policy.announcement(for: battery60) == "Battery, 60 percent"
+                    && policy.announcement(for: battery50) == "Battery, 50 percent",
+                "real passive value changes announce, including a return to a prior value"
+            )
+
+            let volume = try makeSurfaceItem(
+                identifier: "volume-status",
+                kind: .volume,
+                progress: 0.35,
+                revision: 1
+            )
+            let timer = try makeSurfaceItem(
+                identifier: "timer-status",
+                kind: .timer,
+                progress: 0.35,
+                revision: 1
+            )
+            check(
+                policy.announcement(for: volume) == "Volume, 35 percent",
+                "Volume earns a nonduplicative semantic announcement"
+            )
+            check(
+                policy.announcement(for: timer) == nil && policy.announcement(for: nil) == nil,
+                "interactive and absent activities never use the passive announcement route"
+            )
+
+            for index in 0..<PassiveActivityAnnouncementPolicy.maximumRememberedActivities {
+                _ = policy.announcement(
+                    for: try makeSurfaceItem(
+                        identifier: "bounded-battery-\(index)",
+                        kind: .battery,
+                        progress: 0.25,
+                        revision: 1
+                    )
+                )
+            }
+            check(
+                policy.announcement(for: battery50) == "Battery, 50 percent",
+                "bounded announcement memory evicts its oldest semantic identity"
+            )
+        } catch {
+            check(false, "passive announcement fixtures validate")
+        }
+    }
+
+    mutating func verifyPassiveAnnouncementDelivery() async {
+        let main = makeSnapshot(identity: 61, isMain: true)
+        let external = makeSnapshot(identity: 62, originX: 1_440)
+        let displays = FakeDisplayProvider(displays: [main, external])
+        let events = FakeLifecycleEventSource()
+        let registry = DemandPanelRegistry()
+        let broker = ActivityBroker()
+        let activityModel = SurfaceActivityModel(broker: broker)
+        let announcer = RecordingPanelAccessibilityAnnouncer()
+        let coordinator = PanelCoordinator(
+            displayProvider: displays,
+            policy: DisplayPolicy(surfaceScope: .allAvailable),
+            lifecycleEventSource: events,
+            activityModel: activityModel,
+            accessibilityAnnouncer: announcer,
+            panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
+        )
+
+        await coordinator.startAndWait()
+        do {
+            _ = try await broker.submit(
+                ActivityRequest(
+                    identifier: "coordinator-battery",
+                    source: ActivitySource.battery.rawValue,
+                    kind: ActivityKind.battery.rawValue,
+                    priority: 50,
+                    title: "Battery",
+                    progress: 0.50
+                )
+            )
+            for _ in 0..<2_000 where registry.creationCount != 2 {
+                await Task.yield()
+            }
+            check(
+                announcer.announcements.isEmpty,
+                "passive speech waits until a real demand-reporting panel is presented"
+            )
+            registry.panels.forEach { $0.setDemand(true) }
+            check(
+                registry.panels.allSatisfy { $0.showCount == 1 }
+                    && announcer.announcements == ["Battery, 50 percent"],
+                "late panel demand speaks one passive cue across multiple displays"
+            )
+
+            let equivalentSnapshot = try await broker.submit(
+                ActivityRequest(
+                    identifier: "coordinator-battery",
+                    source: ActivitySource.battery.rawValue,
+                    kind: ActivityKind.battery.rawValue,
+                    priority: 50,
+                    title: "Battery",
+                    progress: 0.50
+                )
+            )
+            for _ in 0..<2_000
+                where activityModel.snapshotVersion < equivalentSnapshot.version {
+                await Task.yield()
+            }
+            check(
+                activityModel.snapshotVersion == equivalentSnapshot.version
+                    && announcer.announcements.count == 1,
+                "consumed equivalent broker revisions do not repeat passive speech"
+            )
+        } catch {
+            check(false, "coordinator passive announcement fixture validates")
+        }
+        await coordinator.shutdown()
     }
 
     mutating func verifyHoverHysteresisAndMotionInterruption() {
@@ -242,15 +770,38 @@ private struct FoundationHarness {
         )
 
         model.setPointerInside(true)
+        check(
+            scheduler.lastScheduledDelay == .milliseconds(120),
+            "hover entry uses the controlled 120 millisecond dwell"
+        )
         model.setPointerInside(false)
+        check(
+            scheduler.activeOperationCount == 0,
+            "leaving before hover dwell cancels pending Peek work"
+        )
         scheduler.runAll()
         check(model.state == .compact, "pointer transit keeps compact geometry stable")
 
         model.setPointerInside(true)
-        check(model.state == .compact, "hover highlights without changing panel geometry")
+        scheduler.runNext()
+        check(model.state == .peek, "sustained hover reveals Peek after its one-shot dwell")
+        model.setPointerInside(false)
+        check(
+            scheduler.lastScheduledDelay == .milliseconds(300),
+            "Peek exit uses the controlled 300 millisecond grace period"
+        )
+        model.setPointerInside(true)
+        scheduler.runAll()
+        check(model.state == .peek, "re-entry cancels the pending Peek exit")
+        model.setPointerInside(false)
+        scheduler.runAll()
+        check(model.state == .compact, "completed hover exit returns Peek to compact")
+
+        model.setPointerInside(true)
+        check(model.state == .compact, "click can preempt the pending hover dwell")
         model.send(.primaryAction)
         scheduler.runAll()
-        check(model.state == .expanded, "click deliberately expands the stable compact surface")
+        check(model.state == .expanded, "click deliberately expands the compact surface")
 
         let motionScheduler = ManualOneShotScheduler()
         let motionModel = PanelSurfaceModel(
@@ -329,8 +880,10 @@ private struct FoundationHarness {
         reduceMotionModel.updateReduceMotion(true)
         reduceMotionModel.send(.primaryAction)
         check(
-            reduceMotionScheduler.lastScheduledDelay == .milliseconds(120),
-            "Reduce Motion uses the crossfade/scale completion duration"
+            reduceMotionScheduler.activeOperationCount == 0
+                && reduceMotionModel.isHitRegionSettled
+                && reduceMotionModel.interactionHitRegion == reduceMotionModel.layout.hitRegion,
+            "Reduce Motion snaps visual geometry and native hit testing without scheduled work"
         )
 
         let notchedDisplay = DisplayGeometry(
@@ -381,8 +934,8 @@ private struct FoundationHarness {
         }
         stableScheduler.runAll()
         check(
-            stableModel.state == .compact,
-            "stationary notch hover cannot oscillate surface geometry"
+            stableModel.state == .peek,
+            "stationary notch hover settles in Peek without geometry oscillation"
         )
         check(
             stableScheduler.activeOperationCount == 0,
@@ -433,6 +986,157 @@ private struct FoundationHarness {
             !hiddenModel.pointerDisposition(at: topAnchorPoint).acceptsMouseEvents,
             "hidden notch anchor remains click-through"
         )
+
+        let launcherScheduler = ManualOneShotScheduler()
+        let launcherModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: launcherScheduler,
+            activityModel: SurfaceActivityModel(inert: ())
+        )
+        let launcherChanges = CallbackCounter()
+        launcherModel.didChange = { [weak launcherChanges] in
+            launcherChanges?.increment()
+        }
+        let compactHitRegion = launcherModel.interactionHitRegion
+        launcherModel.setFocusTimerStartHandler { _ in true }
+        check(launcherModel.state == .compact, "launcher availability is a same-state layout mutation")
+        check(launcherChanges.count == 1, "same-state layout mutation notifies its AppKit owner")
+        let launcherTarget = launcherModel.layout.hitRegion
+        check(
+            launcherModel.interactionHitRegion
+                == compactHitRegion.intersecting(launcherTarget),
+            "same-state growth keeps the native hit region inside visible geometry"
+        )
+        check(
+            launcherScheduler.activeOperationCount == 1,
+            "same-state growth owns one bounded hit-region settlement"
+        )
+        launcherScheduler.runAll()
+        check(
+            launcherModel.interactionHitRegion == launcherTarget
+                && launcherChanges.count == 2,
+            "same-state growth adopts the exact target after the morph settles"
+        )
+    }
+
+    mutating func verifyAutomaticWindowMorphStaging() {
+        let display = makeSnapshot(identity: 11, isMain: true).geometry
+        let scheduler = ManualOneShotScheduler()
+        let model = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .compact,
+            scheduler: scheduler,
+            activityModel: makeActiveActivityModel()
+        )
+        model.setWindowPresented(false)
+
+        check(
+            model.stageForWindowOrderIn()
+                && model.state == .compact
+                && model.renderedState == .hidden
+                && model.interactionHitRegion == .empty,
+            "automatic order-in commits a real inert Hidden frame"
+        )
+
+        model.setWindowPresented(true)
+        model.send(.hoverBegan)
+        check(
+            model.state == .peek && model.renderedState == .hidden,
+            "a Compact-to-Peek handoff cannot bypass the staged entrance"
+        )
+        check(
+            model.commitStagedWindowOrderIn()
+                && model.renderedState == .peek,
+            "the staged entrance reveals the newest valid logical destination"
+        )
+        scheduler.runAll()
+        check(
+            model.interactionHitRegion == model.layout.hitRegion,
+            "the revealed destination earns its exact hit region only after motion settles"
+        )
+
+        let exitDelay = model.stageForWindowOrderOut()
+        check(
+            exitDelay == .milliseconds(220)
+                && model.state == .peek
+                && model.renderedState == .hidden
+                && model.interactionHitRegion == .empty,
+            "standard dismissal reaches click-through Hidden before physical order-out"
+        )
+
+        model.updateReduceMotion(true)
+        check(
+            model.stageForWindowOrderOut() == nil
+                && model.renderedState == .hidden
+                && model.interactionHitRegion == .empty,
+            "Reduce Motion keeps physical dismissal synchronous"
+        )
+
+        let completionScheduler = ManualOneShotScheduler()
+        guard let completionSnapshot = try? ActivitySurfacePreviewCatalog.timerCompletion.snapshot() else {
+            check(false, "timer completion entrance fixture validates")
+            return
+        }
+        let completionModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .peek,
+            scheduler: completionScheduler,
+            activityModel: SurfaceActivityModel(previewSnapshot: completionSnapshot)
+        )
+        completionModel.setWindowPresented(false)
+        check(
+            completionModel.stageForWindowOrderIn()
+                && completionModel.state == .peek
+                && completionModel.renderedState == .hidden,
+            "automatic timer completion Peek begins from committed Hidden geometry"
+        )
+        completionModel.setWindowPresented(true)
+        check(
+            completionModel.commitStagedWindowOrderIn()
+                && completionModel.renderedState == .peek,
+            "automatic timer completion reveals Peek through the staged morph"
+        )
+
+        let genericPeekModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .peek,
+            scheduler: ManualOneShotScheduler(),
+            activityModel: makeActiveActivityModel()
+        )
+        check(
+            !DeliberatePanelFocusLeasePolicy.admits(
+                pending: genericPeekModel.deliberateFocusDestination,
+                current: completionModel.deliberateFocusDestination
+            ),
+            "an automatic same-state activity handoff cannot inherit another activity's pending focus"
+        )
+
+        let launcherModel = PanelSurfaceModel(
+            displayGeometry: display,
+            initialState: .hidden,
+            scheduler: ManualOneShotScheduler(),
+            activityModel: SurfaceActivityModel(inert: ())
+        )
+        launcherModel.setFocusTimerStartHandler { _ in true }
+        launcherModel.setWindowPresented(false)
+        let launcherOrigin = launcherModel.state
+        launcherModel.send(.primaryAction)
+        check(
+            launcherModel.stageForWindowOrderIn()
+                && launcherModel.renderedState == .hidden
+                && launcherModel.logicalContentHasExplicitControls,
+            "staged launcher retains its logical control-bearing destination"
+        )
+        check(
+            DeliberatePanelFocusPolicy.shouldRequestKey(
+                from: launcherOrigin,
+                to: launcherModel.state,
+                isWindowPresented: true,
+                hasExplicitControls: launcherModel.logicalContentHasExplicitControls
+            ),
+            "Hidden-to-Compact launcher shortcut retains deliberate focus admission after reentrancy"
+        )
     }
 
     mutating func verifyCoordinatorLifecycle() async {
@@ -446,7 +1150,10 @@ private struct FoundationHarness {
         let activityModel = SurfaceActivityModel(broker: broker)
         let coordinator = PanelCoordinator(
             displayProvider: provider,
-            policy: DisplayPolicy(selectedDisplayIdentity: external.identity),
+            policy: DisplayPolicy(
+                surfaceScope: .allAvailable,
+                preferredDisplayUUID: external.uuid
+            ),
             lifecycleEventSource: eventSource,
             activityModel: activityModel,
             panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
@@ -486,6 +1193,32 @@ private struct FoundationHarness {
         eventSource.emit(.pointerMoved(CGPoint(x: -100, y: -100)))
         let mainPanel = registry.latestPanel(for: main.identity)
         let externalPanel = registry.latestPanel(for: external.identity)
+        check(
+            mainPanel?.fullscreenAuxiliaryUpdates == [false]
+                && externalPanel?.fullscreenAuxiliaryUpdates == [false],
+            "new panels start excluded from fullscreen Spaces"
+        )
+        var fullscreenPolicy = coordinator.policy
+        fullscreenPolicy.allowsFullscreenAuxiliary = true
+        coordinator.update(policy: fullscreenPolicy)
+        check(
+            mainPanel?.fullscreenAuxiliaryUpdates.last == true
+                && externalPanel?.fullscreenAuxiliaryUpdates.last == true,
+            "fullscreen opt-in updates every existing panel"
+        )
+        let contractionBaseline = (
+            mainPanel?.cancellationCount ?? 0,
+            externalPanel?.cancellationCount ?? 0
+        )
+        fullscreenPolicy.allowsFullscreenAuxiliary = false
+        coordinator.update(policy: fullscreenPolicy)
+        check(
+            mainPanel?.fullscreenAuxiliaryUpdates.last == false
+                && externalPanel?.fullscreenAuxiliaryUpdates.last == false
+                && mainPanel?.cancellationCount == contractionBaseline.0 + 1
+                && externalPanel?.cancellationCount == contractionBaseline.1 + 1,
+            "fullscreen opt-out contracts transient state before updating existing panels"
+        )
         let mainPointerBaseline = mainPanel?.pointerUpdateCount ?? 0
         let externalPointerBaseline = externalPanel?.pointerUpdateCount ?? 0
 
@@ -530,7 +1263,7 @@ private struct FoundationHarness {
         check(registry.latestPanel(for: external.identity)?.primaryActionCount == 1, "shortcut targets selected display")
         check(registry.latestPanel(for: main.identity)?.primaryActionCount == 0, "shortcut does not fan out")
 
-        let replacement = makeSnapshot(identity: 40, originX: 1_440)
+        let replacement = makeSnapshot(identity: 40, uuid: external.uuid, originX: 1_440)
         provider.displays = [main, replacement]
         eventSource.emit(.displayConfigurationChanged)
         check(registry.creationCount == 3, "hot-plug adds only the new display panel")
@@ -544,7 +1277,11 @@ private struct FoundationHarness {
         check(registry.creationCount == 3, "active-Space reconciliation reuses existing panels")
 
         eventSource.emit(.workspaceWillSleep)
-        check(registry.latestPanel(for: main.identity)?.hideCount == 1, "sleep hides existing panels")
+        check(
+            registry.latestPanel(for: main.identity)?.hideCount == 1
+                && registry.latestPanel(for: main.identity)?.immediateEnvironmentalHideCount == 1,
+            "sleep uses the immediate environmental hide route"
+        )
         check(!eventSource.isPointerMonitoringEnabled, "sleep retires pointer monitoring while panels are hidden")
         let shortcutCountBeforeSleep = registry.totalPrimaryActionCount
         eventSource.emit(.primaryShortcut)
@@ -562,12 +1299,12 @@ private struct FoundationHarness {
         for _ in 0..<2_000 where eventSource.isPointerMonitoringEnabled { await Task.yield() }
         check(!eventSource.isPointerMonitoringEnabled, "final activity hide tears down pointer monitors")
         check(registry.creationCount == 3, "final hide retains the bounded constructed panel set")
-        let retainedMainPanel = registry.latestPanel(for: main.identity)
-        let retainedShowCount = retainedMainPanel?.showCount
+        let retainedSelectedPanel = registry.latestPanel(for: replacement.identity)
+        let retainedShowCount = retainedSelectedPanel?.showCount
         eventSource.emit(.primaryShortcut)
         check(
-            retainedMainPanel?.showCount == retainedShowCount.map { $0 + 1 },
-            "one shortcut re-presents a retained plain presenter after final activity hide"
+            retainedSelectedPanel?.showCount == retainedShowCount.map { $0 + 1 },
+            "one shortcut re-presents the retained selected presenter after final activity hide"
         )
         check(eventSource.isPointerMonitoringEnabled, "plain-presenter shortcut restores pointer monitoring")
         eventSource.emit(.primaryShortcut)
@@ -624,7 +1361,10 @@ private struct FoundationHarness {
         let model = SurfaceActivityModel(broker: ActivityBroker())
         let coordinator = PanelCoordinator(
             displayProvider: FakeDisplayProvider(displays: [main, selected]),
-            policy: DisplayPolicy(selectedDisplayIdentity: selected.identity),
+            policy: DisplayPolicy(
+                surfaceScope: .allAvailable,
+                preferredDisplayUUID: selected.uuid
+            ),
             lifecycleEventSource: events,
             activityModel: model,
             panelFactory: { snapshot, _ in registry.makePanel(snapshot: snapshot) }
@@ -674,7 +1414,7 @@ private struct FoundationHarness {
         check(!events.isRunning && !events.isPointerMonitoringEnabled, "shutdown rejects pending or replayed presentation demand")
     }
 
-    mutating func verifyComposedDemandPreservation() async {
+    mutating func verifyComposedDemandContraction() async {
         let broker = ActivityBroker()
         let activityModel = SurfaceActivityModel(broker: broker)
         let events = FakeLifecycleEventSource()
@@ -693,10 +1433,11 @@ private struct FoundationHarness {
         let request: (String) -> ActivityRequest = { identifier in
             ActivityRequest(
                 identifier: identifier,
-                source: ActivitySource.timer.rawValue,
-                kind: ActivityKind.timer.rawValue,
+                source: ActivitySource.external.rawValue,
+                kind: ActivityKind.generic.rawValue,
                 priority: 50,
-                title: identifier
+                title: identifier,
+                detail: "Inspect result"
             )
         }
 
@@ -721,47 +1462,15 @@ private struct FoundationHarness {
             _ = await broker.cancel(identity)
         }
         for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
-        check(panel.state == .expanded, "activity expiry preserves deliberate expanded demand")
-        check(panel.isPresented && panel.hideCount == 0, "coordinator does not order out an expanded empty surface")
-        check(events.isPointerMonitoringEnabled, "expanded empty surface retains pointer monitoring")
+        check(panel.state == .hidden, "activity expiry removes a stale expanded composition")
+        check(!panel.isPresented && panel.hideCount == 1, "coordinator orders out the expired empty surface")
+        check(!events.isPointerMonitoringEnabled, "expired expanded content releases pointer monitoring")
         events.emit(.primaryShortcut)
-        check(panel.state == .hidden && !panel.isPresented, "one shortcut hides the still-present expanded empty surface")
-        check(!events.isPointerMonitoringEnabled, "expanded contraction removes final pointer monitoring")
-
-        do {
-            _ = try await broker.submit(request("drop-exit"))
-        } catch {
-            check(false, "drop-exit activity validates")
-        }
-        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
-        panel.send(.dragEntered)
-        check(panel.state == .dropTarget, "drag entry demands the composed drop target")
-        if let identity = await broker.snapshot().current?.activity.identity {
-            _ = await broker.cancel(identity)
-        }
-        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
-        check(panel.state == .dropTarget && panel.isPresented, "activity loss preserves active drop-target demand")
-        check(events.isPointerMonitoringEnabled, "active drop target retains pointer monitoring after activity loss")
-        panel.send(.dragExited)
-        check(panel.state == .hidden && !panel.isPresented, "drag exit restores hidden after activity loss")
-        check(!events.isPointerMonitoringEnabled, "drag exit removes final pointer monitoring")
-
-        do {
-            _ = try await broker.submit(request("drop-complete"))
-        } catch {
-            check(false, "drop-complete activity validates")
-        }
-        for _ in 0..<2_000 where panel.state != .compact { await Task.yield() }
-        panel.send(.dragEntered)
-        if let identity = await broker.snapshot().current?.activity.identity {
-            _ = await broker.cancel(identity)
-        }
-        for _ in 0..<2_000 where activityModel.current != nil { await Task.yield() }
-        panel.send(.dropCompleted)
-        check(panel.state == .expanded && panel.isPresented, "drop completion settles into demanded expanded state")
-        check(events.isPointerMonitoringEnabled, "completed empty drop remains monitored while expanded")
+        check(panel.state == .compact && panel.isPresented, "one shortcut reveals the retained compact surface")
+        check(events.isPointerMonitoringEnabled, "revealed compact surface restores pointer monitoring")
         events.emit(.primaryShortcut)
-        check(panel.state == .hidden && !events.isPointerMonitoringEnabled, "one shortcut contracts the completed empty drop")
+        check(panel.state == .hidden && !panel.isPresented, "second shortcut hides the retained empty surface")
+        check(!events.isPointerMonitoringEnabled, "empty surface contraction removes final pointer monitoring")
 
         await coordinator.shutdown()
         check(!events.isRunning && !events.isPointerMonitoringEnabled, "composed demand fixture shuts down with zero event work")
@@ -802,8 +1511,55 @@ private func makeActiveActivityModel() -> SurfaceActivityModel {
     return SurfaceActivityModel(previewSnapshot: snapshot)
 }
 
+private func makeSurfaceItem(
+    identifier: String,
+    kind: ActivityKind,
+    progress: Double,
+    revision: UInt64
+) throws -> ActivitySurfaceItem {
+    let source: ActivitySource = switch kind {
+    case .battery, .charging:
+        .battery
+    case .timer:
+        .timer
+    case .meeting:
+        .calendar
+    case .volume:
+        .volume
+    case .media, .file, .generic:
+        .external
+    }
+    let activity = try Activity(
+        validating: ActivityRequest(
+            identifier: identifier,
+            source: source.rawValue,
+            kind: kind.rawValue,
+            priority: 50,
+            title: kind.rawValue.capitalized,
+            progress: progress
+        )
+    )
+    return ActivitySurfaceItem(
+        PresentedActivity(
+            activity: activity,
+            submissionSequence: 1,
+            revision: revision
+        )
+    )
+}
+
+@MainActor
+private final class RecordingPanelAccessibilityAnnouncer: PanelAccessibilityAnnouncing {
+    private(set) var announcements: [String] = []
+
+    func announce(_ text: String) {
+        announcements.append(text)
+    }
+}
+
 private func makeSnapshot(
     identity: UInt32,
+    uuid: DisplayUUID? = nil,
     originX: CGFloat = 0,
     isMain: Bool = false,
     isMirrored: Bool = false
@@ -811,6 +1567,8 @@ private func makeSnapshot(
     let frame = CGRect(x: originX, y: 0, width: 1_440, height: 900)
     return DisplaySnapshot(
         identity: DisplayIdentity(rawValue: identity),
+        uuid: uuid ?? makeDisplayUUID(identity),
+        localizedName: isMain ? "Built-in Display" : "External Display",
         geometry: DisplayGeometry(
             frame: frame,
             visibleFrame: CGRect(x: originX, y: 0, width: 1_440, height: 875),
@@ -822,12 +1580,26 @@ private func makeSnapshot(
     )
 }
 
+private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
+    let uuid = String(format: "00000000-0000-0000-0000-%012llx", UInt64(value))
+    return DisplayUUID(rawValue: uuid)!
+}
+
 @MainActor
 private final class ManualScheduledOperation: ScheduledOperation {
     private(set) var isCancelled = false
 
     func cancel() {
         isCancelled = true
+    }
+}
+
+@MainActor
+private final class CallbackCounter {
+    private(set) var count = 0
+
+    func increment() {
+        count += 1
     }
 }
 
@@ -944,7 +1716,7 @@ private final class FakePanelRegistry {
 }
 
 @MainActor
-private final class FakePanel: PanelPresenting {
+private final class FakePanel: PanelPresenting, PanelImmediateEnvironmentalHiding {
     let displayIdentity: DisplayIdentity
     private(set) var showCount = 0
     private(set) var hideCount = 0
@@ -954,6 +1726,8 @@ private final class FakePanel: PanelPresenting {
     private(set) var lastPointerPosition: CGPoint?
     private(set) var primaryActionCount = 0
     private(set) var cancellationCount = 0
+    private(set) var immediateEnvironmentalHideCount = 0
+    private(set) var fullscreenAuxiliaryUpdates: [Bool] = []
 
     init(displayIdentity: DisplayIdentity) {
         self.displayIdentity = displayIdentity
@@ -965,6 +1739,11 @@ private final class FakePanel: PanelPresenting {
 
     func hide() {
         hideCount += 1
+    }
+
+    func hideImmediatelyForEnvironmentalTransition() {
+        immediateEnvironmentalHideCount += 1
+        hide()
     }
 
     func close() {
@@ -986,6 +1765,11 @@ private final class FakePanel: PanelPresenting {
 
     func cancelPendingInteractions() {
         cancellationCount += 1
+    }
+
+    func setFullscreenAuxiliaryEnabled(_ enabled: Bool) {
+        guard fullscreenAuxiliaryUpdates.last != enabled else { return }
+        fullscreenAuxiliaryUpdates.append(enabled)
     }
 }
 
@@ -1043,6 +1827,11 @@ private final class DemandPanel: PanelPresenting, PanelPresentationDemandReporti
     func replayDemandRegistration(_ registration: Int, isDemanded: Bool) {
         guard demandRegistrations.indices.contains(registration) else { return }
         demandRegistrations[registration](isDemanded)
+    }
+
+    func setDemand(_ isDemanded: Bool) {
+        self.isDemanded = isDemanded
+        demandHandler?(isDemanded)
     }
 
     func show() {

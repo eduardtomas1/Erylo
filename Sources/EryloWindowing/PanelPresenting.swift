@@ -14,6 +14,8 @@ public protocol PanelPresenting: AnyObject {
     func performPrimaryAction()
     func performVisibilityToggle()
     func cancelPendingInteractions()
+    func contractForEnvironmentalTransition()
+    func setFullscreenAuxiliaryEnabled(_ enabled: Bool)
 }
 
 /// Package-only feedback from native panels to the process coordinator. The
@@ -47,11 +49,37 @@ package protocol PanelFocusTimerLaunching: AnyObject {
     )
 }
 
+/// A deliberate shortcut may focus controls that are already on screen without
+/// also invoking the surface's semantic primary action.
+@MainActor
+package protocol PanelExistingControlFocusing: AnyObject {
+    @discardableResult
+    func focusExistingControls() -> Bool
+}
+
+/// Native panels distinguish lifecycle retirement from a user-visible demand
+/// contraction. Sleep must never wait for the outgoing surface animation.
+@MainActor
+package protocol PanelImmediateEnvironmentalHiding: AnyObject {
+    func hideImmediatelyForEnvironmentalTransition()
+}
+
 public extension PanelPresenting {
     /// Compatibility fallback for injected presenters that only implement the original action.
     /// The native presenter overrides this with a strict hidden/visible surface toggle.
     func performVisibilityToggle() {
         performPrimaryAction()
+    }
+
+    /// Compatibility fallback for injected presenters without an internal
+    /// surface reducer. Native panels override this to retire Peek/Expanded.
+    func contractForEnvironmentalTransition() {
+        cancelPendingInteractions()
+    }
+
+    /// Compatibility fallback for injected presenters without native AppKit policy.
+    func setFullscreenAuxiliaryEnabled(_ enabled: Bool) {
+        _ = enabled
     }
 }
 

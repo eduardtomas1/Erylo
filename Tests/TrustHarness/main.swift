@@ -1,9 +1,11 @@
+import AppKit
 import CoreGraphics
 import Darwin
 import EryloCore
 import EryloSettingsUI
 import EryloTrust
 import Foundation
+import SwiftUI
 
 @main
 @MainActor
@@ -23,8 +25,11 @@ private final class TrustHarness {
     func run() async {
         await verifySafeDefaultsAndCompatibility()
         await verifyMigrationCorruptionAndBounds()
+        await verifySettingsRecoveryWriteProtection()
         await verifyAtomicPersistence()
         await verifyNoWorkWhileBrowsingOrDisabled()
+        await verifyOnboardingCommandAdmission()
+        await verifyOnboardingCompletionPersistence()
         await verifyRowLocalModuleFeedback()
         await verifyPromptFreePersistedRestore()
         await verifyConcurrentToggleSerialization()
@@ -34,9 +39,125 @@ private final class TrustHarness {
         await verifyResetAndTerminalStopAll()
         await verifyLaunchAtLoginSeam()
         await verifyDisplayScopeBoundsAndUIOrdering()
+        await verifyDisplayPolicySemanticsEndToEnd()
         await verifyDiagnosticsSchemaRedactionAndBounds()
         await verifyMaliciousCollectorReboundingAndExportFailures()
         verifyAccessibilityCopy()
+        if let outputDirectory = ProcessInfo.processInfo.environment["ERYLO_SETTINGS_VISUAL_QA_DIRECTORY"] {
+            do {
+                try await writeNativeSettingsVisualQA(
+                    to: URL(fileURLWithPath: outputDirectory)
+                )
+            } catch {
+                failures.append("native settings visual QA renders")
+                fputs("Settings visual QA rendering failed: \(error)\n", stderr)
+            }
+        }
+    }
+
+    private func verifySettingsRecoveryWriteProtection() async {
+        let recoveryCases: [(Data, Bool, SettingsLoadDisposition)] = [
+            (Data("not-json".utf8), false, .corrupt),
+            (Data("{\"schemaVersion\":999}".utf8), false, .unsupportedVersion),
+            (
+                Data(repeating: 0x20, count: SettingsLimits.maximumEncodedBytes + 1),
+                false,
+                .oversized
+            ),
+            (Data("unreadable".utf8), true, .readFailure),
+        ]
+
+        for (rawValue, failsRead, disposition) in recoveryCases {
+            let storage = TestAtomicSettingsStorage(
+                initialData: rawValue,
+                failsReads: failsRead
+            )
+            let repository = SettingsRepository(storage: storage)
+            do {
+                _ = try await repository.update { $0.onboardingCompleted = true }
+                check(false, "\(disposition.rawValue) fallback rejects ordinary writes")
+            } catch let error {
+                check(
+                    error == .settingsResetRequired(disposition),
+                    "\(disposition.rawValue) fallback reports explicit reset requirement"
+                )
+            }
+            check(
+                storage.replacementAttemptCount == 0 && storage.currentData == rawValue,
+                "\(disposition.rawValue) fallback preserves the exact opaque saved value"
+            )
+            check(
+                await repository.loadReport().disposition == disposition,
+                "\(disposition.rawValue) recovery report survives a rejected edit"
+            )
+
+            storage.failNextReplacement()
+            do {
+                _ = try await repository.resetToSafeDefaults()
+                check(false, "failed \(disposition.rawValue) reset reports storage failure")
+            } catch let error {
+                check(error == .storageWriteFailed, "failed reset retains its typed write failure")
+            }
+            let failedResetDisposition = await repository.loadReport().disposition
+            check(
+                storage.currentData == rawValue
+                    && failedResetDisposition == disposition,
+                "failed \(disposition.rawValue) reset leaves bytes and recovery state unchanged"
+            )
+
+            do {
+                _ = try await repository.resetToSafeDefaults()
+                _ = try await repository.update { $0.onboardingCompleted = true }
+            } catch {
+                check(false, "successful \(disposition.rawValue) reset reopens ordinary persistence")
+            }
+            let recoveredDisposition = await repository.loadReport().disposition
+            check(
+                recoveredDisposition == .current
+                    && SettingsCodec().decode(storage.currentData).settings.onboardingCompleted,
+                "explicit \(disposition.rawValue) reset is the first safe write boundary"
+            )
+        }
+
+        let guardedStorage = TestAtomicSettingsStorage(initialData: Data("not-json".utf8))
+        let guardedProvider = TestLifecycleProvider()
+        let guardedFixture = makeFixture(storage: guardedStorage, provider: guardedProvider)
+        let moduleResult = await guardedFixture.coordinator.setModuleEnabled(.battery, enabled: true)
+        let loginResult = await guardedFixture.coordinator.setLaunchAtLoginEnabled(true)
+        let onboardingResult = await guardedFixture.coordinator.apply(.onboardingCompleted(true))
+        let guardedFactoryMakeCount = await guardedFixture.factory.makeCount
+        check(
+            moduleResult.failure == .settingsResetRequired
+                && loginResult.failure == .settingsResetRequired
+                && onboardingResult.failure == .settingsResetRequired,
+            "recovery blocks every ordinary trust mutation with one explicit failure"
+        )
+        check(
+            guardedFactoryMakeCount == 0
+                && guardedFixture.launchController.changeRequests.isEmpty
+                && guardedStorage.replacementAttemptCount == 0,
+            "recovery preflight blocks provider, Login Item, and persistence side effects"
+        )
+        _ = await guardedFixture.coordinator.stopAll()
+
+        let rollbackStorage = TestAtomicSettingsStorage(
+            initialData: Data("not-json".utf8)
+        )
+        let rollbackFixture = makeFixture(
+            storage: rollbackStorage,
+            provider: TestLifecycleProvider()
+        )
+        rollbackFixture.launchController.seedEnabledForTesting()
+        rollbackStorage.failNextReplacement()
+        let failedReset = await rollbackFixture.coordinator.resetToSafeDefaults()
+        check(
+            failedReset.outcome == .rolledBack
+                && failedReset.failure == .persistenceFailed
+                && rollbackFixture.launchController.isEnabled
+                && rollbackFixture.launchController.changeRequests == [false, true],
+            "failed recovery Reset restores the actual preflight Login Item state, not fallback settings"
+        )
+        _ = await rollbackFixture.coordinator.stopAll()
     }
 
     private func verifySafeDefaultsAndCompatibility() async {
@@ -44,8 +165,13 @@ private final class TrustHarness {
         check(EryloModule.allCases.allSatisfy { !defaults.modules[$0] }, "safe defaults disable every module")
         check(!defaults.crashAndDiagnosticSharingConsent, "crash and diagnostic sharing is opt-in")
         check(!defaults.launchAtLogin, "launch at login defaults off")
+        check(defaults.displays.surfaceScope == .automatic, "display scope defaults to one automatic display")
         check(defaults.motion == .systemDefault, "motion follows the system by default")
         check(defaults.fullscreenBehavior == .hide, "fullscreen behavior defaults to hidden")
+        check(!defaults.displayPolicy.allowsFullscreenAuxiliary, "safe display policy does not join fullscreen Spaces")
+        var fullscreenOptIn = defaults
+        fullscreenOptIn.fullscreenBehavior = .remainAvailable
+        check(fullscreenOptIn.displayPolicy.allowsFullscreenAuxiliary, "explicit fullscreen preference enables auxiliary participation")
         check(!MotionPreference.systemDefault.shouldReduceMotion(systemValue: false), "system motion preserves false")
         check(MotionPreference.systemDefault.shouldReduceMotion(systemValue: true), "system motion preserves true")
         check(MotionPreference.reduce.shouldReduceMotion(systemValue: false), "explicit Reduce Motion always reduces")
@@ -54,6 +180,14 @@ private final class TrustHarness {
         check(EryloModule.spotify.permissionRequirement == .appleEvents, "Spotify owns the Apple Events policy")
         check(EryloModule.fileHold.permissionRequirement == nil, "File Hold does not pre-request a generic permission")
         check(EryloModule.localIntegrations.permissionRequirement == nil, "local integrations do not pre-request a system permission")
+        check(
+            TrustSettingsPresentation.configurableModules == [.battery, .volume],
+            "Settings presents only the two shipping configurable modules"
+        )
+        check(
+            !TrustSettingsPresentation.configurableModules.contains(.timer),
+            "Focus Timer is explained without a background-module toggle"
+        )
         check(ModuleCopy.explanation(for: .appleMusic).contains("not included"), "Apple Music copy is explicit future work")
         check(ModuleCopy.explanation(for: .spotify).contains("not included"), "Spotify copy is explicit future work")
 
@@ -61,8 +195,9 @@ private final class TrustHarness {
         let external = display(20)
         let preferences = DisplayPreferences(
             isEnabled: true,
-            enabledDisplayIDs: [20, 20],
-            selectedDisplayID: 20
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [external.uuid, external.uuid],
+            preferredDisplayUUID: external.uuid
         )
         let resolution = preferences.displayPolicy.resolve([main, external])
         check(resolution.enabledDisplays.map(\.identity) == [external.identity], "display preferences map to DisplayPolicy")
@@ -93,13 +228,57 @@ private final class TrustHarness {
         let report = await repository.loadReport()
         check(migrated.schemaVersion == EryloSettings.currentSchemaVersion, "v1 migrates to current schema")
         check(migrated.modules.battery && migrated.modules.volume, "v1 module values migrate")
-        check(migrated.displays.enabledDisplayIDs == [7, 42], "migration deduplicates display IDs")
+        check(
+            migrated.displays.surfaceScope == .automatic
+                && migrated.displays.enabledDisplayUUIDs == nil
+                && migrated.displays.preferredDisplayUUID == nil,
+            "v1 migration discards session-scoped display IDs and returns to automatic"
+        )
         check(migrated.motion == .reduce, "legacy Reduce Motion migrates")
         check(migrated.fullscreenBehavior == .remainAvailable, "fullscreen preference migrates")
         check(migrated.crashAndDiagnosticSharingConsent, "legacy diagnostic consent migrates to explicit crash and diagnostic consent")
         check(!migrated.onboardingCompleted, "new migration field uses safe default")
         check(report.disposition == .migrated && report.migrationWasPersisted, "migration persistence is reported")
         check(storage.successfulReplacementCount == 1, "migration uses one whole-value replacement")
+
+        let legacyV2JSON = """
+        {
+          "schemaVersion": 2,
+          "modules": {
+            "fileHold": false, "appleMusic": false, "spotify": false,
+            "battery": true, "timer": false, "calendar": false,
+            "volume": true, "localIntegrations": false
+          },
+          "displays": {
+            "isEnabled": true,
+            "enabledDisplayIDs": [42],
+            "selectedDisplayID": 42
+          },
+          "motion": "system-default",
+          "fullscreenBehavior": "hide",
+          "launchAtLogin": false,
+          "crashAndDiagnosticSharingConsent": false,
+          "onboardingCompleted": true
+        }
+        """
+        let migratedV2 = SettingsCodec().decode(Data(legacyV2JSON.utf8))
+        check(
+            migratedV2.report.disposition == .migrated
+                && migratedV2.settings.displays.surfaceScope == .automatic
+                && migratedV2.settings.displays.enabledDisplayUUIDs == nil
+                && migratedV2.settings.displays.preferredDisplayUUID == nil,
+            "v2 migration never reinterprets a raw display ID as stable identity"
+        )
+        let legacyV2EmptyJSON = legacyV2JSON.replacingOccurrences(
+            of: "\"enabledDisplayIDs\": [42]",
+            with: "\"enabledDisplayIDs\": []"
+        )
+        let migratedV2Empty = SettingsCodec().decode(Data(legacyV2EmptyJSON.utf8))
+        check(
+            migratedV2Empty.settings.displays.surfaceScope == .custom
+                && migratedV2Empty.settings.displays.enabledDisplayUUIDs == [],
+            "v2 migration preserves an intentional empty display scope"
+        )
 
         let readOnlyMigrationStorage = TestAtomicSettingsStorage(initialData: Data(legacyJSON.utf8))
         let readOnlyMigrationRepository = SettingsRepository(
@@ -134,21 +313,25 @@ private final class TrustHarness {
         check(await hugeRepository.loadReport().disposition == .oversized, "oversized settings are reported")
         check(hugeStorage.successfulReplacementCount == 0, "oversized bytes are not rewritten automatically")
 
-        let manyIDs = (0..<10_000).map(UInt32.init)
-        let boundedPreferences = DisplayPreferences(enabledDisplayIDs: manyIDs)
+        let manyUUIDs = (0..<10_000).map { makeDisplayUUID(UInt32($0)) }
+        let boundedPreferences = DisplayPreferences(
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: manyUUIDs
+        )
         check(
-            boundedPreferences.enabledDisplayIDs?.count == SettingsLimits.maximumEnabledDisplayIDs,
-            "display preference initializer caps IDs"
+            boundedPreferences.enabledDisplayUUIDs?.count == SettingsLimits.maximumEnabledDisplayUUIDs,
+            "display preference initializer caps UUIDs"
         )
         var directMutation = EryloSettings.safeDefaults
-        directMutation.displays.enabledDisplayIDs = manyIDs + manyIDs
+        directMutation.displays.surfaceScope = .custom
+        directMutation.displays.enabledDisplayUUIDs = manyUUIDs + manyUUIDs
         do {
             let data = try SettingsCodec().encode(directMutation)
             check(data.count <= SettingsLimits.maximumEncodedBytes, "settings encode remains byte bounded")
             let decoded = SettingsCodec().decode(data).settings
             check(
-                decoded.displays.enabledDisplayIDs?.count == SettingsLimits.maximumEnabledDisplayIDs,
-                "encode normalizes a directly mutated oversized ID array"
+                decoded.displays.enabledDisplayUUIDs?.count == SettingsLimits.maximumEnabledDisplayUUIDs,
+                "encode normalizes a directly mutated oversized UUID array"
             )
         } catch {
             check(false, "bounded settings encode produced unexpected error")
@@ -235,6 +418,128 @@ private final class TrustHarness {
         check(await fixture.repository.current().fullscreenBehavior == .hide, "unavailable fullscreen control cannot persist")
     }
 
+    private func verifyOnboardingCommandAdmission() async {
+        let provider = TestLifecycleProvider()
+        let fixture = makeFixture(provider: provider)
+        let model = TrustSettingsViewModel(
+            coordinator: fixture.coordinator,
+            diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events)
+        )
+        var startRequestCount = 0
+
+        let rejected = await model.startFocusTimerAndCompleteOnboarding {
+            startRequestCount += 1
+            return false
+        }
+        check(
+            !rejected
+                && startRequestCount == 1
+                && !model.settings.onboardingCompleted
+                && model.onboardingActionFailure?.contains("could not start") == true,
+            "rejected first-run timer keeps onboarding visible with an inline failure"
+        )
+        check(
+            !(await fixture.repository.current().onboardingCompleted),
+            "rejected first-run timer performs no onboarding persistence"
+        )
+        check(
+            await provider.startCount == 0,
+            "rejected first-run timer path starts no settings module"
+        )
+
+        let accepted = await model.startFocusTimerAndCompleteOnboarding {
+            startRequestCount += 1
+            return true
+        }
+        check(
+            accepted
+                && startRequestCount == 2
+                && model.settings.onboardingCompleted
+                && model.onboardingActionFailure == nil,
+            "accepted first-run timer clears inline failure and completes onboarding"
+        )
+        check(
+            await fixture.repository.current().onboardingCompleted,
+            "accepted first-run timer persists onboarding completion exactly after admission"
+        )
+    }
+
+    private func verifyOnboardingCompletionPersistence() async {
+        do {
+            let storage = TestAtomicSettingsStorage()
+            let fixture = makeFixture(
+                storage: storage,
+                provider: TestLifecycleProvider()
+            )
+            let model = TrustSettingsViewModel(
+                coordinator: fixture.coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events)
+            )
+            storage.failNextReplacement()
+
+            await model.completeOnboarding()
+
+            let failedPersistedSettings = await fixture.repository.current()
+            check(
+                !model.settings.onboardingCompleted
+                    && !failedPersistedSettings.onboardingCompleted,
+                "failed Continue keeps both visible and persisted onboarding incomplete"
+            )
+            check(
+                model.onboardingActionFailure
+                    == "Setup couldn’t be saved. Try again.",
+                "failed Continue exposes setup-specific inline recovery copy"
+            )
+            check(!model.isWorking, "failed Continue releases the disabled working state")
+
+            await model.completeOnboarding()
+
+            let retriedPersistedSettings = await fixture.repository.current()
+            check(
+                model.settings.onboardingCompleted
+                    && retriedPersistedSettings.onboardingCompleted,
+                "retry reveals Settings only after onboarding persistence succeeds"
+            )
+            check(
+                model.onboardingActionFailure == nil && !model.isWorking,
+                "successful retry clears setup failure and pending work"
+            )
+        }
+
+        do {
+            let coordinator = GatedOnboardingSettingsCoordinator()
+            let model = TrustSettingsViewModel(
+                coordinator: coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: InMemoryDiagnosticEventBuffer())
+            )
+            let completion = Task { await model.completeOnboarding() }
+
+            check(
+                await waitUntil { await coordinator.onboardingRequestIsWaiting },
+                "Continue reaches the gated persistence boundary"
+            )
+            check(
+                !model.settings.onboardingCompleted && model.isWorking,
+                "pending Continue keeps onboarding visible and disables repeated submission"
+            )
+            await model.completeOnboarding()
+            check(
+                await coordinator.onboardingRequestCount == 1,
+                "disabled Continue admits only one persistence request"
+            )
+
+            await coordinator.releaseOnboardingRequest()
+            await completion.value
+
+            check(
+                model.settings.onboardingCompleted
+                    && !model.isWorking
+                    && model.onboardingActionFailure == nil,
+                "settled Continue reveals Settings only after persistence succeeds"
+            )
+        }
+    }
+
     private func verifyPromptFreePersistedRestore() async {
         do {
             let emptyFixture = makeFixture(provider: TestLifecycleProvider())
@@ -311,9 +616,20 @@ private final class TrustHarness {
             let fixture = makeFixture(storage: storage, provider: provider)
             let results = await fixture.coordinator.startEnabledModules()
             check(results.first?.failure == .providerStartFailed, "persisted start failure is surfaced")
-            check(!(await fixture.repository.current().modules.battery), "persisted start failure converges intent to off")
+            check(await fixture.repository.current().modules.battery, "persisted start failure preserves enabled intent")
+            check(storage.successfulReplacementCount == 0, "persisted start failure performs no preference write")
             check(await provider.stopCount == 1, "persisted start failure awaits provider cleanup")
             check(await fixture.coordinator.activeModules().isEmpty, "persisted start failure retains no lifecycle ownership")
+            let retry = await fixture.coordinator.startEnabledModules()
+            let activeAfterRetry = await fixture.coordinator.activeModules()
+            let settingsAfterRetry = await fixture.repository.current()
+            check(
+                retry.first?.failure == nil
+                    && activeAfterRetry == [.battery]
+                    && settingsAfterRetry.modules.battery,
+                "persisted intent retries successfully after a transient startup failure"
+            )
+            _ = await fixture.coordinator.stopAll()
         } catch {
             check(false, "persisted failure fixture encodes valid settings: \(error)")
         }
@@ -367,9 +683,14 @@ private final class TrustHarness {
             )
             check(
                 model.moduleFeedbackIsFailure(for: .volume)
-                    && model.statusMessage == nil
+                    && model.statusMessage == "The module could not start and remains off."
                     && !model.settings.modules.volume,
                 "row-local Volume failure remains honest and rolls the toggle back"
+            )
+            check(
+                model.moduleAccessibilityValue(for: .volume)
+                    == "Off. Error. Volume could not start and remains off.",
+                "failed module Toggle exposes state and recovery through one VoiceOver value"
             )
             await model.resetToSafeDefaults()
             check(
@@ -769,12 +1090,12 @@ private final class TrustHarness {
             let fixture = makeFixture(provider: provider)
             let choices = [
                 DisplayChoice(
-                    identity: DisplayIdentity(rawValue: 10),
+                    identity: makeDisplayUUID(10),
                     name: "Built-in\u{0000} display " + String(repeating: "x", count: 500)
                 ),
-                DisplayChoice(identity: DisplayIdentity(rawValue: 10), name: "Duplicate"),
+                DisplayChoice(identity: makeDisplayUUID(10), name: "Duplicate"),
             ] + (11..<400).map {
-                DisplayChoice(identity: DisplayIdentity(rawValue: UInt32($0)), name: "Display \($0)")
+                DisplayChoice(identity: makeDisplayUUID(UInt32($0)), name: "Display \($0)")
             }
             let model = TrustSettingsViewModel(
                 coordinator: fixture.coordinator,
@@ -792,13 +1113,17 @@ private final class TrustHarness {
                 "display names are VoiceOver-safe and byte bounded"
             )
 
-            await model.setUseAllAvailableDisplays(false)
-            let customIDs = model.settings.displays.enabledDisplayIDs
-            check(customIDs?.count == DisplayChoiceLimits.maximumChoices, "all-to-custom initializes bounded current choices")
-            await model.setDisplayEnabled(DisplayIdentity(rawValue: 11), enabled: false)
-            check(!(model.settings.displays.enabledDisplayIDs?.contains(11) ?? true), "custom mode enables per-display changes")
+            await model.setDisplayScope(.custom)
+            let customUUIDs = model.settings.displays.enabledDisplayUUIDs
+            check(customUUIDs == [makeDisplayUUID(10)], "automatic-to-custom starts with one current display")
+            await model.setDisplayEnabled(makeDisplayUUID(11), enabled: true)
+            check(model.settings.displays.enabledDisplayUUIDs?.contains(makeDisplayUUID(11)) == true, "custom mode enables per-display changes")
             await model.setUseAllAvailableDisplays(true)
-            check(model.settings.displays.enabledDisplayIDs == nil, "custom-to-all restores automatic display scope")
+            check(
+                model.settings.displays.surfaceScope == .allAvailable
+                    && model.settings.displays.enabledDisplayUUIDs == nil,
+                "custom-to-all is an explicit all-display opt-in"
+            )
         }
 
         do {
@@ -810,10 +1135,14 @@ private final class TrustHarness {
                 displayChoices: []
             )
             await model.load()
+            await model.setDisplayScope(.custom)
+            check(model.settings.displays.enabledDisplayUUIDs == [], "empty display list can enter explicit custom mode")
             await model.setUseAllAvailableDisplays(false)
-            check(model.settings.displays.enabledDisplayIDs == [], "empty display list can enter explicit custom mode")
-            await model.setUseAllAvailableDisplays(true)
-            check(model.settings.displays.enabledDisplayIDs == nil, "empty display custom mode can return to all")
+            check(
+                model.settings.displays.surfaceScope == .automatic
+                    && model.settings.displays.enabledDisplayUUIDs == nil,
+                "empty display custom mode can return to one automatic display"
+            )
         }
 
         do {
@@ -835,6 +1164,81 @@ private final class TrustHarness {
         }
     }
 
+    private func verifyDisplayPolicySemanticsEndToEnd() async {
+        do {
+            let provider = TestLifecycleProvider()
+            let storage = TestAtomicSettingsStorage()
+            let fixture = makeFixture(storage: storage, provider: provider)
+            let main = display(10, isMain: true)
+            let external = display(20)
+            let model = TrustSettingsViewModel(
+                coordinator: fixture.coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events),
+                displayChoices: [
+                    DisplayChoice(identity: main.uuid, name: "Built-in Display", isMain: true),
+                    DisplayChoice(identity: external.uuid, name: "External Display"),
+                ]
+            )
+            await model.load()
+            await model.setDisplayScope(.custom)
+            await model.setDisplayEnabled(main.uuid, enabled: false)
+            await model.setDisplayEnabled(external.uuid, enabled: false)
+
+            let persistedEmpty = await SettingsRepository(storage: storage).current().displays
+            let emptyResolution = persistedEmpty.displayPolicy.resolve([main, external])
+            check(
+                persistedEmpty.enabledDisplayUUIDs == [],
+                "ViewModel persists an intentional empty display selection"
+            )
+            check(
+                emptyResolution.enabledDisplays.isEmpty
+                    && emptyResolution.selectedDisplayIdentity == nil,
+                "ViewModel empty selection reaches DisplayPolicy as no panels"
+            )
+        }
+
+        do {
+            let provider = TestLifecycleProvider()
+            let storage = TestAtomicSettingsStorage()
+            let fixture = makeFixture(storage: storage, provider: provider)
+            let disconnected = display(20)
+            let currentMain = display(30, isMain: true)
+            let model = TrustSettingsViewModel(
+                coordinator: fixture.coordinator,
+                diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events),
+                displayChoices: [
+                    DisplayChoice(identity: disconnected.uuid, name: "Desk Display", isMain: true),
+                ]
+            )
+            await model.load()
+            await model.setDisplayScope(.custom)
+            await model.selectDisplay(disconnected.uuid)
+            model.updateDisplayChoices([
+                DisplayChoice(identity: currentMain.uuid, name: "Current Built-in Display", isMain: true),
+            ])
+
+            let persistedStale = await SettingsRepository(storage: storage).current().displays
+            let staleResolution = persistedStale.displayPolicy.resolve([currentMain])
+            check(
+                persistedStale.enabledDisplayUUIDs == [disconnected.uuid]
+                    && persistedStale.preferredDisplayUUID == disconnected.uuid
+                    && model.unavailablePreferredDisplayUUID == disconnected.uuid,
+                "ViewModel preserves and explicitly reports an unavailable stable preference"
+            )
+            check(
+                staleResolution.enabledDisplays.isEmpty
+                    && staleResolution.selectedDisplayIdentity == nil,
+                "ViewModel stale stable UUID never targets a different physical display"
+            )
+
+            await model.selectDisplay(currentMain.uuid)
+            check(
+                model.settings.displays.preferredDisplayUUID == disconnected.uuid,
+                "a disabled display cannot replace the saved preferred target"
+            )
+        }
+    }
+
     private func verifyDiagnosticsSchemaRedactionAndBounds() async {
         let events = InMemoryDiagnosticEventBuffer(clock: FixedClock())
         for index in 0..<200 {
@@ -852,8 +1256,9 @@ private final class TrustHarness {
 
         var settings = EryloSettings.safeDefaults
         settings.displays = DisplayPreferences(
-            enabledDisplayIDs: [123_456_789, 987_654_321],
-            selectedDisplayID: 987_654_321
+            surfaceScope: .custom,
+            enabledDisplayUUIDs: [makeDisplayUUID(123_456_789), makeDisplayUUID(987_654_321)],
+            preferredDisplayUUID: makeDisplayUUID(987_654_321)
         )
         settings.modules.timer = true
         let duplicateHealth = (0..<1_000).map { index in
@@ -889,8 +1294,12 @@ private final class TrustHarness {
         }
         check(await writer.writeCount == 1, "explicit export writes exactly once")
         check(text.contains("\"schemaVersion\" : 1"), "diagnostics schema version is explicit")
-        check(text.contains("\"schemaVersion\" : 2"), "settings schema version is included")
-        check(!text.contains("123456789") && !text.contains("987654321"), "display identifiers are excluded")
+        check(text.contains("\"schemaVersion\" : 3"), "settings schema version is included")
+        check(
+            !text.contains(makeDisplayUUID(123_456_789).rawValue)
+                && !text.contains(makeDisplayUUID(987_654_321).rawValue),
+            "stable display UUIDs are excluded"
+        )
         let forbidden = [
             "/Users/alice", "vacation.mov", "meeting-title", "attendee@example.com",
             "https://private.example", "socket-payload", "secret-token", "rawURL",
@@ -909,6 +1318,7 @@ private final class TrustHarness {
             check(report.recentEvents.count == DiagnosticsLimits.maximumExportedEvents, "event export is bounded")
             check(report.providerHealth.count == EryloModule.allCases.count, "provider health is deduplicated by module")
             check(Set(report.providerHealth.map(\.module)).count == report.providerHealth.count, "provider health has no duplicates")
+            check(report.settings.displayScope == .custom, "non-identifying display scope is retained")
             check(report.settings.customDisplayCount == 2, "non-identifying display count is retained")
             check(report.settings.displaySelection == .explicit, "selection mode is retained without ID")
         } catch {
@@ -995,10 +1405,12 @@ private final class TrustHarness {
         let labels = TrustAccessibilityCopy.fixedLabels
             + EryloModule.allCases.map(TrustAccessibilityCopy.moduleLabel)
         let hints = [
-            TrustAccessibilityCopy.productPromiseHint,
             TrustAccessibilityCopy.onboardingHint,
+            TrustAccessibilityCopy.focusTimerHint,
+            TrustAccessibilityCopy.displayScopePickerHint,
+            TrustAccessibilityCopy.preferredDisplayPickerHint,
+            TrustAccessibilityCopy.fullscreenPickerHint,
             TrustAccessibilityCopy.launchAtLoginHint,
-            TrustAccessibilityCopy.diagnosticsConsentHint,
             TrustAccessibilityCopy.diagnosticsExportHint,
             TrustAccessibilityCopy.resetHint,
             TrustAccessibilityCopy.unavailableMotionHint,
@@ -1008,6 +1420,26 @@ private final class TrustHarness {
         check(labels.allSatisfy { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }, "accessibility labels are non-empty")
         check(Set(labels).count == labels.count, "accessibility labels are distinct")
         check(hints.allSatisfy { $0.count >= 12 }, "accessibility hints explain controls")
+        check(
+            !labels.contains(TrustAccessibilityCopy.diagnosticsConsentLabel),
+            "Settings exposes no diagnostic-sharing consent control without a transport"
+        )
+        check(
+            TrustAccessibilityCopy.resetHint.contains("not affected"),
+            "reset accessibility copy does not claim to cancel Focus Timer"
+        )
+        check(
+            !TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("hover")
+                && TrustAccessibilityCopy.onboardingInteractionExplanation.contains("useful secondary detail"),
+            "onboarding copy limits Peek claims to activities with useful secondary detail"
+        )
+        let mark = EryloSignalMarkGeometry.path(
+            in: CGRect(x: 0, y: 0, width: 36, height: 20)
+        )
+        check(
+            !mark.isEmpty && mark.boundingRect.height > 8,
+            "the shared top-edge signal mark has visible code-native geometry"
+        )
         check(EryloModule.allCases.allSatisfy { TrustAccessibilityCopy.moduleLabel($0).hasPrefix("Enable ") }, "module labels expose action")
         check(
             EryloModule.allCases.allSatisfy {
@@ -1015,6 +1447,93 @@ private final class TrustHarness {
             },
             "unavailable module labels do not claim an enabled action"
         )
+    }
+
+    private func writeNativeSettingsVisualQA(to directory: URL) async throws {
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+
+        let displayChoices = [
+            DisplayChoice(identity: makeDisplayUUID(1), name: "Built-in Display", isMain: true),
+            DisplayChoice(identity: makeDisplayUUID(2), name: "Studio Display"),
+        ]
+        let onboardingModel = try await makeVisualQAModel(
+            settings: .safeDefaults,
+            displayChoices: displayChoices
+        )
+        var configuredSettings = EryloSettings.safeDefaults
+        configuredSettings.onboardingCompleted = true
+        configuredSettings.modules.battery = true
+        configuredSettings.fullscreenBehavior = .remainAvailable
+        let settingsModel = try await makeVisualQAModel(
+            settings: configuredSettings,
+            displayChoices: displayChoices
+        )
+
+        let fixtures: [(String, TrustSettingsViewModel, ColorScheme, Bool)] = [
+            ("erylo-onboarding-light.png", onboardingModel, .light, false),
+            ("erylo-onboarding-dark.png", onboardingModel, .dark, false),
+            ("erylo-settings-light.png", settingsModel, .light, false),
+            ("erylo-settings-dark.png", settingsModel, .dark, false),
+            ("erylo-settings-lower-light.png", settingsModel, .light, true),
+        ]
+        for (filename, model, colorScheme, showsLowerSections) in fixtures {
+            let view = TrustSettingsView(
+                model: model,
+                onStartFocusTimer: { true },
+                showsLowerSectionsForVisualQA: showsLowerSections
+            )
+            .frame(width: 680, height: 620)
+            .environment(\.colorScheme, colorScheme)
+            .transaction { transaction in
+                transaction.animation = nil
+                transaction.disablesAnimations = true
+            }
+            try renderSettingsVisualQA(
+                view,
+                colorScheme: colorScheme,
+                to: directory.appendingPathComponent(filename)
+            )
+        }
+
+        let upperSettings = try Data(
+            contentsOf: directory.appendingPathComponent("erylo-settings-light.png")
+        )
+        let lowerSettings = try Data(
+            contentsOf: directory.appendingPathComponent("erylo-settings-lower-light.png")
+        )
+        guard upperSettings != lowerSettings else {
+            throw NativeSettingsVisualQAError.duplicateFixture(
+                "erylo-settings-light.png",
+                "erylo-settings-lower-light.png"
+            )
+        }
+    }
+
+    private func makeVisualQAModel(
+        settings: EryloSettings,
+        displayChoices: [DisplayChoice]
+    ) async throws -> TrustSettingsViewModel {
+        let storage = TestAtomicSettingsStorage(
+            initialData: try JSONEncoder().encode(settings)
+        )
+        let fixture = makeFixture(
+            storage: storage,
+            provider: TestLifecycleProvider()
+        )
+        let model = TrustSettingsViewModel(
+            coordinator: fixture.coordinator,
+            diagnosticsExporter: makeDiagnosticsExporter(events: fixture.events),
+            initialSettings: settings,
+            displayChoices: displayChoices,
+            availableModules: [.battery, .volume],
+            supportsMotionPreference: false,
+            supportsFullscreenPreference: true
+        )
+        await model.load()
+        return model
     }
 
     private func makeFixture(
@@ -1059,6 +1578,8 @@ private final class TrustHarness {
     private func display(_ identity: UInt32, isMain: Bool = false) -> DisplaySnapshot {
         DisplaySnapshot(
             identity: DisplayIdentity(rawValue: identity),
+            uuid: makeDisplayUUID(identity),
+            localizedName: isMain ? "Built-in Display" : "External Display",
             geometry: DisplayGeometry(
                 frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
                 visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
@@ -1093,6 +1614,122 @@ private final class TrustHarness {
     }
 }
 
+@MainActor
+private func renderSettingsVisualQA<Content: View>(
+    _ content: Content,
+    colorScheme: ColorScheme,
+    to destination: URL
+) throws {
+    let size = CGSize(width: 680, height: 620)
+    _ = NSApplication.shared
+    let hostingView = NSHostingView(rootView: content)
+    hostingView.frame = CGRect(origin: .zero, size: size)
+    hostingView.appearance = NSAppearance(
+        named: colorScheme == .dark ? .darkAqua : .aqua
+    )
+    hostingView.layoutSubtreeIfNeeded()
+    guard let representation = NSBitmapImageRep(
+        bitmapDataPlanes: nil,
+        pixelsWide: Int(size.width * 2),
+        pixelsHigh: Int(size.height * 2),
+        bitsPerSample: 8,
+        samplesPerPixel: 4,
+        hasAlpha: true,
+        isPlanar: false,
+        colorSpaceName: .deviceRGB,
+        bytesPerRow: 0,
+        bitsPerPixel: 0
+    ) else {
+        throw NativeSettingsVisualQAError.encodingFailed(destination.lastPathComponent)
+    }
+    representation.size = size
+    hostingView.cacheDisplay(in: hostingView.bounds, to: representation)
+    try validateNativeSettingsPixels(
+        representation,
+        colorScheme: colorScheme,
+        filename: destination.lastPathComponent
+    )
+    guard let png = representation.representation(using: .png, properties: [:]) else {
+        throw NativeSettingsVisualQAError.encodingFailed(destination.lastPathComponent)
+    }
+    try png.write(to: destination, options: .atomic)
+}
+
+@MainActor
+private func validateNativeSettingsPixels(
+    _ representation: NSBitmapImageRep,
+    colorScheme: ColorScheme,
+    filename: String
+) throws {
+    let sampleStride = 3
+    var semanticPixelCount = 0
+    var minimumLuminance: CGFloat = 1
+    var maximumLuminance: CGFloat = 0
+    var minimumX = representation.pixelsWide
+    var minimumY = representation.pixelsHigh
+    var maximumX = 0
+    var maximumY = 0
+
+    for y in stride(from: 0, to: representation.pixelsHigh, by: sampleStride) {
+        for x in stride(from: 0, to: representation.pixelsWide, by: sampleStride) {
+            guard let color = representation.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+                continue
+            }
+            let luminance = color.redComponent * 0.2126
+                + color.greenComponent * 0.7152
+                + color.blueComponent * 0.0722
+            minimumLuminance = min(minimumLuminance, luminance)
+            maximumLuminance = max(maximumLuminance, luminance)
+
+            let isSemanticPixel = switch colorScheme {
+            case .dark:
+                luminance > 0.58
+            default:
+                luminance < 0.42
+            }
+            guard isSemanticPixel else { continue }
+            semanticPixelCount += 1
+            minimumX = min(minimumX, x)
+            minimumY = min(minimumY, y)
+            maximumX = max(maximumX, x)
+            maximumY = max(maximumY, y)
+        }
+    }
+
+    guard maximumLuminance - minimumLuminance >= 0.25 else {
+        throw NativeSettingsVisualQAError.missingContrast(filename)
+    }
+    guard semanticPixelCount >= 120 else {
+        throw NativeSettingsVisualQAError.missingSemanticContent(
+            filename,
+            observed: semanticPixelCount
+        )
+    }
+    let semanticWidth = maximumX - minimumX
+    let semanticHeight = maximumY - minimumY
+    guard CGFloat(semanticWidth) >= CGFloat(representation.pixelsWide) * 0.25,
+          CGFloat(semanticHeight) >= CGFloat(representation.pixelsHigh) * 0.20 else {
+        throw NativeSettingsVisualQAError.implausiblyClippedContent(
+            filename,
+            width: semanticWidth,
+            height: semanticHeight
+        )
+    }
+}
+
+private enum NativeSettingsVisualQAError: Error {
+    case encodingFailed(String)
+    case duplicateFixture(String, String)
+    case missingContrast(String)
+    case missingSemanticContent(String, observed: Int)
+    case implausiblyClippedContent(String, width: Int, height: Int)
+}
+
+private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
+    let uuid = String(format: "00000000-0000-0000-0000-%012llx", UInt64(value))
+    return DisplayUUID(rawValue: uuid)!
+}
+
 private struct Fixture {
     let repository: SettingsRepository
     let factory: TestProviderFactory
@@ -1107,13 +1744,22 @@ private final class TestAtomicSettingsStorage: AtomicSettingsStorage, @unchecked
     private var failNext = false
     private var attempts = 0
     private var successes = 0
+    private let failsReads: Bool
 
-    init(initialData: Data? = nil) { data = initialData }
+    init(initialData: Data? = nil, failsReads: Bool = false) {
+        data = initialData
+        self.failsReads = failsReads
+    }
     var currentData: Data? { lock.withLock { data } }
     var replacementAttemptCount: Int { lock.withLock { attempts } }
     var successfulReplacementCount: Int { lock.withLock { successes } }
     func failNextReplacement() { lock.withLock { failNext = true } }
-    func data(forKey key: String) throws -> Data? { lock.withLock { data } }
+    func data(forKey key: String) throws -> Data? {
+        try lock.withLock {
+            if failsReads { throw TestFailure.requested }
+            return data
+        }
+    }
     func replace(_ data: Data, forKey key: String) throws {
         try lock.withLock {
             attempts += 1
@@ -1278,6 +1924,56 @@ private actor OutOfOrderSettingsCoordinator: TrustSettingsCoordinating {
     }
 }
 
+private actor GatedOnboardingSettingsCoordinator: TrustSettingsCoordinating {
+    private(set) var onboardingRequestIsWaiting = false
+    private(set) var onboardingRequestCount = 0
+    private var onboardingContinuation: CheckedContinuation<Void, Never>?
+    private var settings = EryloSettings.safeDefaults
+
+    func currentSettings() async -> EryloSettings { settings }
+
+    func launchAtLoginSnapshot() async -> LaunchAtLoginSnapshot { .unavailable }
+
+    func setModuleEnabled(
+        _ module: EryloModule,
+        enabled: Bool,
+        permissionPolicy: PermissionRequestPolicy
+    ) async -> TrustSettingsUpdateResult {
+        TrustSettingsUpdateResult(settings: settings, outcome: .noChange)
+    }
+
+    func apply(_ change: TrustSettingsChange) async -> TrustSettingsUpdateResult {
+        guard case let .onboardingCompleted(completed) = change else {
+            return TrustSettingsUpdateResult(settings: settings, outcome: .noChange)
+        }
+        onboardingRequestCount += 1
+        onboardingRequestIsWaiting = true
+        await withCheckedContinuation { onboardingContinuation = $0 }
+        onboardingRequestIsWaiting = false
+        settings.onboardingCompleted = completed
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) async -> TrustSettingsUpdateResult {
+        TrustSettingsUpdateResult(settings: settings, outcome: .noChange)
+    }
+
+    func resetToSafeDefaults() async -> TrustSettingsUpdateResult {
+        settings = .safeDefaults
+        return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
+    }
+
+    func diagnosticsContext() async -> DiagnosticsContext {
+        DiagnosticsContext(settings: settings, providerHealth: [])
+    }
+
+    func releaseOnboardingRequest() {
+        let continuation = onboardingContinuation
+        onboardingContinuation = nil
+        continuation?.resume()
+    }
+}
+
 @MainActor
 private final class TestLaunchAtLoginController: LaunchAtLoginControlling {
     var capability: LaunchAtLoginCapability = .available
@@ -1285,6 +1981,11 @@ private final class TestLaunchAtLoginController: LaunchAtLoginControlling {
     var failNextChange = false
     private(set) var isEnabled = false
     private(set) var changeRequests: [Bool] = []
+
+    func seedEnabledForTesting() {
+        isEnabled = true
+    }
+
     func snapshot() -> LaunchAtLoginSnapshot {
         guard capability == .available else { return .unavailable }
         return LaunchAtLoginSnapshot(

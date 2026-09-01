@@ -82,6 +82,7 @@ public final class PanelCoordinator {
     private let displayProvider: any EnabledDisplayProviding
     private let panelFactory: ActivityPanelPresentationFactory
     private let activityModel: SurfaceActivityModel
+    private let accessibilityAnnouncer: any PanelAccessibilityAnnouncing
     private let ownedResources: PanelCoordinatorOwnedResources
     /// Enforces the product invariant directly at the platform boundary.
     private var panels: [CGDirectDisplayID: any PanelPresenting] {
@@ -109,6 +110,7 @@ public final class PanelCoordinator {
     private var lastReportedActivityVisibility = false
     private var focusTimerStartHandler: (@MainActor @Sendable (Int) -> Bool)?
     private var primaryShortcutAdmissionHandler: (@MainActor @Sendable () -> Bool)?
+    private var passiveAnnouncementPolicy = PassiveActivityAnnouncementPolicy()
 
     /// Preserves the original coordinator entry point with a stopped, zero-work activity model.
     public convenience init(
@@ -179,16 +181,53 @@ public final class PanelCoordinator {
         )
     }
 
-    public init(
+    public convenience init(
         displayProvider: any EnabledDisplayProviding,
         policy: DisplayPolicy,
         lifecycleEventSource: any PanelLifecycleEventSourcing,
         activityModel: SurfaceActivityModel,
         panelFactory: @escaping ActivityPanelPresentationFactory
     ) {
+        self.init(
+            displayProvider: displayProvider,
+            policy: policy,
+            lifecycleEventSource: lifecycleEventSource,
+            activityModel: activityModel,
+            resolvedAccessibilityAnnouncer: SystemPanelAccessibilityAnnouncer(),
+            panelFactory: panelFactory
+        )
+    }
+
+    package convenience init(
+        displayProvider: any EnabledDisplayProviding,
+        policy: DisplayPolicy,
+        lifecycleEventSource: any PanelLifecycleEventSourcing,
+        activityModel: SurfaceActivityModel,
+        accessibilityAnnouncer: any PanelAccessibilityAnnouncing,
+        panelFactory: @escaping ActivityPanelPresentationFactory
+    ) {
+        self.init(
+            displayProvider: displayProvider,
+            policy: policy,
+            lifecycleEventSource: lifecycleEventSource,
+            activityModel: activityModel,
+            resolvedAccessibilityAnnouncer: accessibilityAnnouncer,
+            panelFactory: panelFactory
+        )
+    }
+
+    private init(
+        displayProvider: any EnabledDisplayProviding,
+        policy: DisplayPolicy,
+        lifecycleEventSource: any PanelLifecycleEventSourcing,
+        activityModel: SurfaceActivityModel,
+        resolvedAccessibilityAnnouncer: any PanelAccessibilityAnnouncing,
+        panelFactory: @escaping ActivityPanelPresentationFactory
+    ) {
         self.displayProvider = displayProvider
         self.policy = policy
         self.activityModel = activityModel
+        self.accessibilityAnnouncer = resolvedAccessibilityAnnouncer
         self.panelFactory = panelFactory
         ownedResources = PanelCoordinatorOwnedResources(
             lifecycleEventSource: lifecycleEventSource,
@@ -263,6 +302,7 @@ public final class PanelCoordinator {
         activityVisibilityHandler = nil
         focusTimerStartHandler = nil
         primaryShortcutAdmissionHandler = nil
+        passiveAnnouncementPolicy.reset()
         finishTerminalCleanup()
     }
 
@@ -295,7 +335,15 @@ public final class PanelCoordinator {
     /// when disabling must also be a physical activity-model drain barrier.
     public func update(policy: DisplayPolicy) {
         guard !isShutdown, self.policy != policy else { return }
+        let optedOutOfFullscreen = self.policy.allowsFullscreenAuxiliary
+            && !policy.allowsFullscreenAuxiliary
         self.policy = policy
+        if optedOutOfFullscreen {
+            panels.values.forEach { $0.contractForEnvironmentalTransition() }
+        }
+        panels.values.forEach {
+            $0.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
+        }
         guard isRunning else { return }
         if policy.isEnabled {
             activityModel.start()
@@ -364,6 +412,9 @@ public final class PanelCoordinator {
             return false
         }
         let displayID = CGDirectDisplayID(selectedDisplayIdentity.rawValue)
+        if (panel as? any PanelExistingControlFocusing)?.focusExistingControls() == true {
+            return true
+        }
         guard !(panel is any PanelPresentationDemandReporting) else {
             panel.performPrimaryAction()
             return true
@@ -434,13 +485,23 @@ public final class PanelCoordinator {
         }
 
         switch event {
-        case .displayConfigurationChanged, .activeSpaceChanged:
+        case .displayConfigurationChanged:
             guard !isWorkspaceSleeping else { return }
+            reconcileDisplays()
+        case .activeSpaceChanged:
+            guard !isWorkspaceSleeping else { return }
+            panels.values.forEach { $0.contractForEnvironmentalTransition() }
             reconcileDisplays()
         case .workspaceWillSleep:
             guard !isWorkspaceSleeping else { return }
             isWorkspaceSleeping = true
-            Array(panels.values).forEach { $0.hide() }
+            Array(panels.values).forEach { panel in
+                if let immediatePanel = panel as? any PanelImmediateEnvironmentalHiding {
+                    immediatePanel.hideImmediatelyForEnvironmentalTransition()
+                } else {
+                    panel.hide()
+                }
+            }
             presentedPanelIDs.removeAll()
             lifecycleEventSource.setPointerMonitoringEnabled(false)
         case .workspaceDidWake:
@@ -472,10 +533,20 @@ public final class PanelCoordinator {
         }
         if displaySnapshots.isEmpty {
             reconcileDisplays()
+        } else {
+            displaySnapshots.values.forEach { _ = ensurePanel(snapshot: $0) }
+            presentDemandedPanels()
+        }
+        announcePassiveActivityIfPresented()
+    }
+
+    private func announcePassiveActivityIfPresented() {
+        guard !presentedPanelIDs.isEmpty else { return }
+        let item = activityModel.current.map(ActivitySurfaceItem.init)
+        guard let announcement = passiveAnnouncementPolicy.announcement(for: item) else {
             return
         }
-        displaySnapshots.values.forEach { _ = ensurePanel(snapshot: $0) }
-        presentDemandedPanels()
+        accessibilityAnnouncer.announce(announcement)
     }
 
     private func ensurePanel(
@@ -483,6 +554,7 @@ public final class PanelCoordinator {
     ) -> (any PanelPresenting)? {
         let displayID = CGDirectDisplayID(identity.rawValue)
         if let panel = panels[displayID] {
+            panel.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
             return panel
         }
         guard let snapshot = displaySnapshots[displayID] else { return nil }
@@ -495,11 +567,13 @@ public final class PanelCoordinator {
     ) -> any PanelPresenting {
         let displayID = CGDirectDisplayID(snapshot.identity.rawValue)
         if let panel = panels[displayID] {
+            panel.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
             panel.update(snapshot: snapshot)
             return panel
         }
 
         let panel = panelFactory(snapshot, activityModel)
+        panel.setFullscreenAuxiliaryEnabled(policy.allowsFullscreenAuxiliary)
         let lease = UUID()
         panels[displayID] = panel
         panelLeases[displayID] = lease
@@ -572,6 +646,11 @@ public final class PanelCoordinator {
         guard presentedPanelIDs.insert(displayID).inserted else { return }
         lifecycleEventSource.setPointerMonitoringEnabled(true)
         panel.show()
+        // Panel and model observer order is intentionally unspecified. Announce
+        // again at the physical presentation boundary so a passive cue cannot
+        // be missed when its demand callback settles after `activityDidChange`.
+        // The semantic policy makes this route idempotent across displays.
+        announcePassiveActivityIfPresented()
         updatePointer(NSEvent.mouseLocation, forceAll: true)
     }
 

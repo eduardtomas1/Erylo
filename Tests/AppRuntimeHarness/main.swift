@@ -27,6 +27,7 @@ enum AppRuntimeHarnessMain {
         await harness.verifyRetiredVolumeExpiryDrainAcrossResetAndShutdown()
         await harness.verifyMenuCommandRoutingAndUpdateAvailability()
         await harness.verifyFocusTimerVerticalSlice()
+        await harness.verifyFocusTimerPersistenceAcrossRelaunch()
         await harness.verifyNaturalCompletionPresentationAndShutdownBarrier()
         harness.finish()
     }
@@ -276,7 +277,7 @@ private struct AppRuntimeHarness {
         check(coreGatePresenter.statusItemCount == 1, "status item is discoverable while core startup is gated")
         let startingMenu = coreGatePresenter.menu
         check(
-            startingMenu?.items.filter {
+            startingMenu?.allItems.filter {
                 if case .command = $0.kind { return $0.kind != .command(.quit) }
                 return false
             }.allSatisfy { !$0.isEnabled && $0.keyEquivalent.isEmpty } == true,
@@ -377,7 +378,7 @@ private struct AppRuntimeHarness {
             "surface control is admitted before optional restoration completes"
         )
         check(
-            restoringMenu?.items.first(where: { $0.kind == .command(.startFocusTimer25) })?.isEnabled == true,
+            restoringMenu?.allItems.first(where: { $0.kind == .command(.startFocusTimer25) })?.isEnabled == true,
             "Focus control is admitted before optional restoration completes"
         )
         check(
@@ -537,7 +538,7 @@ private struct AppRuntimeHarness {
             ),
             presenter: presenter,
             makeDisplayChoices: {
-                [DisplayChoice(identity: DisplayIdentity(rawValue: 1), name: "Main display")]
+                [DisplayChoice(identity: makeDisplayUUID(1), name: "Built-in Display", isMain: true)]
             }
         )
 
@@ -546,17 +547,24 @@ private struct AppRuntimeHarness {
         check(presenter.statusItemCount == 0 && presenter.settingsWindowCount == 0, "control-plane preparation creates no menu or window resource")
 
         var routedCommands: [ApplicationControlCommand] = []
+        let commandAdmission = CommandAdmissionProbe()
         var appliedPolicies: [DisplayPolicy] = []
         let menuContextProbe = FocusTimerMenuContextProbe()
         let runtimeSnapshot = RuntimeControlSnapshotProbe(focusTimer: menuContextProbe)
         check(plane.installEarlyControls(
             runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
-            commandHandler: { routedCommands.append($0) },
+            commandHandler: {
+                routedCommands.append($0)
+                return commandAdmission.isAdmitted
+            },
             displayPolicyHandler: { appliedPolicies.append($0) }
         ), "early control installation succeeds after inert preparation")
         check(!plane.installEarlyControls(
             runtimeSnapshotProvider: { runtimeSnapshot.evaluate() },
-            commandHandler: { routedCommands.append($0) },
+            commandHandler: {
+                routedCommands.append($0)
+                return commandAdmission.isAdmitted
+            },
             displayPolicyHandler: { appliedPolicies.append($0) }
         ), "repeated early control installation is rejected")
 
@@ -571,7 +579,7 @@ private struct AppRuntimeHarness {
             "early menu exposes truthful non-actionable startup copy"
         )
         check(
-            presenter.menu?.items.filter {
+            presenter.menu?.allItems.filter {
                 if case .command = $0.kind { return $0.kind != .command(.quit) }
                 return false
             }.allSatisfy { !$0.isEnabled && $0.keyEquivalent.isEmpty } == true,
@@ -604,8 +612,9 @@ private struct AppRuntimeHarness {
         check(presenter.presentationCount == 1, "first-launch presentation occurs once after persistence settles")
         check(plane.readinessSnapshot.state == .setupRequired, "missing first-launch settings become setup-required, not attention")
         check(
-            presenter.menu?.items.contains(where: { $0.title == ApplicationControlCopy.shortcutReminder }) == true,
-            "admitted visible-surface controls include the keyboard shortcut reminder"
+            presenter.menu?.items.first(where: { $0.kind == .command(.showSettings) })?.title
+                == ApplicationControlCopy.finishSetup,
+            "setup-required readiness becomes one actionable native Settings command"
         )
         check(menuContextProbe.evaluationCount == 2, "status menu performs no background context polling")
         menuContextProbe.context = .active(remainingText: "18:07")
@@ -618,9 +627,9 @@ private struct AppRuntimeHarness {
         check(
             menuContextProbe.evaluationCount == 3
                 && presenter.menu?.items.contains(where: {
-                    $0.title.contains("18:07") && $0.kind == .information && !$0.isEnabled
+                    $0.title.contains("18:07") && $0.kind == .submenu && $0.isEnabled
                 }) == true,
-            "menu-open refresh computes one contextual remaining-time snapshot"
+            "menu-open refresh computes one contextual timer-submenu title"
         )
 
         check(plane.presentSettings(), "ready Settings request succeeds")
@@ -631,11 +640,27 @@ private struct AppRuntimeHarness {
         let modelReference = WeakReference<TrustSettingsViewModel>()
         modelReference.value = presenter.presentedModel
         if let model = presenter.presentedModel {
-            await model.completeOnboarding()
+            let rejectedStart = await model.startFocusTimerAndCompleteOnboarding {
+                presenter.commandHandler?(.startFocusTimer25) == true
+            }
             check(
-                plane.readinessSnapshot.state == .ready
+                !rejectedStart
+                    && !model.settings.onboardingCompleted
+                    && plane.readinessSnapshot.state == .setupRequired
+                    && model.onboardingActionFailure?.contains("could not start") == true,
+                "rejected optional setup command keeps setup visible with inline failure"
+            )
+            commandAdmission.isAdmitted = true
+            let acceptedStart = await model.startFocusTimerAndCompleteOnboarding {
+                presenter.commandHandler?(.startFocusTimer25) == true
+            }
+            check(
+                acceptedStart
+                    && model.settings.onboardingCompleted
+                    && model.onboardingActionFailure == nil
+                    && plane.readinessSnapshot.state == .ready
                     && plane.readinessSnapshot.notices.isEmpty,
-                "successful onboarding immediately clears setup-required readiness"
+                "accepted optional setup command persists onboarding and clears setup-required readiness"
             )
             await model.setModuleEnabled(.timer, enabled: true)
             check(await settingsOwner.moduleMutationCount == 0, "unavailable timer control cannot reach provider mutation")
@@ -647,31 +672,49 @@ private struct AppRuntimeHarness {
             await model.setMotion(.reduce)
             check(model.settings.motion == .systemDefault, "unwired motion preference cannot be persisted")
             await model.setFullscreen(.remainAvailable)
-            check(model.settings.fullscreenBehavior == .hide, "unwired fullscreen preference cannot be persisted")
+            check(
+                model.settings.fullscreenBehavior == .remainAvailable
+                    && appliedPolicies.last?.allowsFullscreenAuxiliary == true,
+                "wired fullscreen preference persists and applies the auxiliary policy"
+            )
 
             await model.setDisplaySurfaceEnabled(false)
-            check(appliedPolicies.last == DisplayPolicy(isEnabled: false), "display preference applies the proven panel policy")
+            check(
+                appliedPolicies.last?.isEnabled == false
+                    && appliedPolicies.last?.allowsFullscreenAuxiliary == true,
+                "display preference preserves the independently persisted fullscreen policy"
+            )
         } else {
             check(false, "first-launch presenter receives a settings model")
+            check(false, "rejected first-run timer fixture has a model")
+            check(false, "accepted first-run timer fixture has a model")
             check(false, "unavailable utility fixture has a model")
             check(false, "unavailable utility status fixture has a model")
             check(false, "motion availability fixture has a model")
-            check(false, "fullscreen availability fixture has a model")
+            check(false, "fullscreen policy fixture has a model")
             check(false, "display-policy fixture has a model")
         }
 
-        presenter.commandHandler?(.showSettings)
-        check(routedCommands == [.showSettings], "native presenter routes menu selections through the injected handler")
+        check(
+            presenter.commandHandler?(.showSettings) == true
+                && routedCommands == [
+                    .startFocusTimer25,
+                    .startFocusTimer25,
+                    .showSettings,
+                ],
+            "presenter preserves the injected command admission result"
+        )
 
         check(
             ApplicationControlCopy.statusItemLabel == "Erylo controls"
-                && ApplicationControlCopy.statusItemHint.contains("surface")
-                && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("top edge")
-                && TrustAccessibilityCopy.onboardingInteractionExplanation.contains("Control–Option–Command–E")
-                && TrustAccessibilityCopy.onboardingSafetyExplanation.contains("Browsing Settings")
+                && ApplicationControlCopy.statusItemHint.contains("Focus Timer")
+                && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("top of your display")
+                && TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("visible only")
+                && !TrustAccessibilityCopy.onboardingSurfaceExplanation.contains("hover")
                 && TrustAccessibilityCopy.onboardingControlExplanation.contains("Focus Timer")
-                && TrustAccessibilityCopy.onboardingControlExplanation.contains("quit"),
-            "control and onboarding accessibility copy explains the complete daily-use path"
+                && TrustAccessibilityCopy.onboardingControlExplanation.contains("Battery and Volume")
+                && TrustAccessibilityCopy.onboardingControlExplanation.contains("Settings"),
+            "concise onboarding copy explains the shipping utilities without false hover claims"
         )
 
         await plane.shutdown()
@@ -710,7 +753,7 @@ private struct AppRuntimeHarness {
                     surface: .hidden
                 )
             },
-            commandHandler: { _ in },
+            commandHandler: { _ in true },
             displayPolicyHandler: { _ in }
         )
         _ = await returningPlane.restorePersistedModules()
@@ -721,6 +764,8 @@ private struct AppRuntimeHarness {
 
         var recoveredSettings = EryloSettings.safeDefaults
         recoveredSettings.onboardingCompleted = true
+        recoveredSettings.modules.battery = true
+        recoveredSettings.modules.volume = true
         let failedBattery = PersistedModuleRestoreResult(
             module: .battery,
             update: TrustSettingsUpdateResult(
@@ -768,7 +813,7 @@ private struct AppRuntimeHarness {
                     surface: .hidden
                 )
             },
-            commandHandler: { _ in },
+            commandHandler: { _ in true },
             displayPolicyHandler: { _ in }
         )
         _ = await recoveryPlane.restorePersistedModules()
@@ -776,110 +821,79 @@ private struct AppRuntimeHarness {
         check(recoveryPlane.readinessSnapshot.state == .needsAttention, "unsafe fallback and restore failures produce needs-attention readiness")
         check(
             recoveryPlane.readinessSnapshot.notices == [
-                "Safe defaults were used.",
-                "Battery could not start and was left off.",
-                "Volume could not start and was left off.",
+                "Saved settings need to be reset. Existing data was left unchanged.",
+                "Battery could not start. Its enabled setting was kept.",
+                "Volume could not start. Its enabled setting was kept.",
             ],
             "every restore result is aggregated into bounded user-facing recovery copy"
         )
         let recoveryCopy = recoveryPresenter.menu?.items.map(\.title).joined(separator: " ") ?? ""
         check(
-            recoveryCopy.contains("Safe defaults were used.")
-                && recoveryCopy.contains("Battery could not start and was left off.")
+            recoveryCopy.contains("Saved settings need to be reset.")
+                && !recoveryCopy.contains("Battery could not start.")
+                && recoveryPresenter.menu?.items.first(where: {
+                    $0.kind == .command(.showSettings)
+                })?.title == ApplicationControlCopy.reviewSettings
                 && !recoveryCopy.contains("provider-start-failed")
                 && !recoveryCopy.contains("provider-factory-failed"),
-            "recovery surfaces safe outcomes without raw errors"
+            "recovery keeps the menu to one safe summary and one Review Settings action"
         )
         _ = recoveryPlane.presentSettings()
         check(
-            recoveryPresenter.presentedModel?.statusMessage?.contains("Volume could not start") == true,
-            "Settings receives the same bounded recovery outcome after settlement"
+            recoveryPresenter.presentedModel?.statusMessage?.contains("Volume could not start") == true
+                && recoveryPresenter.presentedModel?.recoveryReport?.requiresExplicitReset == true,
+            "Settings receives the same bounded recovery outcome and a protected recovery state"
         )
         if let recoveryModel = recoveryPresenter.presentedModel {
             await recoveryModel.setLaunchAtLoginEnabled(true)
             check(
                 recoveryPlane.readinessSnapshot.state == .needsAttention
                     && recoveryPlane.readinessSnapshot.notices == [
-                        "Battery could not start and was left off.",
-                        "Volume could not start and was left off.",
+                        "Saved settings need to be reset. Existing data was left unchanged.",
+                        "Battery could not start. Its enabled setting was kept.",
+                        "Volume could not start. Its enabled setting was kept.",
                     ],
-                "a successful Login Item write persists recovery but retains provider failures"
+                "an ordinary Login Item write cannot clear protected recovery"
             )
             await recoveryModel.setCrashAndDiagnosticSharingConsent(false)
             check(
                 recoveryPlane.readinessSnapshot.state == .needsAttention
                     && recoveryPlane.readinessSnapshot.notices == [
-                        "Battery could not start and was left off.",
-                        "Volume could not start and was left off.",
+                        "Saved settings need to be reset. Existing data was left unchanged.",
+                        "Battery could not start. Its enabled setting was kept.",
+                        "Volume could not start. Its enabled setting was kept.",
                     ],
-                "an unrelated successful Settings write clears only the recovered-file notice"
+                "an unrelated Settings write cannot clear protected recovery"
             )
             await recoveryModel.completeOnboarding()
             check(
                 recoveryPlane.readinessSnapshot.state == .needsAttention
                     && recoveryPlane.readinessSnapshot.notices == [
-                        "Battery could not start and was left off.",
-                        "Volume could not start and was left off.",
+                        "Saved settings need to be reset. Existing data was left unchanged.",
+                        "Battery could not start. Its enabled setting was kept.",
+                        "Volume could not start. Its enabled setting was kept.",
                     ],
-                "completed onboarding cannot hide unresolved provider failures"
-            )
-            await recoveryModel.setModuleEnabled(.battery, enabled: true)
-            check(
-                recoveryPlane.readinessSnapshot.notices == [
-                    "Battery could not start and was left off.",
-                    "Volume could not start and was left off.",
-                ]
-                    && recoveryModel.moduleFeedbackIsFailure(for: .battery)
-                    && recoveryModel.moduleFeedbackIsFailure(for: .volume)
-                    && recoveryModel.moduleFeedback[.volume]
-                        == "Volume could not start and remains off.",
-                "a failed Battery retry keeps both unresolved failures visible in Settings"
-            )
-            await recoveryModel.setModuleEnabled(.battery, enabled: false)
-            check(
-                recoveryPlane.readinessSnapshot.notices.count == 2
-                    && recoveryModel.moduleFeedbackIsFailure(for: .battery)
-                    && recoveryModel.moduleFeedbackIsFailure(for: .volume),
-                "an already-off Battery write cannot dismiss unresolved startup failures"
-            )
-            await recoveryModel.setModuleEnabled(.battery, enabled: true)
-            check(
-                recoveryPlane.readinessSnapshot.state == .needsAttention
-                    && recoveryPlane.readinessSnapshot.notices == [
-                        "Volume could not start and was left off.",
-                    ],
-                "successful Battery remediation clears only Battery's startup failure"
+                "onboarding completion cannot overwrite or hide protected recovery"
             )
             check(
-                recoveryModel.statusMessage?.contains("Volume could not start") == true
-                    && recoveryModel.statusMessage?.contains("Battery could not start") == false,
-                "partial remediation keeps the unresolved startup failure visible in Settings"
+                await recoveryOwner.currentSettings() == recoveredSettings,
+                "protected app-layer mutations leave the recovered settings snapshot unchanged"
             )
-            recoveryPresenter.refreshMenu()
-            let partiallyRemediatedCopy = recoveryPresenter.menu?.items.map(\.title).joined(separator: " ") ?? ""
+            await recoveryModel.resetToSafeDefaults()
             check(
-                !partiallyRemediatedCopy.contains("Safe defaults were used.")
-                    && !partiallyRemediatedCopy.contains("Battery could not start")
-                    && partiallyRemediatedCopy.contains("Volume could not start"),
-                "partial remediation keeps the exact unresolved notice in the menu"
-            )
-            await recoveryModel.setModuleEnabled(.volume, enabled: true)
-            check(
-                recoveryPlane.readinessSnapshot.state == .ready
-                    && recoveryPlane.readinessSnapshot.notices.isEmpty,
-                "every failed module must succeed before startup attention clears"
+                recoveryPlane.readinessSnapshot.state == .setupRequired
+                    && recoveryPlane.readinessSnapshot.notices.isEmpty
+                    && recoveryModel.recoveryReport == nil
+                    && recoveryModel.settings == .safeDefaults,
+                "only explicit Reset replaces recovery data and returns to safe first-run setup"
             )
         } else {
             for message in [
                 "recovery remediation fixture retains its contained Settings model",
-                "Login Item persistence clears only the recovered-file notice",
-                "unrelated Settings changes retain module failures",
-                "onboarding completion retains module failures",
-                "failed remediation retains every unresolved Settings row",
-                "already-off module intent cannot dismiss startup failure rows",
-                "one module remediation retains the other failure",
-                "partial remediation retains Settings failure copy",
-                "partial remediation refreshes bounded menu copy",
+                "Login Item changes retain protected recovery",
+                "unrelated Settings changes retain protected recovery",
+                "onboarding completion retains protected recovery",
+                "explicit Reset clears protected recovery",
             ] {
                 check(false, message)
             }
@@ -941,7 +955,7 @@ private struct AppRuntimeHarness {
 
             _ = plane.installEarlyControls(
                 runtimeSnapshotProvider: { .starting },
-                commandHandler: { _ in },
+                commandHandler: { _ in true },
                 displayPolicyHandler: { _ in }
             )
             check(presenter.statusItemCount == 1, "status item is installed before persisted Glance restoration")
@@ -1755,7 +1769,12 @@ private struct AppRuntimeHarness {
         let now = Date(timeIntervalSinceReferenceDate: 90_000.25)
         let clock = ManualFocusClock(now: now)
         let broker = ActivityBroker()
-        let focusTimer = FocusTimerRuntimeService(broker: broker, clock: clock)
+        let completionNotifications = Counter()
+        let focusTimer = FocusTimerRuntimeService(
+            broker: broker,
+            clock: clock,
+            completionNotifier: { completionNotifications.value += 1 }
+        )
         let router = FocusTimerActionRouter(broker: broker, focusTimer: focusTimer)
         let model = SurfaceActivityModel(broker: broker, actionHandler: router)
         let events = EventLog()
@@ -1814,9 +1833,13 @@ private struct AppRuntimeHarness {
             await broker.workState().activeOwnershipCount == 0,
             "Settings browsing creates no timer broker ownership"
         )
+        check(
+            !controlPlane.route(.cancelFocusTimer),
+            "installed control callback preserves a rejected runtime command result"
+        )
 
         let menu = ApplicationMenuDescriptor(canCheckForUpdates: true)
-        let commandItems = menu.items.filter {
+        let commandItems = menu.allItems.filter {
             if case .command = $0.kind { return true }
             return false
         }
@@ -1834,7 +1857,7 @@ private struct AppRuntimeHarness {
                 && Set(commandIdentifiers).count == commandIdentifiers.count,
             "menu command accessibility identifiers are unique"
         )
-        let timerItems = menu.items.filter {
+        let timerItems = menu.allItems.filter {
             switch $0.kind {
             case .command(.startFocusTimer15), .command(.startFocusTimer25),
                  .command(.startFocusTimer50), .command(.cancelFocusTimer):
@@ -1843,10 +1866,10 @@ private struct AppRuntimeHarness {
                 false
             }
         }
-        check(timerItems.count == 4, "status menu exposes three Focus Timer presets and Cancel")
+        check(timerItems.count == 3, "idle status menu exposes only three Focus Timer presets")
         check(
-            timerItems.map(\.keyEquivalent) == ["1", "2", "5", ""],
-            "only actionable Focus Timer commands provide keyboard equivalents"
+            timerItems.map(\.keyEquivalent) == ["1", "2", "5"],
+            "Focus Timer presets retain compact keyboard equivalents inside their submenu"
         )
         check(
             timerItems.allSatisfy {
@@ -1856,17 +1879,22 @@ private struct AppRuntimeHarness {
             "Focus Timer menu commands provide accurate accessibility metadata"
         )
         check(
-            !menu.items.map(\.title).joined(separator: " ").lowercased().contains("pause")
-                && !menu.items.map(\.title).joined(separator: " ").lowercased().contains("resume"),
+            !menu.allItems.map(\.title).joined(separator: " ").lowercased().contains("pause")
+                && !menu.allItems.map(\.title).joined(separator: " ").lowercased().contains("resume"),
             "Focus Timer menu makes no unsupported pause or resume claim"
         )
         check(
-            menu.items.first(where: { $0.kind == .command(.cancelFocusTimer) })?.isEnabled == false,
-            "status menu disables timer cancellation while idle"
+            menu.allItems.first(where: { $0.kind == .command(.cancelFocusTimer) }) == nil,
+            "idle status menu omits an inapplicable Cancel command"
         )
         check(
-            menu.items.first(where: { $0.kind == .information })?.isEnabled == false,
-            "status menu reminder is truly informational"
+            menu.items.contains(where: {
+                $0.kind == .submenu
+                    && $0.title == ApplicationControlCopy.focusTimer
+                    && $0.children.count == 3
+                    && $0.accessibilityHint == ApplicationControlCopy.focusMenuHint
+            }),
+            "idle presets live under one native Focus Timer submenu"
         )
         let activeMenu = ApplicationMenuDescriptor(
             canCheckForUpdates: false,
@@ -1874,12 +1902,15 @@ private struct AppRuntimeHarness {
         )
         check(
             activeMenu.items.contains(where: {
-                $0.kind == .information && $0.title.contains("24:59") && !$0.isEnabled
+                $0.kind == .submenu
+                    && $0.title.contains("24:59")
+                    && $0.isEnabled
+                    && $0.accessibilityHint == ApplicationControlCopy.activeFocusMenuHint
             }),
-            "active status menu exposes remaining time as inert context"
+            "active status menu exposes remaining time in the actionable submenu title"
         )
         check(
-            activeMenu.items.filter {
+            activeMenu.allItems.filter {
                 switch $0.kind {
                 case .command(.startFocusTimer15), .command(.startFocusTimer25),
                      .command(.startFocusTimer50):
@@ -1887,17 +1918,24 @@ private struct AppRuntimeHarness {
                 default:
                     false
                 }
-            }.allSatisfy { $0.title.hasPrefix("Replace with") },
-            "active status menu makes preset replacement semantics explicit"
+            }.allSatisfy {
+                $0.accessibilityHint == ApplicationControlCopy.replaceFocusHint
+            },
+            "active preset accessibility copy makes replacement semantics explicit"
         )
         check(
-            activeMenu.items.first(where: { $0.kind == .command(.cancelFocusTimer) })?.isEnabled == true,
-            "active status menu enables timer cancellation"
+            activeMenu.allItems.first(where: { $0.kind == .command(.cancelFocusTimer) }).map {
+                $0.isEnabled && $0.keyEquivalent == "."
+            } == true,
+            "active status menu reveals one enabled timer-cancellation command"
         )
 
         check(runtime.handle(.toggleSurface), "deliberate surface toggle constructs the demand-driven idle launcher")
         check(panel.isActivitySurfaceVisible, "idle launcher is physically and logically visible before selection")
-        check(panel.startFocusTimer(minutes: 25), "idle native launcher routes the 25-minute Focus Timer preset")
+        check(
+            controlPlane.route(.startFocusTimer25),
+            "installed control callback preserves an accepted Focus Timer result"
+        )
         check(
             await waitUntil {
                 let countdown = await focusTimer.provider.countdown()
@@ -2195,6 +2233,10 @@ private struct AppRuntimeHarness {
             },
             "repeated start/cancel converges with no orphan command or timer work"
         )
+        check(
+            completionNotifications.value == 0,
+            "explicit cancellation and replacement never invoke the completion notifier"
+        )
 
         panel.setContentVisible(false)
         check(runtime.handle(.startFocusTimer15), "natural-completion Focus Timer starts")
@@ -2219,11 +2261,18 @@ private struct AppRuntimeHarness {
                 let providerWork = await focusTimer.provider.workState()
                 return countdown == nil
                     && snapshot.current?.activity.presentation.title == "Focus complete"
-                    && snapshot.current?.activity.action == nil
+                    && snapshot.current?.activity.action?.identifier
+                        == CountdownActivityContract.dismissActionIdentifier
+                    && snapshot.current?.activity.action?.label == "Done"
+                    && snapshot.current?.activity.action?.intent == .dismiss
                     && providerWork.isIdle
                     && focusTimer.workState().isIdle
             },
-            "natural completion publishes only the bounded acknowledgement and drains runtime work"
+            "natural completion publishes a bounded dismissible acknowledgement and drains runtime work"
+        )
+        check(
+            completionNotifications.value == 1,
+            "natural completion invokes the injected one-shot notifier exactly once"
         )
         check(await focusTimer.provider.status() == .disabled, "natural completion disables timer provider")
         check(focusTimer.menuContext(at: completionDeadline) == .idle, "natural completion retires menu timer context")
@@ -2231,6 +2280,35 @@ private struct AppRuntimeHarness {
             await broker.workState().activeOwnershipCount == 0,
             "natural completion releases timer broker ownership"
         )
+        check(
+            await waitUntil { model.currentAction?.intent == .dismiss },
+            "completion Done reaches the shared surface model"
+        )
+        if let completionAction = model.currentAction {
+            check(
+                completionAction.intent == .dismiss
+                    && completionAction.label == "Done",
+                "surface model exposes the completion Done route"
+            )
+            check(model.dispatch(completionAction), "completion Done dispatches through the app router")
+            check(
+                await waitUntil {
+                    await broker.snapshot().current == nil
+                        && model.current == nil
+                        && !model.workState.hasActionTask
+                },
+                "completion Done removes the exact acknowledgement revision"
+            )
+            check(
+                completionNotifications.value == 1,
+                "manual completion dismissal never duplicates the natural notifier"
+            )
+        } else {
+            check(false, "surface model exposes the completion Done route")
+            check(false, "completion Done remains dispatchable")
+            check(false, "completion Done can settle")
+            check(false, "completion dismissal leaves notifier count stable")
+        }
 
         check(runtime.handle(.startFocusTimer50), "shutdown-overlap Focus Timer starts")
         check(
@@ -2252,6 +2330,463 @@ private struct AppRuntimeHarness {
         check(await broker.workState() == .stopped, "terminal shutdown drains broker timers, subscribers, and ownership")
         check(await clock.pendingCount == 0, "terminal shutdown leaves no countdown clock waiter")
         check(!runtime.handle(.startFocusTimer15), "Focus Timer commands fail closed after terminal shutdown")
+    }
+
+    mutating func verifyFocusTimerPersistenceAcrossRelaunch() async {
+        let now = Date(timeIntervalSinceReferenceDate: 92_000)
+        let clock = ManualFocusClock(now: now)
+        let storage = RuntimeAtomicSettingsStorage()
+        let firstBroker = ActivityBroker()
+        let first = FocusTimerRuntimeService(
+            broker: firstBroker,
+            clock: clock,
+            persistenceStorage: storage
+        )
+
+        check(storage.readCount == 0, "Focus Timer persistence construction performs no storage read")
+        await first.start()
+        check(storage.readCount == 1, "Focus Timer reads its deadline record only during explicit startup")
+        check(await first.provider.status() == .disabled, "missing persisted timer leaves startup inert")
+        check(first.requestStart(duration: 120), "persistent Focus Timer admits a bounded deadline")
+        check(
+            await waitUntil {
+                let countdown = await first.provider.countdown()
+                return countdown != nil && storage.successfulReplacementCount == 1
+            },
+            "starting a Focus Timer atomically stores one active deadline"
+        )
+        guard let originalTimer = await first.provider.countdown(),
+              let originalRecord = storage.currentData else {
+            check(false, "persistent Focus Timer exposes its original deadline")
+            check(false, "persistent Focus Timer exposes its atomic record")
+            await first.shutdown()
+            await firstBroker.shutdown()
+            return
+        }
+
+        storage.failNextReplacement()
+        check(first.requestStart(duration: 300), "replacement remains synchronously admissible before persistence settles")
+        check(
+            await waitUntil {
+                let state = first.workState()
+                return !state.hasWorkerTask && state.pendingOperationCount == 0
+            },
+            "failed persistent replacement drains its bounded command work"
+        )
+        check(
+            await first.provider.countdown() == originalTimer
+                && storage.currentData == originalRecord,
+            "failed atomic replacement preserves the matching live and persisted timer"
+        )
+
+        await first.shutdown()
+        check(storage.currentData == originalRecord, "process shutdown preserves the active timer deadline")
+        check(await first.provider.workState().isIdle, "persistent timer shutdown still drains provider work")
+        await firstBroker.shutdown()
+
+        let gatedClock = GatedFocusClock(now: now.addingTimeInterval(30))
+        let gatedBroker = ActivityBroker()
+        let gatedRuntime = FocusTimerRuntimeService(
+            broker: gatedBroker,
+            clock: gatedClock,
+            persistenceStorage: storage
+        )
+        let gatedStart = Task { @MainActor in await gatedRuntime.start() }
+        check(
+            await waitUntil { await gatedClock.isNowPending },
+            "persistent restore reaches its suspended clock boundary"
+        )
+        check(
+            !gatedRuntime.requestStart(duration: 300),
+            "Focus Timer command admission stays closed while persisted restore is starting"
+        )
+        let gatedShutdownFinished = CompletionFlag()
+        let gatedShutdown = Task { @MainActor in
+            await gatedRuntime.shutdown()
+            gatedShutdownFinished.isComplete = true
+        }
+        for _ in 0..<20 { await Task.yield() }
+        check(!gatedShutdownFinished.isComplete, "shutdown joins a suspended persisted restore")
+        await gatedClock.releaseNow()
+        _ = await gatedStart.value
+        _ = await gatedShutdown.value
+        let gatedStatus = await gatedRuntime.provider.status()
+        let gatedBrokerWork = await gatedBroker.workState()
+        check(
+            gatedShutdownFinished.isComplete
+                && gatedStatus == .disabled
+                && gatedRuntime.workState().isIdle
+                && gatedBrokerWork.activeOwnershipCount == 0,
+            "shutdown during persisted restore leaves no provider, command, or ownership work"
+        )
+        check(
+            storage.currentData == originalRecord,
+            "shutdown during suspended restore preserves the valid persisted deadline"
+        )
+        check(
+            !gatedRuntime.requestStart(duration: 300),
+            "persistent Focus Timer rejects commands after restore-overlap shutdown"
+        )
+        await gatedBroker.shutdown()
+
+        let pendingStartStorage = RuntimeAtomicSettingsStorage()
+        let pendingStartClock = GatedFocusClock(now: now)
+        let pendingStartBroker = ActivityBroker()
+        let pendingStartRuntime = FocusTimerRuntimeService(
+            broker: pendingStartBroker,
+            clock: pendingStartClock,
+            persistenceStorage: pendingStartStorage
+        )
+        await pendingStartRuntime.start()
+        check(
+            pendingStartRuntime.requestStart(duration: 120),
+            "running Focus Timer admits the suspended-start fixture"
+        )
+        check(
+            await waitUntil { await pendingStartClock.isNowPending },
+            "Focus Timer start reaches its suspended clock boundary"
+        )
+        let pendingStartShutdown = Task { @MainActor in
+            await pendingStartRuntime.shutdown()
+        }
+        for _ in 0..<20 { await Task.yield() }
+        await pendingStartClock.releaseNow()
+        _ = await pendingStartShutdown.value
+        let pendingStartStatus = await pendingStartRuntime.provider.status()
+        let pendingStartBrokerWork = await pendingStartBroker.workState()
+        check(
+            pendingStartStorage.currentData == nil
+                && pendingStartStatus == .disabled
+                && pendingStartRuntime.workState().isIdle
+                && pendingStartBrokerWork.activeOwnershipCount == 0,
+            "shutdown admission prevents a suspended start from creating persisted or provider work"
+        )
+        await pendingStartBroker.shutdown()
+
+        let immediateCancelStorage = RuntimeAtomicSettingsStorage()
+        let immediateCancelClock = ManualFocusClock(now: now)
+        let immediateCancelBroker = ActivityBroker()
+        let immediateCancelRuntime = FocusTimerRuntimeService(
+            broker: immediateCancelBroker,
+            clock: immediateCancelClock,
+            persistenceStorage: immediateCancelStorage
+        )
+        await immediateCancelRuntime.start()
+        check(
+            immediateCancelRuntime.requestStart(duration: 120),
+            "immediate-cancel persistence fixture starts"
+        )
+        check(
+            await waitUntil { await immediateCancelRuntime.provider.countdown() != nil },
+            "immediate-cancel persistence fixture reaches provider state"
+        )
+        guard let immediateActiveRecord = immediateCancelStorage.currentData else {
+            check(false, "immediate-cancel persistence fixture exposes its active record")
+            await immediateCancelRuntime.shutdown()
+            await immediateCancelBroker.shutdown()
+            return
+        }
+        check(
+            immediateCancelRuntime.requestCancel(),
+            "immediate-cancel persistence fixture synchronously admits Cancel"
+        )
+        await immediateCancelRuntime.shutdown()
+        check(
+            immediateCancelStorage.currentData != nil
+                && immediateCancelStorage.currentData != immediateActiveRecord,
+            "Quit immediately after an accepted Cancel preserves the cancellation tombstone"
+        )
+        await immediateCancelBroker.shutdown()
+
+        let postCancelBroker = ActivityBroker()
+        let postCancelRuntime = FocusTimerRuntimeService(
+            broker: postCancelBroker,
+            clock: immediateCancelClock,
+            persistenceStorage: immediateCancelStorage
+        )
+        await postCancelRuntime.start()
+        let postCancelStatus = await postCancelRuntime.provider.status()
+        let postCancelBrokerWork = await postCancelBroker.workState()
+        check(
+            postCancelStatus == .disabled
+                && postCancelRuntime.workState().isIdle
+                && postCancelBrokerWork.activeOwnershipCount == 0,
+            "a Cancel accepted immediately before Quit cannot resurrect on relaunch"
+        )
+        await postCancelRuntime.shutdown()
+        await postCancelBroker.shutdown()
+
+        await clock.advance(to: now.addingTimeInterval(30))
+        let restoredBroker = ActivityBroker()
+        let restored = FocusTimerRuntimeService(
+            broker: restoredBroker,
+            clock: clock,
+            persistenceStorage: storage
+        )
+        await restored.start()
+        check(
+            await waitUntil {
+                let countdown = await restored.provider.countdown()
+                let brokerWork = await restoredBroker.workState()
+                return countdown == originalTimer && brokerWork.activeOwnershipCount == 1
+            },
+            "relaunch restores the exact original timestamps and one broker ownership"
+        )
+        check(
+            restored.menuContext(at: now.addingTimeInterval(30))
+                == .active(remainingText: "01:30"),
+            "restored timer derives remaining time from its absolute deadline"
+        )
+        check(
+            await waitUntil { await clock.pendingDeadlines == [originalTimer.endsAt] },
+            "restored timer owns one expiry boundary without tick polling"
+        )
+
+        storage.failNextReplacement()
+        check(restored.requestCancel(), "persistent timer admits an explicit cancellation request")
+        check(
+            await waitUntil {
+                let state = restored.workState()
+                return !state.hasWorkerTask && state.pendingOperationCount == 0
+            },
+            "failed persistent cancellation drains its bounded command work"
+        )
+        check(
+            await restored.provider.countdown() == originalTimer
+                && storage.currentData == originalRecord,
+            "failed cancellation tombstone leaves the persisted timer running instead of resurrectable"
+        )
+
+        check(restored.requestCancel(), "persistent timer cancellation can be retried")
+        check(
+            await waitUntil {
+                let countdown = await restored.provider.countdown()
+                let brokerWork = await restoredBroker.workState()
+                return countdown == nil
+                    && restored.workState().isIdle
+                    && brokerWork.activeOwnershipCount == 0
+            },
+            "successful cancellation tombstones and releases the restored timer"
+        )
+        let cancellationTombstone = storage.currentData
+        check(
+            cancellationTombstone != nil && cancellationTombstone != originalRecord,
+            "successful explicit cancellation replaces the active record with a tombstone"
+        )
+        await restored.shutdown()
+        await restoredBroker.shutdown()
+
+        let completionBroker = ActivityBroker()
+        let completionNotifications = Counter()
+        let completionRuntime = FocusTimerRuntimeService(
+            broker: completionBroker,
+            clock: clock,
+            persistenceStorage: storage,
+            completionNotifier: { completionNotifications.value += 1 }
+        )
+        await completionRuntime.start()
+        check(
+            await completionRuntime.provider.status() == .disabled,
+            "a cancellation tombstone restores no timer work"
+        )
+        check(completionRuntime.requestStart(duration: 5), "naturally completing persistent timer starts")
+        check(
+            await waitUntil { await completionRuntime.provider.countdown() != nil },
+            "naturally completing persistent timer reaches provider state"
+        )
+        guard let completionDeadline = await completionRuntime.provider.countdown()?.endsAt,
+              let completionRecord = storage.currentData else {
+            check(false, "naturally completing persistent timer exposes a deadline")
+            check(false, "naturally completing persistent timer exposes a record")
+            await completionRuntime.shutdown()
+            await completionBroker.shutdown()
+            return
+        }
+        check(
+            await waitUntil { await clock.pendingDeadlines == [completionDeadline] },
+            "persistent natural completion owns its single expiry boundary before advancement"
+        )
+        await clock.advance(to: completionDeadline)
+        check(
+            await waitUntil {
+                let countdown = await completionRuntime.provider.countdown()
+                return countdown == nil
+                    && completionRuntime.workState().isIdle
+                    && completionNotifications.value == 1
+            },
+            "natural completion drains the timer and delivers its one notifier"
+        )
+        check(
+            storage.currentData != nil && storage.currentData != completionRecord,
+            "natural completion tombstones its matching persisted session"
+        )
+        await completionRuntime.shutdown()
+        await completionBroker.shutdown()
+
+        let expiredStorage = RuntimeAtomicSettingsStorage()
+        let expiredClock = ManualFocusClock(now: now)
+        let expiringBroker = ActivityBroker()
+        let expiring = FocusTimerRuntimeService(
+            broker: expiringBroker,
+            clock: expiredClock,
+            persistenceStorage: expiredStorage
+        )
+        await expiring.start()
+        check(expiring.requestStart(duration: 5), "offline-expiry fixture starts")
+        check(
+            await waitUntil { await expiring.provider.countdown() != nil },
+            "offline-expiry fixture reaches provider state"
+        )
+        guard let expiredDeadline = await expiring.provider.countdown()?.endsAt,
+              let expiringRecord = expiredStorage.currentData else {
+            check(false, "offline-expiry fixture exposes a deadline")
+            check(false, "offline-expiry fixture exposes a record")
+            await expiring.shutdown()
+            await expiringBroker.shutdown()
+            return
+        }
+        await expiring.shutdown()
+        await expiringBroker.shutdown()
+        await expiredClock.advance(to: expiredDeadline.addingTimeInterval(1))
+
+        let expiredBroker = ActivityBroker()
+        let expiredNotifications = Counter()
+        let expired = FocusTimerRuntimeService(
+            broker: expiredBroker,
+            clock: expiredClock,
+            persistenceStorage: expiredStorage,
+            completionNotifier: { expiredNotifications.value += 1 }
+        )
+        await expired.start()
+        let expiredStatus = await expired.provider.status()
+        let expiredCountdown = await expired.provider.countdown()
+        let expiredBrokerWork = await expiredBroker.workState()
+        check(
+            expiredStatus == .disabled
+                && expiredCountdown == nil
+                && expiredBrokerWork.activeOwnershipCount == 0,
+            "a deadline that passed while Erylo was closed restores no provider or ownership work"
+        )
+        check(expiredNotifications.value == 0, "offline expiry never emits a late completion alert")
+        check(
+            expiredStorage.currentData != nil && expiredStorage.currentData != expiringRecord,
+            "offline expiry is replaced by an inert tombstone"
+        )
+        await expired.shutdown()
+        await expiredBroker.shutdown()
+
+        do {
+            let futureData = try JSONEncoder().encode(
+                RuntimePersistedFocusTimerEnvelope(
+                    schemaVersion: 1,
+                    activeSession: RuntimePersistedFocusTimerSession(
+                        sessionID: UUID(uuidString: "D6AA996F-6D62-4D29-BA74-91B40678E2B7")!,
+                        startedAt: now.addingTimeInterval(60),
+                        endsAt: now.addingTimeInterval(120)
+                    )
+                )
+            )
+            let futureStorage = RuntimeAtomicSettingsStorage(initialData: futureData)
+            let futureBroker = ActivityBroker()
+            let futureRuntime = FocusTimerRuntimeService(
+                broker: futureBroker,
+                clock: ManualFocusClock(now: now),
+                persistenceStorage: futureStorage
+            )
+            await futureRuntime.start()
+            let futureStatus = await futureRuntime.provider.status()
+            let futureCountdown = await futureRuntime.provider.countdown()
+            let futureBrokerWork = await futureBroker.workState()
+            check(
+                futureStatus == .disabled
+                    && futureCountdown == nil
+                    && futureBrokerWork.activeOwnershipCount == 0,
+                "a future-start persisted session fails closed without scheduling work"
+            )
+            check(
+                futureStorage.currentData != futureData,
+                "a future-start persisted session is replaced by an inert tombstone"
+            )
+            await futureRuntime.shutdown()
+            await futureBroker.shutdown()
+        } catch {
+            recordUnexpected(error, context: "future-start Focus Timer persistence fixture")
+            check(false, "future-start persistence fixture remains encodable")
+            check(false, "future-start persistence fixture remains testable")
+        }
+
+        let unsupportedData = Data(
+            "{\"activeSession\":{\"futureShape\":true},\"schemaVersion\":2}".utf8
+        )
+        let unsupportedStorage = RuntimeAtomicSettingsStorage(initialData: unsupportedData)
+        let unsupportedBroker = ActivityBroker()
+        let unsupportedRuntime = FocusTimerRuntimeService(
+            broker: unsupportedBroker,
+            clock: ManualFocusClock(now: now),
+            persistenceStorage: unsupportedStorage
+        )
+        await unsupportedRuntime.start()
+        let unsupportedStatus = await unsupportedRuntime.provider.status()
+        check(
+            unsupportedStatus == .disabled
+                && unsupportedStorage.currentData == unsupportedData
+                && unsupportedStorage.replacementAttemptCount == 0,
+            "a future persistence schema fails closed without overwriting its bytes"
+        )
+        await unsupportedRuntime.shutdown()
+        await unsupportedBroker.shutdown()
+
+        let unreadableData = Data("preserve-on-read-failure".utf8)
+        let unreadableStorage = RuntimeAtomicSettingsStorage(initialData: unreadableData)
+        unreadableStorage.failNextRead()
+        let unreadableBroker = ActivityBroker()
+        let unreadableRuntime = FocusTimerRuntimeService(
+            broker: unreadableBroker,
+            clock: ManualFocusClock(now: now),
+            persistenceStorage: unreadableStorage
+        )
+        await unreadableRuntime.start()
+        let unreadableStatus = await unreadableRuntime.provider.status()
+        check(
+            unreadableStatus == .disabled
+                && unreadableStorage.currentData == unreadableData
+                && unreadableStorage.replacementAttemptCount == 0,
+            "a persistence read failure stays inert without overwriting unreadable data"
+        )
+        await unreadableRuntime.shutdown()
+        await unreadableBroker.shutdown()
+
+        for invalidData in [
+            Data("not-json".utf8),
+            Data(repeating: 0x41, count: 1_025),
+        ] {
+            let invalidStorage = RuntimeAtomicSettingsStorage(initialData: invalidData)
+            let invalidBroker = ActivityBroker()
+            let invalidNotifications = Counter()
+            let invalidRuntime = FocusTimerRuntimeService(
+                broker: invalidBroker,
+                clock: ManualFocusClock(now: now),
+                persistenceStorage: invalidStorage,
+                completionNotifier: { invalidNotifications.value += 1 }
+            )
+            await invalidRuntime.start()
+            let invalidStatus = await invalidRuntime.provider.status()
+            let invalidCountdown = await invalidRuntime.provider.countdown()
+            let invalidBrokerWork = await invalidBroker.workState()
+            check(
+                invalidStatus == .disabled
+                    && invalidCountdown == nil
+                    && invalidBrokerWork.activeOwnershipCount == 0,
+                "invalid or oversized timer persistence fails closed without runtime work"
+            )
+            check(invalidNotifications.value == 0, "invalid persistence emits no completion notification")
+            check(
+                invalidStorage.currentData != invalidData,
+                "invalid persistence is replaced by a bounded tombstone"
+            )
+            await invalidRuntime.shutdown()
+            await invalidBroker.shutdown()
+        }
     }
 
     mutating func verifyNaturalCompletionPresentationAndShutdownBarrier() async {
@@ -2311,6 +2846,12 @@ private struct AppRuntimeHarness {
                 "completion peek announces its acknowledgement to VoiceOver"
             )
             check(
+                panelModel.content.action?.intent == .dismiss
+                    && panelModel.content.action?.label == "Done"
+                    && panelModel.accessibilitySurfaceAction == .dismiss,
+                "completion peek exposes Done and a VoiceOver dismiss action, never Expand"
+            )
+            check(
                 await waitUntil { await completionScheduler.pendingCount == 1 },
                 "completion peek remains bounded by its one broker expiry"
             )
@@ -2332,9 +2873,13 @@ private struct AppRuntimeHarness {
             broker: barrierBroker,
             clock: barrierClock
         )
+        let barrierStorage = RuntimeAtomicSettingsStorage()
+        let barrierNotifications = Counter()
         let focusTimer = FocusTimerRuntimeService(
             provider: barrierProvider,
-            clock: barrierClock
+            clock: barrierClock,
+            persistenceStorage: barrierStorage,
+            completionNotifier: { barrierNotifications.value += 1 }
         )
         await focusTimer.start()
         await barrierBroker.gateNextRelease()
@@ -2373,6 +2918,11 @@ private struct AppRuntimeHarness {
             },
             "gated cleanup stores a semantically new operation with value-identical timer fields"
         )
+        let replacementPersistedRecord = barrierStorage.currentData
+        check(
+            replacementPersistedRecord != nil,
+            "value-identical replacement stores a distinct persisted session identity"
+        )
         check(
             focusTimer.menuContext(at: now) == .active(remainingText: "00:05"),
             "value-identical replacement immediately owns its menu deadline"
@@ -2407,6 +2957,14 @@ private struct AppRuntimeHarness {
             "value-identical replacement preserves its menu context after the old callback"
         )
         check(
+            barrierStorage.currentData == replacementPersistedRecord,
+            "retired natural completion cannot tombstone the persisted replacement session"
+        )
+        check(
+            barrierNotifications.value == 0,
+            "retired natural completion cannot notify after a replacement is active"
+        )
+        check(
             await waitUntil { await barrierClock.pendingDeadlines == [replacementEnd] },
             "settled replacement owns exactly one fresh expiry boundary"
         )
@@ -2423,6 +2981,10 @@ private struct AppRuntimeHarness {
                     && brokerWork.pendingOwnershipIntentCount == 0
             },
             "replacement cancel route drains revision, boundary, ownership, and capacity"
+        )
+        check(
+            barrierStorage.currentData != replacementPersistedRecord,
+            "replacement cancellation tombstones its exact persisted session"
         )
 
         await barrierBroker.gateNextRelease()
@@ -2631,6 +3193,11 @@ private final class Counter {
 }
 
 @MainActor
+private final class CommandAdmissionProbe {
+    var isAdmitted = false
+}
+
+@MainActor
 private final class FocusTimerMenuContextProbe {
     var context = ApplicationFocusTimerMenuContext.idle
     private(set) var evaluationCount = 0
@@ -2674,6 +3241,7 @@ private final class RecordingControlPlane: ApplicationControlPlaneOwning {
     private(set) var restoreCount = 0
     private var isShutDown = false
     private var runtimeSnapshotProvider: (@MainActor () -> ApplicationRuntimeControlSnapshot)?
+    private var commandHandler: (@MainActor (ApplicationControlCommand) -> Bool)?
     private(set) var readinessSnapshot = ApplicationReadinessSnapshot.starting
 
     var lastCanCheckForUpdates: Bool? {
@@ -2686,15 +3254,19 @@ private final class RecordingControlPlane: ApplicationControlPlaneOwning {
 
     func installEarlyControls(
         runtimeSnapshotProvider: @escaping @MainActor () -> ApplicationRuntimeControlSnapshot,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void,
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool,
         displayPolicyHandler: @escaping @MainActor (DisplayPolicy) -> Void
     ) -> Bool {
         guard installCount == 0, !isShutDown else { return false }
-        _ = commandHandler
         _ = displayPolicyHandler
         self.runtimeSnapshotProvider = runtimeSnapshotProvider
+        self.commandHandler = commandHandler
         installCount += 1
         return true
+    }
+
+    func route(_ command: ApplicationControlCommand) -> Bool {
+        commandHandler?(command) == true
     }
 
     func restorePersistedModules() async -> Bool {
@@ -2713,6 +3285,7 @@ private final class RecordingControlPlane: ApplicationControlPlaneOwning {
     func shutdown() async {
         guard !isShutDown else { return }
         isShutDown = true
+        commandHandler = nil
         shutdownCount += 1
     }
 }
@@ -2724,13 +3297,13 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
     private(set) var presentationCount = 0
     private(set) var shutdownCount = 0
     private(set) var menu: ApplicationMenuDescriptor?
-    private(set) var commandHandler: (@MainActor (ApplicationControlCommand) -> Void)?
+    private(set) var commandHandler: (@MainActor (ApplicationControlCommand) -> Bool)?
     private(set) var presentedModel: TrustSettingsViewModel?
     private var descriptorProvider: (@MainActor () -> ApplicationMenuDescriptor)?
 
     func installStatusMenu(
         descriptorProvider: @escaping @MainActor () -> ApplicationMenuDescriptor,
-        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Void
+        commandHandler: @escaping @MainActor (ApplicationControlCommand) -> Bool
     ) {
         statusItemCount = 1
         self.descriptorProvider = descriptorProvider
@@ -2762,7 +3335,7 @@ private final class RecordingControlPresenter: ApplicationControlPresenting {
 
 private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     private var settings: EryloSettings
-    private let report: SettingsLoadReport
+    private var report: SettingsLoadReport
     private let restoreResults: [PersistedModuleRestoreResult]
     private var moduleFailureQueues: [EryloModule: [TrustUpdateFailure]]
     private(set) var moduleMutationCount = 0
@@ -2795,6 +3368,13 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
         permissionPolicy: PermissionRequestPolicy
     ) -> TrustSettingsUpdateResult {
         _ = permissionPolicy
+        if report.requiresExplicitReset {
+            return TrustSettingsUpdateResult(
+                settings: settings,
+                outcome: .failed,
+                failure: .settingsResetRequired
+            )
+        }
         moduleMutationCount += 1
         if var failures = moduleFailureQueues[module], !failures.isEmpty {
             let failure = failures.removeFirst()
@@ -2810,6 +3390,13 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     }
 
     func apply(_ change: TrustSettingsChange) -> TrustSettingsUpdateResult {
+        if report.requiresExplicitReset {
+            return TrustSettingsUpdateResult(
+                settings: settings,
+                outcome: .failed,
+                failure: .settingsResetRequired
+            )
+        }
         switch change {
         case let .displays(displays):
             settings.displays = displays
@@ -2826,12 +3413,23 @@ private actor RecordingApplicationSettingsOwner: ApplicationSettingsOwning {
     }
 
     func setLaunchAtLoginEnabled(_ enabled: Bool) -> TrustSettingsUpdateResult {
+        if report.requiresExplicitReset {
+            return TrustSettingsUpdateResult(
+                settings: settings,
+                outcome: .failed,
+                failure: .settingsResetRequired
+            )
+        }
         settings.launchAtLogin = enabled
         return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
     }
 
     func resetToSafeDefaults() -> TrustSettingsUpdateResult {
         settings = .safeDefaults
+        report = SettingsLoadReport(
+            disposition: .current,
+            storedSchemaVersion: EryloSettings.currentSchemaVersion
+        )
         return TrustSettingsUpdateResult(settings: settings, outcome: .applied)
     }
 
@@ -2947,22 +3545,66 @@ private actor GatedApplicationSettingsOwner: ApplicationSettingsOwning {
     }
 }
 
+private struct RuntimePersistedFocusTimerSession: Codable {
+    let sessionID: UUID
+    let startedAt: Date
+    let endsAt: Date
+}
+
+private struct RuntimePersistedFocusTimerEnvelope: Codable {
+    let schemaVersion: Int
+    let activeSession: RuntimePersistedFocusTimerSession?
+}
+
 private final class RuntimeAtomicSettingsStorage: AtomicSettingsStorage, @unchecked Sendable {
     private let lock = NSLock()
     private var data: Data?
+    private var reads = 0
+    private var replacementAttempts = 0
+    private var successfulReplacements = 0
+    private var shouldFailNextRead = false
+    private var shouldFailNextReplacement = false
 
-    init(initialData: Data?) {
+    init(initialData: Data? = nil) {
         data = initialData
+    }
+
+    var currentData: Data? { lock.withLock { data } }
+    var readCount: Int { lock.withLock { reads } }
+    var replacementAttemptCount: Int { lock.withLock { replacementAttempts } }
+    var successfulReplacementCount: Int { lock.withLock { successfulReplacements } }
+
+    func failNextReplacement() {
+        lock.withLock { shouldFailNextReplacement = true }
+    }
+
+    func failNextRead() {
+        lock.withLock { shouldFailNextRead = true }
     }
 
     func data(forKey key: String) throws -> Data? {
         _ = key
-        return lock.withLock { data }
+        return try lock.withLock {
+            reads += 1
+            if shouldFailNextRead {
+                shouldFailNextRead = false
+                throw RuntimeSystemSourceError.requestedFailure
+            }
+            return data
+        }
     }
 
     func replace(_ data: Data, forKey key: String) throws {
         _ = key
-        lock.withLock { self.data = data }
+        try lock.withLock {
+            replacementAttempts += 1
+            if shouldFailNextReplacement {
+                shouldFailNextReplacement = false
+                throw RuntimeSystemSourceError.requestedFailure
+            }
+            self.data = data
+            successfulReplacements += 1
+        }
     }
 }
 
@@ -3266,6 +3908,8 @@ private final class FixedDisplayProvider: EnabledDisplayProviding {
         [
             DisplaySnapshot(
                 identity: DisplayIdentity(rawValue: 1),
+                uuid: makeDisplayUUID(1),
+                localizedName: "Built-in Display",
                 geometry: DisplayGeometry(
                     frame: CGRect(x: 0, y: 0, width: 1_440, height: 900),
                     visibleFrame: CGRect(x: 0, y: 0, width: 1_440, height: 875),
@@ -3276,6 +3920,11 @@ private final class FixedDisplayProvider: EnabledDisplayProviding {
             ),
         ]
     }
+}
+
+private func makeDisplayUUID(_ value: UInt32) -> DisplayUUID {
+    let uuid = String(format: "00000000-0000-0000-0000-%012llx", UInt64(value))
+    return DisplayUUID(rawValue: uuid)!
 }
 
 @MainActor
@@ -3430,6 +4079,36 @@ private final class VisibilityReportingPanel: PanelPresenting, PanelActivityVisi
         guard force || visible != lastReportedVisibility else { return }
         lastReportedVisibility = visible
         visibilityHandler?(visible)
+    }
+}
+
+private actor GatedFocusClock: GlanceClock {
+    private let currentDate: Date
+    private var gatesNextNow = true
+    private var nowContinuation: CheckedContinuation<Date, Never>?
+
+    init(now: Date) {
+        currentDate = now
+    }
+
+    var isNowPending: Bool { nowContinuation != nil }
+
+    func now() async -> Date {
+        guard gatesNextNow else { return currentDate }
+        gatesNextNow = false
+        return await withCheckedContinuation { continuation in
+            nowContinuation = continuation
+        }
+    }
+
+    func releaseNow() {
+        nowContinuation?.resume(returning: currentDate)
+        nowContinuation = nil
+    }
+
+    func sleep(until deadline: Date) async throws {
+        guard deadline > currentDate else { return }
+        throw CancellationError()
     }
 }
 

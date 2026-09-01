@@ -1,18 +1,39 @@
+public enum DisplaySurfaceScope: String, Codable, Equatable, Sendable {
+    /// One deterministic display: the current main display when available.
+    case automatic
+    /// Every available non-mirrored display. This is always an explicit opt-in.
+    case allAvailable = "all-available"
+    /// Only the stable display UUIDs in `enabledDisplayUUIDs`.
+    case custom
+}
+
 public struct DisplayPolicy: Equatable, Sendable {
-    /// A nil set means every available non-mirrored display is enabled.
-    public var enabledDisplayIdentities: Set<DisplayIdentity>?
-    /// The preferred target for one-at-a-time interactions such as the shortcut.
-    public var selectedDisplayIdentity: DisplayIdentity?
+    public var surfaceScope: DisplaySurfaceScope
+    /// Used only by custom scope. An empty set enables none. Explicit stable UUIDs
+    /// that are not currently available remain unavailable; Erylo never substitutes
+    /// a different physical display.
+    public var enabledDisplayUUIDs: Set<DisplayUUID>?
+    /// Stable preferred target for one-at-a-time menu and shortcut interactions.
+    /// `nil` chooses the main enabled display automatically. An explicit UUID that
+    /// is unavailable or disabled resolves to no target rather than the wrong screen.
+    public var preferredDisplayUUID: DisplayUUID?
+    /// Public AppKit fullscreen-Space participation. `false` is the safe default;
+    /// `true` maps only to `NSWindow.CollectionBehavior.fullScreenAuxiliary`.
+    public var allowsFullscreenAuxiliary: Bool
     public var isEnabled: Bool
 
     public init(
         isEnabled: Bool = true,
-        enabledDisplayIdentities: Set<DisplayIdentity>? = nil,
-        selectedDisplayIdentity: DisplayIdentity? = nil
+        surfaceScope: DisplaySurfaceScope = .automatic,
+        enabledDisplayUUIDs: Set<DisplayUUID>? = nil,
+        preferredDisplayUUID: DisplayUUID? = nil,
+        allowsFullscreenAuxiliary: Bool = false
     ) {
         self.isEnabled = isEnabled
-        self.enabledDisplayIdentities = enabledDisplayIdentities
-        self.selectedDisplayIdentity = selectedDisplayIdentity
+        self.surfaceScope = surfaceScope
+        self.enabledDisplayUUIDs = enabledDisplayUUIDs
+        self.preferredDisplayUUID = preferredDisplayUUID
+        self.allowsFullscreenAuxiliary = allowsFullscreenAuxiliary
     }
 
     public static let safeDefault = DisplayPolicy()
@@ -20,21 +41,44 @@ public struct DisplayPolicy: Equatable, Sendable {
     public func resolve(_ availableDisplays: [DisplaySnapshot]) -> DisplayResolution {
         guard isEnabled else { return DisplayResolution(enabledDisplays: [], selectedDisplayIdentity: nil) }
 
-        var seen: Set<DisplayIdentity> = []
-        let enabledDisplays = availableDisplays.filter { display in
-            guard !display.isMirrored, seen.insert(display.identity).inserted else { return false }
-            return enabledDisplayIdentities?.contains(display.identity) ?? true
+        var seen: Set<DisplayUUID> = []
+        let eligibleDisplays = availableDisplays.filter { display in
+            !display.isMirrored && seen.insert(display.uuid).inserted
+        }
+        let enabledDisplays: [DisplaySnapshot] = switch surfaceScope {
+        case .automatic:
+            Self.stableFallback(in: eligibleDisplays).map { [$0] } ?? []
+        case .allAvailable:
+            eligibleDisplays
+        case .custom:
+            eligibleDisplays.filter { enabledDisplayUUIDs?.contains($0.uuid) == true }
         }
 
-        let selectedDisplayIdentity = selectedDisplayIdentity.flatMap { preferredIdentity in
-            enabledDisplays.first { $0.identity == preferredIdentity }?.identity
-        } ?? enabledDisplays.first(where: \.isMain)?.identity
-            ?? enabledDisplays.first?.identity
+        let selectedDisplayIdentity: DisplayIdentity?
+        if let preferredDisplayUUID {
+            selectedDisplayIdentity = enabledDisplays.first {
+                $0.uuid == preferredDisplayUUID
+            }?.identity
+        } else {
+            selectedDisplayIdentity = enabledDisplays.first(where: \.isMain)?.identity
+                ?? Self.stableFallback(in: enabledDisplays)?.identity
+        }
 
         return DisplayResolution(
             enabledDisplays: enabledDisplays,
             selectedDisplayIdentity: selectedDisplayIdentity
         )
+    }
+
+    private static func stableFallback(
+        in displays: [DisplaySnapshot]
+    ) -> DisplaySnapshot? {
+        displays.first(where: \.isMain) ?? displays.min {
+            if $0.uuid == $1.uuid {
+                return $0.identity.rawValue < $1.identity.rawValue
+            }
+            return $0.uuid < $1.uuid
+        }
     }
 }
 

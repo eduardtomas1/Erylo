@@ -1,116 +1,375 @@
+import AppKit
 import EryloCore
 import EryloTrust
 import SwiftUI
 
+public enum TrustSettingsPresentation {
+    /// Only modules with a shipping Settings lifecycle belong in the visible module list.
+    /// Other persisted module keys remain supported for decoding and library clients.
+    public static let configurableModules: [EryloModule] = [.battery, .volume]
+}
+
 public struct TrustSettingsView: View {
     private let model: TrustSettingsViewModel
     private let destinationChooser: any DiagnosticsDestinationChoosing
+    private let onStartFocusTimer: (@MainActor () -> Bool)?
+    private let showsLowerSectionsForVisualQA: Bool
 
     @State private var isResetConfirmationPresented = false
+    @State private var focusTimerStartFailed = false
 
     @MainActor
     public init(
         model: TrustSettingsViewModel,
-        destinationChooser: any DiagnosticsDestinationChoosing = SystemDiagnosticsDestinationChooser()
+        destinationChooser: any DiagnosticsDestinationChoosing = SystemDiagnosticsDestinationChooser(),
+        onStartFocusTimer: (@MainActor () -> Bool)? = nil
     ) {
         self.model = model
         self.destinationChooser = destinationChooser
+        self.onStartFocusTimer = onStartFocusTimer
+        showsLowerSectionsForVisualQA = false
+    }
+
+    /// Package-only visual-proof seam. Production Settings always renders the
+    /// complete form; the deterministic harness can isolate the lower native
+    /// controls without exposing a test preference to users.
+    @MainActor
+    package init(
+        model: TrustSettingsViewModel,
+        onStartFocusTimer: (@MainActor () -> Bool)?,
+        showsLowerSectionsForVisualQA: Bool
+    ) {
+        self.model = model
+        destinationChooser = SystemDiagnosticsDestinationChooser()
+        self.onStartFocusTimer = onStartFocusTimer
+        self.showsLowerSectionsForVisualQA = showsLowerSectionsForVisualQA
     }
 
     public var body: some View {
-        ScrollView {
-            LazyVStack(spacing: 16) {
-                promiseCard
-                moduleSection
-                displaySection
-                behaviorSection
-                trustSection
+        ZStack {
+            Color(nsColor: .windowBackgroundColor)
+                .ignoresSafeArea()
+
+            if model.recoveryReport != nil {
+                settingsRecoveryView
+            } else if model.settings.onboardingCompleted {
+                Form {
+                    if showsLowerSectionsForVisualQA {
+                        generalSection
+                        supportSection
+                    } else {
+                        activitySection
+                        displaySection
+                        if model.supportsMotionPreference || model.supportsFullscreenPreference {
+                            behaviorSection
+                        }
+                        generalSection
+                        supportSection
+                    }
+                }
+                .formStyle(.grouped)
+                .scrollContentBackground(.hidden)
+                .frame(maxWidth: 720)
+            } else {
+                onboardingView
             }
-            .padding(24)
-            .frame(maxWidth: 760)
-            .frame(maxWidth: .infinity)
         }
-        .background(EryloPalette.ink)
-        .foregroundStyle(EryloPalette.cloud)
         .task {
             await model.load()
         }
         .confirmationDialog(
-            "Reset Erylo to safe defaults?",
+            "Reset Erylo settings?",
             isPresented: $isResetConfirmationPresented,
             titleVisibility: .visible
         ) {
-            Button("Reset", role: .destructive) {
+            Button("Reset Settings", role: .destructive) {
                 Task { await model.resetToSafeDefaults() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("All modules, login launch, diagnostic consent, and custom behavior will be turned off.")
+            Text("Battery, Volume, display choices, launch at login, and other saved preferences will return to their defaults. A running Focus Timer is not affected.")
         }
     }
 
-    private var promiseCard: some View {
-        sectionCard {
-            HStack(alignment: .top, spacing: 14) {
-                Circle()
-                    .fill(EryloPalette.mint)
-                    .frame(width: 10, height: 10)
-                    .padding(.top, 7)
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Glance. Act. Disappear.")
-                        .font(.system(.title2, design: .rounded, weight: .semibold))
-                    Text("Erylo is a quiet, local-first activity layer. Focus Timer starts from the Erylo menu; Battery and Volume run only when you enable them in Settings.")
-                        .foregroundStyle(EryloPalette.mist)
-                        .fixedSize(horizontal: false, vertical: true)
-                    if !model.settings.onboardingCompleted {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(TrustAccessibilityCopy.onboardingSurfaceExplanation)
-                            Text(TrustAccessibilityCopy.onboardingInteractionExplanation)
-                            Text(TrustAccessibilityCopy.onboardingSafetyExplanation)
-                            Text(TrustAccessibilityCopy.onboardingControlExplanation)
-                        }
-                        .font(.callout)
-                        .foregroundStyle(EryloPalette.mist)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityElement(children: .combine)
-                        .accessibilityLabel(TrustAccessibilityCopy.onboardingLabel)
-                        .accessibilityHint(TrustAccessibilityCopy.onboardingHint)
+    private var settingsRecoveryView: some View {
+        GeometryReader { proxy in
+            ScrollView(.vertical) {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 40)
 
-                        Button("Continue with safe defaults") {
-                            Task { await model.completeOnboarding() }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(EryloPalette.mint)
-                        .foregroundStyle(EryloPalette.ink)
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 34, weight: .medium))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+
+                    Text("Saved Settings Need Attention")
+                        .font(.system(size: 26, weight: .semibold))
+                        .padding(.top, 18)
+                        .accessibilityAddTraits(.isHeader)
+
+                    Text("Erylo opened with safe defaults because the saved settings could not be read safely. Your existing saved data has not been changed.")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 8)
+
+                    Label(
+                        "Reset is the only action that can replace the saved value.",
+                        systemImage: "lock.shield"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 22)
+
+                    if let statusMessage = model.statusMessage {
+                        Text(statusMessage)
+                            .font(.callout)
+                            .foregroundStyle(statusMessageIsFailure ? Color.red : Color.secondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 18)
+                            .accessibilityLabel("Settings status: \(statusMessage)")
                     }
+
+                    HStack(spacing: 12) {
+                        Button {
+                            Task {
+                                guard let destination = await destinationChooser.chooseDestination() else {
+                                    return
+                                }
+                                await model.exportDiagnostics(to: destination)
+                            }
+                        } label: {
+                            Text("Export Diagnostics…")
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityHint(TrustAccessibilityCopy.diagnosticsExportHint)
+
+                        Button("Reset Settings…", role: .destructive) {
+                            isResetConfirmationPresented = true
+                        }
+                        .buttonStyle(.bordered)
+                        .accessibilityHint("Replaces the unreadable saved value with safe defaults after confirmation.")
+                    }
+                    .controlSize(.large)
+                    .padding(.top, 26)
+                    .disabled(model.isWorking)
+
+                    if model.isWorking {
+                        ProgressView("Working…")
+                            .controlSize(.small)
+                            .padding(.top, 16)
+                    }
+
+                    Spacer(minLength: 40)
                 }
+                .frame(maxWidth: 500)
+                .padding(.horizontal, 44)
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+                .accessibilityElement(children: .contain)
             }
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(TrustAccessibilityCopy.productPromiseLabel)
-        .accessibilityHint(TrustAccessibilityCopy.productPromiseHint)
     }
 
-    private var moduleSection: some View {
-        sectionCard(
-            title: "Modules",
-            subtitle: "Battery and Volume use local system events and are fully stopped when off. Focus Timer is available from the Erylo menu; every other utility row is future work."
-        ) {
-            VStack(spacing: 0) {
-                ForEach(EryloModule.allCases, id: \.self) { module in
-                    moduleRow(module)
-                    if module != EryloModule.allCases.last {
-                        Divider().overlay(EryloPalette.mist.opacity(0.2))
+    private var onboardingView: some View {
+        GeometryReader { proxy in
+            ScrollView(.vertical) {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 32)
+
+                    EryloSignalMark()
+                        .stroke(
+                            Color.accentColor,
+                            style: StrokeStyle(lineWidth: 2.5, lineCap: .round, lineJoin: .round)
+                        )
+                        .frame(width: 48, height: 28)
+                        .accessibilityHidden(true)
+
+                    Text("Your focus, at the top edge")
+                        .font(.system(size: 30, weight: .semibold))
+                        .padding(.top, 16)
+                        .accessibilityAddTraits(.isHeader)
+
+                    Text(TrustAccessibilityCopy.onboardingSurfaceExplanation)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 7)
+
+                    OnboardingSurfacePreview()
+                        .frame(maxWidth: 440)
+                        .padding(.top, 24)
+
+                    HStack(alignment: .top, spacing: 24) {
+                        onboardingPromise(
+                            symbol: "cursorarrow.rays",
+                            title: "Stays out of the way",
+                            detail: "Hover never activates Erylo or steals focus."
+                        )
+                        onboardingPromise(
+                            symbol: "moon.zzz",
+                            title: "Sleeps when idle",
+                            detail: "No background loop runs while Erylo is idle."
+                        )
+                        onboardingPromise(
+                            symbol: "lock.shield",
+                            title: "Local by design",
+                            detail: "No account, analytics, or automatic upload."
+                        )
                     }
+                    .frame(maxWidth: 500)
+                    .padding(.top, 24)
+
+                    if let failure = model.onboardingActionFailure {
+                        Label(failure, systemImage: "exclamationmark.circle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 20)
+                            .accessibilityLabel("Setup error. \(failure)")
+                    }
+
+                    Spacer(minLength: 28)
+
+                    HStack(spacing: 12) {
+                        if let onStartFocusTimer {
+                            Button {
+                                Task {
+                                    _ = await model.startFocusTimerAndCompleteOnboarding(
+                                        using: onStartFocusTimer
+                                    )
+                                }
+                            } label: {
+                                HStack(spacing: 7) {
+                                    Image(systemName: "timer")
+                                        .accessibilityHidden(true)
+                                    Text("Start 25-Minute Focus")
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                            .accessibilityHint("Starts a 25 minute Focus Timer and finishes setup. No permission is requested.")
+
+                            Button("Continue to Settings") {
+                                Task { await model.completeOnboarding() }
+                            }
+                            .buttonStyle(.bordered)
+                        } else {
+                            Button("Continue to Settings") {
+                                Task { await model.completeOnboarding() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                        }
+                    }
+                    .controlSize(.large)
+                    .disabled(model.isWorking)
+
+                    Text("Battery and Volume stay off until you enable them in Settings.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 9)
+
+                    Spacer(minLength: 28)
                 }
+                .frame(maxWidth: 520)
+                .padding(.horizontal, 44)
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+                .accessibilityElement(children: .contain)
             }
+        }
+    }
+
+    private func onboardingPromise(
+        symbol: String,
+        title: String,
+        detail: String
+    ) -> some View {
+        VStack(spacing: 8) {
+            Image(systemName: symbol)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .symbolRenderingMode(.monochrome)
+                .frame(width: 28, height: 24)
+                .accessibilityHidden(true)
+
+            Text(title)
+                .font(.callout.weight(.semibold))
+                .multilineTextAlignment(.center)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var activitySection: some View {
+        Section {
+            focusTimerRow
+
+            ForEach(configurableModules, id: \.self) { module in
+                moduleToggle(module)
+            }
+        } header: {
+            Text("Utilities")
+        } footer: {
+            settingsFooter("Disabled utilities stop completely.")
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(TrustAccessibilityCopy.moduleGroupLabel)
     }
 
-    private func moduleRow(_ module: EryloModule) -> some View {
+    private var configurableModules: [EryloModule] {
+        TrustSettingsPresentation.configurableModules.filter(model.isModuleAvailable)
+    }
+
+    private var focusTimerRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 12) {
+                settingIcon("timer")
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Focus Timer")
+                    Text("Start here, or choose another duration from the Erylo menu.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 12)
+
+                if let onStartFocusTimer {
+                    Button("Start 25 min") {
+                        focusTimerStartFailed = !onStartFocusTimer()
+                    }
+                    .accessibilityHint("Starts a 25 minute Focus Timer. A running timer is replaced.")
+                } else {
+                    Text("Menu bar")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if focusTimerStartFailed {
+                Label("The timer couldn’t start.", systemImage: "exclamationmark.circle.fill")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.red)
+                    .padding(.leading, 34)
+            }
+        }
+        .padding(.vertical, 3)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(TrustAccessibilityCopy.focusTimerLabel)
+        .accessibilityHint(TrustAccessibilityCopy.focusTimerHint)
+    }
+
+    private func moduleToggle(_ module: EryloModule) -> some View {
         Toggle(
             isOn: Binding(
                 get: { model.settings.modules[module] },
@@ -119,134 +378,125 @@ public struct TrustSettingsView: View {
                 }
             )
         ) {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                settingIcon(moduleIcon(module))
+
+                VStack(alignment: .leading, spacing: 3) {
                     Text(ModuleCopy.title(for: module))
-                        .foregroundStyle(EryloPalette.cloud)
-                    if let badge = moduleBadge(module) {
-                        Text(badge)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(EryloPalette.amber)
+                    Text(ModuleCopy.explanation(for: module))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let feedback = model.moduleFeedback[module] {
+                        Text(feedback)
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(
+                                model.moduleFeedbackIsFailure(for: module)
+                                    ? Color.red
+                                    : Color.secondary
+                            )
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityHidden(true)
                     }
-                }
-                Text(ModuleCopy.explanation(for: module))
-                    .font(.caption)
-                    .foregroundStyle(EryloPalette.mist)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let feedback = model.moduleFeedback[module] {
-                    Text(feedback)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(
-                            model.moduleFeedbackIsFailure(for: module)
-                                ? EryloPalette.coral
-                                : EryloPalette.mint
-                        )
-                        .fixedSize(horizontal: false, vertical: true)
-                        .accessibilityLabel("\(ModuleCopy.title(for: module)) status: \(feedback)")
-                }
-                if !model.isModuleAvailable(module) {
-                    Text(module == .timer
-                        ? "Focus Timer is live from the Erylo menu; this background-module switch is not used."
-                        : "Future utility; not included or running in this build.")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(EryloPalette.amber)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }
         .toggleStyle(.switch)
-        .tint(EryloPalette.mint)
-        .disabled(!model.isModuleAvailable(module))
-        .padding(.vertical, 10)
-        .accessibilityLabel(
-            module == .timer
-                ? "Focus Timer menu control"
-                : model.isModuleAvailable(module)
-                ? TrustAccessibilityCopy.moduleLabel(module)
-                : TrustAccessibilityCopy.unavailableModuleLabel(module)
-        )
-        .accessibilityHint(
-            module == .timer
-                ? "Use the Erylo menu to start a 15, 25, or 50 minute Focus Timer, or cancel the current timer."
-                : model.isModuleAvailable(module)
-                ? TrustAccessibilityCopy.moduleHint(module)
-                : TrustAccessibilityCopy.unavailableModuleHint(module)
-        )
+        .padding(.vertical, 3)
+        .accessibilityLabel(TrustAccessibilityCopy.moduleLabel(module))
+        .accessibilityValue(model.moduleAccessibilityValue(for: module))
+        .accessibilityHint(TrustAccessibilityCopy.moduleHint(module))
     }
 
     private var displaySection: some View {
-        sectionCard(title: "Displays", subtitle: "Choose where the activity surface may appear. Missing displays fall back safely.") {
-            VStack(alignment: .leading, spacing: 12) {
-                Toggle(
-                    "Show the Erylo surface",
-                    isOn: Binding(
-                        get: { model.settings.displays.isEnabled },
-                        set: { enabled in Task { await model.setDisplaySurfaceEnabled(enabled) } }
-                    )
+        Section {
+            Toggle(
+                "Show Erylo",
+                isOn: Binding(
+                    get: { model.settings.displays.isEnabled },
+                    set: { enabled in Task { await model.setDisplaySurfaceEnabled(enabled) } }
                 )
-                .toggleStyle(.switch)
-                .tint(EryloPalette.mint)
+            )
+            .toggleStyle(.switch)
+
+            if model.settings.displays.isEnabled {
+                Picker(
+                    TrustAccessibilityCopy.displayScopePickerLabel,
+                    selection: Binding(
+                        get: { model.settings.displays.surfaceScope },
+                        set: { scope in Task { await model.setDisplayScope(scope) } }
+                    )
+                ) {
+                    Text("Automatic — Main Display").tag(DisplaySurfaceScope.automatic)
+                    Text("All Displays").tag(DisplaySurfaceScope.allAvailable)
+                    Text("Choose Displays").tag(DisplaySurfaceScope.custom)
+                }
+                .pickerStyle(.menu)
+                .accessibilityHint(TrustAccessibilityCopy.displayScopePickerHint)
 
                 if model.displayChoices.isEmpty {
-                    Text("Display choices will appear when the host app supplies the current display list. Automatic selection remains available.")
+                    Text("No display is currently available. Erylo will wait for one to connect.")
                         .font(.caption)
-                        .foregroundStyle(EryloPalette.mist)
+                        .foregroundStyle(.secondary)
                 } else {
-                    Toggle(
-                        "Use all available displays",
-                        isOn: Binding(
-                            get: { model.settings.displays.enabledDisplayIDs == nil },
-                            set: { useAll in
-                                Task { await model.setUseAllAvailableDisplays(useAll) }
-                            }
-                        )
-                    )
-                    .toggleStyle(.switch)
-                    .tint(EryloPalette.sky)
-
-                    ForEach(model.displayChoices) { display in
-                        Toggle(
-                            display.name,
-                            isOn: Binding(
-                                get: { model.isDisplayEnabled(display.identity) },
-                                set: { enabled in
-                                    Task { await model.setDisplayEnabled(display.identity, enabled: enabled) }
-                                }
-                            )
-                        )
-                        .disabled(model.settings.displays.enabledDisplayIDs == nil)
-                    }
-
-                    Picker(
-                        "Shortcut display",
-                        selection: Binding<DisplayIdentity?>(
-                            get: {
-                                model.settings.displays.selectedDisplayID.map(DisplayIdentity.init(rawValue:))
-                            },
-                            set: { identity in Task { await model.selectDisplay(identity) } }
-                        )
-                    ) {
-                        Text("Automatic").tag(DisplayIdentity?.none)
+                    if model.settings.displays.surfaceScope == .custom {
                         ForEach(model.displayChoices) { display in
-                            Text(display.name).tag(Optional(display.identity))
+                            Toggle(
+                                display.name,
+                                isOn: Binding(
+                                    get: { model.isDisplayEnabled(display.identity) },
+                                    set: { enabled in
+                                        Task { await model.setDisplayEnabled(display.identity, enabled: enabled) }
+                                    }
+                                )
+                            )
                         }
                     }
-                    .pickerStyle(.menu)
+                }
+
+                Picker(
+                    TrustAccessibilityCopy.preferredDisplayPickerLabel,
+                    selection: Binding<DisplayUUID?>(
+                        get: { model.settings.displays.preferredDisplayUUID },
+                        set: { identity in Task { await model.selectDisplay(identity) } }
+                    )
+                ) {
+                    Text("Automatic").tag(DisplayUUID?.none)
+                    if let unavailable = model.unavailablePreferredDisplayUUID {
+                        Text("Previously selected — Not Connected")
+                            .tag(Optional(unavailable))
+                            .disabled(true)
+                    }
+                    ForEach(model.preferredDisplayChoices) { display in
+                        Text(display.name).tag(Optional(display.identity))
+                    }
+                }
+                .pickerStyle(.menu)
+                .accessibilityHint(TrustAccessibilityCopy.preferredDisplayPickerHint)
+
+                if model.unavailablePreferredDisplayUUID != nil {
+                    Label(
+                        "The saved menu and shortcut display is unavailable. Erylo will not target another display.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
+        } header: {
+            Text("Displays")
+        } footer: {
+            settingsFooter("Automatic uses one main display. All Displays is opt-in. The menu and shortcut target can only be an enabled, connected display.")
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(TrustAccessibilityCopy.displayGroupLabel)
     }
 
     private var behaviorSection: some View {
-        sectionCard(
-            title: "Behavior",
-            subtitle: model.supportsMotionPreference && model.supportsFullscreenPreference
-                ? nil
-                : "Unavailable controls are not connected to the current surface and do not claim to change it."
-        ) {
-            VStack(alignment: .leading, spacing: 14) {
+        Section("Behavior") {
+            if model.supportsMotionPreference {
                 Picker(
                     TrustAccessibilityCopy.motionPickerLabel,
                     selection: Binding(
@@ -257,14 +507,11 @@ public struct TrustSettingsView: View {
                     Text("Follow System Settings").tag(MotionPreference.systemDefault)
                     Text("Reduce motion").tag(MotionPreference.reduce)
                 }
-                .pickerStyle(.segmented)
-                .disabled(!model.supportsMotionPreference)
-                .accessibilityHint(
-                    model.supportsMotionPreference
-                        ? "System default follows the macOS Reduce Motion setting."
-                        : TrustAccessibilityCopy.unavailableMotionHint
-                )
+                .pickerStyle(.menu)
+                .accessibilityHint("System default follows the macOS Reduce Motion setting.")
+            }
 
+            if model.supportsFullscreenPreference {
                 Picker(
                     TrustAccessibilityCopy.fullscreenPickerLabel,
                     selection: Binding(
@@ -272,90 +519,114 @@ public struct TrustSettingsView: View {
                         set: { value in Task { await model.setFullscreen(value) } }
                     )
                 ) {
-                    Text("Hide in fullscreen").tag(FullscreenBehavior.hide)
+                    Text("Hide Erylo").tag(FullscreenBehavior.hide)
                     Text("Remain available").tag(FullscreenBehavior.remainAvailable)
                 }
-                .pickerStyle(.segmented)
-                .disabled(!model.supportsFullscreenPreference)
-                .accessibilityHint(
-                    model.supportsFullscreenPreference
-                        ? "Controls whether the activity surface remains available with a fullscreen app."
-                        : TrustAccessibilityCopy.unavailableFullscreenHint
-                )
+                .pickerStyle(.menu)
+                .accessibilityHint(TrustAccessibilityCopy.fullscreenPickerHint)
             }
         }
     }
 
-    private var trustSection: some View {
-        sectionCard(title: "Trust and support", subtitle: "Your settings and diagnostics stay on this Mac unless you export a file.") {
-            VStack(alignment: .leading, spacing: 14) {
-                Toggle(
-                    TrustAccessibilityCopy.launchAtLoginLabel,
-                    isOn: Binding(
-                        get: { model.settings.launchAtLogin },
-                        set: { enabled in Task { await model.setLaunchAtLoginEnabled(enabled) } }
-                    )
+    private var generalSection: some View {
+        Section("General") {
+            Toggle(
+                TrustAccessibilityCopy.launchAtLoginLabel,
+                isOn: Binding(
+                    get: { model.settings.launchAtLogin },
+                    set: { enabled in Task { await model.setLaunchAtLoginEnabled(enabled) } }
                 )
-                .toggleStyle(.switch)
-                .tint(EryloPalette.sky)
-                .disabled(model.launchAtLogin.capability == .unavailable)
-                .accessibilityHint(TrustAccessibilityCopy.launchAtLoginHint)
+            )
+            .toggleStyle(.switch)
+            .disabled(model.launchAtLogin.capability == .unavailable)
+            .accessibilityHint(TrustAccessibilityCopy.launchAtLoginHint)
 
+            HStack(spacing: 7) {
+                Image(systemName: launchAtLoginStatusSymbol)
+                    .foregroundStyle(launchAtLoginStatusColor)
+                    .accessibilityHidden(true)
                 Text(launchAtLoginStatus)
                     .font(.caption)
-                    .foregroundStyle(launchAtLoginStatusColor)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .combine)
+        }
+    }
 
-                Divider().overlay(EryloPalette.mist.opacity(0.2))
-
-                Toggle(
-                    TrustAccessibilityCopy.diagnosticsConsentLabel,
-                    isOn: Binding(
-                        get: { model.settings.crashAndDiagnosticSharingConsent },
-                        set: { consent in Task { await model.setCrashAndDiagnosticSharingConsent(consent) } }
-                    )
-                )
-                .toggleStyle(.switch)
-                .tint(EryloPalette.mint)
-                .accessibilityHint(TrustAccessibilityCopy.diagnosticsConsentHint)
-
-                Text("Consent is off by default. There is no analytics SDK, automatic upload, or persistent device identifier in the report.")
-                    .font(.caption)
-                    .foregroundStyle(EryloPalette.mist)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 10) {
-                    Button(TrustAccessibilityCopy.diagnosticsExportLabel) {
-                        Task {
-                            guard let destination = await destinationChooser.chooseDestination() else { return }
-                            await model.exportDiagnostics(to: destination)
-                        }
+    private var supportSection: some View {
+        Section {
+            LabeledContent {
+                Button {
+                    Task {
+                        guard let destination = await destinationChooser.chooseDestination() else { return }
+                        await model.exportDiagnostics(to: destination)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(EryloPalette.sky)
-                    .accessibilityHint(TrustAccessibilityCopy.diagnosticsExportHint)
+                } label: { Text(TrustAccessibilityCopy.diagnosticsExportLabel) }
+                .accessibilityHint(TrustAccessibilityCopy.diagnosticsExportHint)
+            } label: {
+                Label("Diagnostics", systemImage: "stethoscope")
+            }
 
-                    Button(TrustAccessibilityCopy.resetLabel, role: .destructive) {
-                        isResetConfirmationPresented = true
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(EryloPalette.coral)
-                    .accessibilityHint(TrustAccessibilityCopy.resetHint)
+            LabeledContent {
+                Button(TrustAccessibilityCopy.resetLabel, role: .destructive) {
+                    isResetConfirmationPresented = true
                 }
+                .accessibilityHint(TrustAccessibilityCopy.resetHint)
+            } label: {
+                Label("Settings", systemImage: "arrow.counterclockwise")
+            }
 
-                if model.isWorking {
+            if model.isWorking {
+                HStack(spacing: 8) {
                     ProgressView()
                         .controlSize(.small)
-                        .accessibilityLabel("Applying settings change")
-                }
-                if let statusMessage = model.statusMessage {
-                    Text(statusMessage)
+                    Text("Applying changes…")
                         .font(.caption)
-                        .foregroundStyle(statusMessage.contains("could not") || statusMessage.contains("failed")
-                            ? EryloPalette.coral
-                            : EryloPalette.mist)
-                        .accessibilityLabel("Settings status: \(statusMessage)")
+                        .foregroundStyle(.secondary)
                 }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Applying settings change")
             }
+
+            if let statusMessage = model.statusMessage {
+                Text(statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(statusMessageIsFailure ? Color.red : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Settings status: \(statusMessage)")
+            }
+        } header: {
+            Text("Advanced")
+        } footer: {
+            settingsFooter("Diagnostics are redacted and saved only when you choose a file. Erylo has no analytics or automatic upload.")
+        }
+    }
+
+    private func settingsFooter(_ text: String) -> some View {
+        Text(text)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func settingIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 15, weight: .medium))
+            .foregroundStyle(Color.accentColor)
+            .symbolRenderingMode(.hierarchical)
+            .frame(width: 22)
+            .accessibilityHidden(true)
+    }
+
+    private func moduleIcon(_ module: EryloModule) -> String {
+        switch module {
+        case .battery: "battery.100percent"
+        case .volume: "speaker.wave.2.fill"
+        case .timer: "timer"
+        case .fileHold: "folder.fill"
+        case .appleMusic, .spotify: "music.note"
+        case .calendar: "calendar"
+        case .localIntegrations: "point.3.connected.trianglepath.dotted"
         }
     }
 
@@ -364,55 +635,129 @@ public struct TrustSettingsView: View {
         case .disabled: "Off in macOS Login Items."
         case .enabled: "Enabled in macOS Login Items."
         case .requiresApproval: "Waiting for approval in System Settings → Login Items."
-        case .unavailable: "Unavailable outside a signed application bundle."
+        case .unavailable: "Available when Erylo is running as an installed app."
         }
     }
 
-    private func moduleBadge(_ module: EryloModule) -> String? {
-        if module == .timer { return "USE ERYLO MENU" }
-        if !model.isModuleAvailable(module) { return "NOT AVAILABLE" }
-        if module.permissionRequirement != nil { return "ASKS WHEN ENABLED" }
-        switch module {
-        case .fileHold: return "ACCESS ON USE"
-        case .localIntegrations: return "LOCAL ONLY"
-        case .battery, .timer, .volume: return nil
-        case .appleMusic, .spotify, .calendar: return nil
+    private var launchAtLoginStatusSymbol: String {
+        switch model.launchAtLogin.registrationState {
+        case .enabled: "checkmark.circle.fill"
+        case .requiresApproval: "exclamationmark.circle.fill"
+        case .disabled: "circle"
+        case .unavailable: "minus.circle"
         }
     }
 
     private var launchAtLoginStatusColor: Color {
         switch model.launchAtLogin.registrationState {
-        case .enabled: EryloPalette.mint
-        case .requiresApproval: EryloPalette.amber
-        case .disabled, .unavailable: EryloPalette.mist
+        case .enabled: .green
+        case .requiresApproval: .orange
+        case .disabled, .unavailable: .secondary
         }
     }
 
-    private func sectionCard<Content: View>(
-        title: String? = nil,
-        subtitle: String? = nil,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let title {
-                Text(title)
-                    .font(.headline)
-                    .foregroundStyle(EryloPalette.cloud)
-            }
-            if let subtitle {
-                Text(subtitle)
+    private var statusMessageIsFailure: Bool {
+        guard let statusMessage = model.statusMessage else { return false }
+        return statusMessage.localizedCaseInsensitiveContains("could not")
+            || statusMessage.localizedCaseInsensitiveContains("failed")
+            || statusMessage.localizedCaseInsensitiveContains("needs attention")
+            || statusMessage.localizedCaseInsensitiveContains("must be reset")
+    }
+}
+
+/// A truthful first-run product moment: an illustrative compact signal using
+/// the shipping timer color and top-edge hierarchy, without fake controls or
+/// an always-running animation.
+private struct OnboardingSurfacePreview: View {
+    var body: some View {
+        ZStack(alignment: .top) {
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+
+            VStack(spacing: 0) {
+                ZStack(alignment: .bottom) {
+                    OnboardingTopEdgeSurfaceShape()
+                        .fill(Color.black)
+
+                    HStack(spacing: 0) {
+                        Image(systemName: "timer")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(EryloPalette.amber)
+                            .frame(width: 66)
+                            .accessibilityHidden(true)
+
+                        Spacer(minLength: 142)
+
+                        Text("24:59")
+                            .font(.system(size: 12, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .frame(width: 66)
+                    }
+                    .padding(.horizontal, 8)
+                    .frame(height: 43)
+
+                    HStack(spacing: 0) {
+                        Capsule(style: .continuous)
+                            .fill(EryloPalette.amber)
+                            .frame(width: 86, height: 2)
+                        Capsule(style: .continuous)
+                            .fill(Color.white.opacity(0.16))
+                            .frame(width: 108, height: 2)
+                    }
+                    .padding(.bottom, 1)
+                }
+                // The preview is a permanently black surface. Keep its
+                // semantic foreground independent from the host appearance.
+                .foregroundStyle(Color.white)
+                .environment(\.colorScheme, .dark)
+                .frame(width: 330, height: 44)
+
+                Spacer(minLength: 22)
+
+                Text("Focus stays visible. Your work stays frontmost.")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.primary)
+
+                Text("Control-Command-E reveals the controls only when you ask.")
                     .font(.caption)
-                    .foregroundStyle(EryloPalette.mist)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 4)
+
+                Spacer(minLength: 20)
             }
-            content()
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(EryloPalette.graphite, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .frame(height: 132)
+        .frame(maxWidth: .infinity)
         .overlay {
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(EryloPalette.mist.opacity(0.12), lineWidth: 1)
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.5)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Preview: Focus Timer, 24 minutes 59 seconds remaining. Control-Command-E reveals controls.")
+    }
+}
+
+/// A preview of the shipping top-edge relationship, not a floating card. The
+/// flat top is attached to the simulated display edge; only the lower corners
+/// soften into the screen.
+private struct OnboardingTopEdgeSurfaceShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        let radius = min(17, rect.height * 0.5)
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - radius))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.maxX - radius, y: rect.maxY),
+            control: CGPoint(x: rect.maxX, y: rect.maxY)
+        )
+        path.addLine(to: CGPoint(x: rect.minX + radius, y: rect.maxY))
+        path.addQuadCurve(
+            to: CGPoint(x: rect.minX, y: rect.maxY - radius),
+            control: CGPoint(x: rect.minX, y: rect.maxY)
+        )
+        path.closeSubpath()
+        return path
     }
 }

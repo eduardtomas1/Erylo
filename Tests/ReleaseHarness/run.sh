@@ -14,7 +14,7 @@ release_capture_toolchain 0
 release_harness_shard="${1:-all}"
 release_harness_manifest="Tests/ReleaseHarness/shards.tsv"
 if [[ "$release_harness_shard" == all ]]; then
-    release_harness_expected_checks=593
+    release_harness_expected_checks=594
 else
     release_harness_expected_checks="$(/usr/bin/awk -F '\t' -v shard="$release_harness_shard" \
         '$1 == shard { print $2 }' "$release_harness_manifest")"
@@ -899,6 +899,27 @@ check "unusual in-root argument denial identifies the exact unreviewed path" \
     /usr/bin/grep -Fq \
         "compiler input is not in the reviewed pinned policy: Sources/Fixture/Injected/Input.payload" \
         "$test_root/logs/compiler-transient-unusual.err"
+external_compiler_source="$external_test_root/ExternalCompilerInput.swift"
+printf 'public let externalCompilerPayload = "EXTERNAL_UNREVIEWED_COMPILER_BYTES"\n' \
+    > "$external_compiler_source"
+expect_failure_with_stderr \
+    "external Swift source is denied before it can bypass the reviewed compiler-input audit" \
+    compiler-external-source \
+    "compiler Swift source input is outside the reviewed source root" \
+    /usr/bin/env \
+        ERYLO_RELEASE_SWIFTC_DRIVER_ACTIVE=1 \
+        ERYLO_RELEASE_REAL_SWIFTC="$(xcrun --find swiftc)" \
+        ERYLO_RELEASE_REAL_SWIFT_FRONTEND="$(xcrun --find swift-frontend)" \
+        ERYLO_RELEASE_SOURCE_REPOSITORY="$snapshot_fixture_repo" \
+        ERYLO_RELEASE_SOURCE_ROOT="$snapshot_fixture_root" \
+        ERYLO_RELEASE_SOURCE_COMMIT="$snapshot_fixture_commit" \
+        ERYLO_RELEASE_COMPILER_INPUT_DIRECTORY="$compiler_fixture_inputs" \
+        ERYLO_RELEASE_COMPILER_AUDIT="$compiler_fixture_audit" \
+        "$repo_root/Scripts/release/verified-swiftc.rb" \
+        -frontend \
+        "$snapshot_fixture_root/Sources/Fixture/main.swift" \
+        "$external_compiler_source"
+/bin/rm -f -- "$external_compiler_source"
 /bin/rm -f -- "$snapshot_fixture_root/Sources/Fixture/Injected/Evil.swift"
 /bin/rm -f -- "$snapshot_fixture_root/Sources/Fixture/Injected/Input.payload"
 /bin/rmdir "$snapshot_fixture_root/Sources/Fixture/Injected"

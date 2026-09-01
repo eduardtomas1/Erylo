@@ -687,24 +687,20 @@ public struct PanelInteractionTiming: Equatable, Sendable {
     public let hoverEntryDelay: Duration
     public let hoverExitDelay: Duration
     public let motionDuration: Duration
-    public let reducedMotionDuration: Duration
 
     public init(
         hoverEntryDelay: Duration,
         hoverExitDelay: Duration,
-        motionDuration: Duration,
-        reducedMotionDuration: Duration
+        motionDuration: Duration
     ) {
         self.hoverEntryDelay = hoverEntryDelay
         self.hoverExitDelay = hoverExitDelay
         self.motionDuration = motionDuration
-        self.reducedMotionDuration = reducedMotionDuration
     }
 
     public static let standard = PanelInteractionTiming(
         hoverEntryDelay: .milliseconds(120),
         hoverExitDelay: .milliseconds(300),
-        motionDuration: .milliseconds(220),
-        reducedMotionDuration: .milliseconds(120)
+        motionDuration: .milliseconds(220)
     )
 }
